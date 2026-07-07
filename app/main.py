@@ -27,6 +27,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from math import ceil
+from app.routes.billing import router as billing_router
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -137,6 +138,9 @@ def get_business_doc_state(db: Session, business_id: int) -> dict:
 @app.get("/")
 def read_root():
     return {"Hello": "World"}
+
+
+app.include_router(billing_router)
 
 
 @app.post("/upload-multiple")
