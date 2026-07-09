@@ -6,7 +6,7 @@ from app.database import get_db
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.routes.auth import router as auth_router
-from app.models import Business, User, Document, QueryLog, Organization, OrgMember
+from app.models import Business, User, Document, QueryLog, Organization, OrgMember, user_business
 from app.rag import (
     ingest_document,
     retrieve_chunks,
@@ -21,13 +21,24 @@ from app.rag import (
     PLAN_CONFIG,
 )
 from app.llm import generate_answer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from app.auth import get_current_user
 import os
 import uuid
 from datetime import datetime, timezone
 from math import ceil
 from app.routes.billing import router as billing_router
+
+import jwt  # pyjwt
+import resend
+from datetime import datetime, timedelta, timezone
+
+# Configure your keys (In production, load these from os.environ)
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your_super_secret_signing_key_change_this_in_production")
+JWT_ALGORITHM = "HS256"
+
+resend.api_key = os.getenv("RESEND_API_KEY")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000") # Your frontend app domain
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -82,6 +93,17 @@ class OrgResponseSchema(BaseModel):
         from_attributes = True
 
 
+class AcceptInviteRequest(BaseModel):
+    token: str
+    password: str = Field(..., min_length=6, description="Password required only for new accounts")
+    name: str = "User"
+
+# Place this in your "Request / Response models" section at the top of the file:
+class OrgInviteRequest(BaseModel):
+    email: EmailStr
+    role: str = "member"
+    business_ids: List[int] = []
+
 # ── App setup ──────────────────────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(
@@ -92,6 +114,91 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth_router)
+
+
+@app.get("/auth/verify-invite")
+def verify_invite_token(token: str, db: Session = Depends(get_db)):
+    """Frontend calls this on page load to see if the token is valid and checks if user exists."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        email = payload["email"]
+        
+        # Check if they already have an account in your ecosystem
+        user_exists = db.query(User).filter(User.email == email).first() is not None
+        
+        return {
+            "valid": True,
+            "email": email,
+            "org_id": payload["org_id"],
+            "user_exists": user_exists
+        }
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="This invitation link has expired.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid invitation token.")
+
+
+@app.post("/auth/accept-invite")
+def accept_workspace_invitation(body: AcceptInviteRequest, db: Session = Depends(get_db)):
+    """Frontend submits the password/name here to seal the registration and map permissions."""
+    try:
+        payload = jwt.decode(body.token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        raise HTTPException(status_code=400, detail="Invalid or expired invitation token.")
+
+    email = payload["email"]
+    org_id = payload["org_id"]
+    role = payload["role"]
+    business_ids = payload["business_ids"]
+
+    # 1. Fetch or create the user profile record securely
+    target_user = db.query(User).filter(User.email == email).first()
+    
+    if not target_user:
+        # For a production application, make sure to hash this password using your auth pass-context!
+        # Assuming you use passlib/bcrypt elsewhere in your auth router:
+        # from app.routes.auth import pwd_context (or similar hashing helper)
+        hashed_pwd = body.password # Replace with your real password hashing helper function
+        
+        target_user = User(
+            email=email,
+            name=body.name,
+            hashed_password=hashed_pwd,
+            plan="free"
+        )
+        db.add(target_user)
+        db.flush()
+
+    # 2. Map organization-wide container membership
+    existing_member = db.query(OrgMember).filter(
+        OrgMember.org_id == org_id,
+        OrgMember.user_id == target_user.id
+    ).first()
+    
+    if not existing_member:
+        new_membership = OrgMember(
+            org_id=org_id,
+            user_id=target_user.id,
+            role=role
+        )
+        db.add(new_membership)
+
+    # 3. Map local multi-property location access bridges
+    for biz_id in business_ids:
+        already_has_access = db.execute(
+            user_business.select().where(
+                user_business.c.user_id == target_user.id,
+                user_business.c.business_id == biz_id
+            )
+        ).first()
+        
+        if not already_has_access:
+            db.execute(
+                user_business.insert().values(user_id=target_user.id, business_id=biz_id)
+            )
+
+    db.commit()
+    return {"status": "success", "message": "Workspace onboarding mapped safely. You can now sign in."}
 
 def enforce_business_quota(db: Session, business_id: int, user_id: int):
     # 1. Fetch the business and organization ownership framework
@@ -256,36 +363,144 @@ async def get_documents(
 
 @app.get("/me/businesses")
 def get_my_businesses(
+    org_id: int,  
     db:           Session = Depends(get_db),
     current_user          = Depends(get_current_user),
 ):
     user, _ = current_user
     
-    user_org_ids = [
-        membership.org_id for membership in db.query(OrgMember)
-        .filter(OrgMember.user_id == user.id)
-        .all()
-    ]
+    # Boundary check: Ensure user belongs to the requested workspace
+    membership = db.query(OrgMember).filter(
+        OrgMember.org_id == org_id,
+        OrgMember.user_id == user.id
+    ).first()
     
-    if not user_org_ids:
-        return {"businesses": []}
+    if not membership:
+        raise HTTPException(
+            status_code=403, 
+            detail="Access Denied: You are not a member of this workspace container."
+        )
         
-    db_businesses = (
-        db.query(Business)
-        .filter(Business.org_id.in_(user_org_ids))
-        .all()
-    )
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    is_owner = org and org.owner_id == user.id
+    is_admin = membership.role == "admin"
+
+    if is_owner or is_admin:
+        # Admins automatically get visibility over ALL properties in the org
+        db_businesses = db.query(Business).filter(Business.org_id == org_id).all()
+    else:
+        # Standard members use the user_business junction table safely
+        db_businesses = (
+            db.query(Business)
+            .join(user_business, Business.id == user_business.c.business_id)
+            .filter(
+                Business.org_id == org_id,
+                user_business.c.user_id == user.id
+            )
+            .all()
+        )
     
     return {
         "businesses": [
-            {
-                "id": b.id, 
-                "name": b.name,
-                "org_id": b.org_id
-            } 
+            {"id": b.id, "name": b.name, "org_id": b.org_id} 
             for b in db_businesses
         ]
     }
+
+@app.post("/organizations/{org_id}/invite", status_code=status.HTTP_201_CREATED)
+async def invite_user_to_workspace(
+    org_id: int,
+    body: OrgInviteRequest,
+    db: Session = Depends(get_db),
+    current_auth = Depends(get_current_user),
+):
+    admin_user, _ = current_auth
+
+    # 1. Fetch organization and verify admin permissions
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization workspace not found.")
+        
+    admin_membership = db.query(OrgMember).filter(
+        OrgMember.org_id == org_id, 
+        OrgMember.user_id == admin_user.id
+    ).first()
+    
+    if org.owner_id != admin_user.id and (not admin_membership or admin_membership.role != "admin"):
+        raise HTTPException(
+            status_code=403, 
+            detail="You lack administrative permissions to invite users to this workspace."
+        )
+
+    # 2. Enforce your PLAN_CONFIG 'max_users' seat limit caps
+    billing_owner = db.query(User).filter(User.id == org.owner_id).first()
+    owner_plan = billing_owner.plan.lower() if billing_owner and billing_owner.plan else "free"
+    
+    config = PLAN_CONFIG.get(owner_plan, PLAN_CONFIG["free"])
+    max_seats_allowed = config.get("max_users", 2)
+
+    # Count all members in this specific workspace container
+    current_seat_count = db.query(OrgMember).filter(OrgMember.org_id == org_id).count()
+
+    if current_seat_count >= max_seats_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Workspace seat limit reached: Your current '{owner_plan}' plan allows a maximum of "
+                   f"{max_seats_allowed} users. Please upgrade your tier profile to invite more members."
+        )
+
+    # 3. Verify business IDs map to this organization layer safely
+    valid_biz_count = db.query(Business).filter(
+        Business.id.in_(body.business_ids),
+        Business.org_id == org_id
+    ).count()
+    
+    if valid_biz_count != len(body.business_ids):
+        raise HTTPException(status_code=400, detail="One or more selected Business IDs are invalid for this workspace.")
+
+    # 4. Generate a secure, short-lived Invitation Token (Expires in 7 days)
+    token_expiry = datetime.now(timezone.utc) + timedelta(days=7)
+    token_payload = {
+        "email": body.email,
+        "org_id": org_id,
+        "role": body.role,
+        "business_ids": body.business_ids,
+        "exp": token_expiry
+    }
+    invite_token = jwt.encode(token_payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+    # 5. Build the invite magic URL for your frontend
+    invite_link = f"{FRONTEND_URL}/accept-invite?token={invite_token}"
+
+    # 6. Send the transactional email using Resend
+    try:
+        params = {
+            "from": "Acme Team <onboarding@resend.dev>", # Use your verified domain once you set it up in Resend
+            "to": [body.email],
+            "subject": f"You've been invited to join {org.name}",
+            "html": f"""
+                <div style="font-family: sans-serif; padding: 20px; color: #333;">
+                    <h2>You're invited!</h2>
+                    <p><strong>{admin_user.email}</strong> has invited you to collaborate on their team workspace: <strong>{org.name}</strong>.</p>
+                    <p>Click the button below to accept your invitation and set up your account. This link will expire in 7 days.</p>
+                    <div style="margin: 24px 0;">
+                        <a href="{invite_link}" style="background-color: #000; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+                            Accept Invitation
+                        </a>
+                    </div>
+                    <p style="font-size: 12px; color: #666;">If the button doesn't work, copy and paste this link into your browser:<br>{invite_link}</p>
+                </div>
+            """
+        }
+        resend.Emails.send(params)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to send invitation email cleanly: {str(e)}"
+        )
+
+    return {"message": f"Invitation link generated and emailed to {body.email} successfully."}
+
 
 # Updated route to a static path, pulling everything from the body payload
 @app.patch("/businesses/settings")
@@ -612,18 +827,11 @@ async def create_organization(
     db: Session = Depends(get_db), 
     current_auth = Depends(get_current_user)
 ):
-    """
-    Creates an organization workspace. Inspects the user's personal billing tier
-    limits dynamically to control how many workspaces they can cleanly own.
-    """
     user, _ = current_auth
-    
-    # 1. Fetch user's global plan configurations dynamically
     user_plan = user.plan if hasattr(user, "plan") else "free"
     config = PLAN_CONFIG.get(user_plan, PLAN_CONFIG["free"])
-    max_orgs = config.get("max_organizations", 1) # Defaulting cleanly to 1 if not declared
+    max_orgs = config.get("max_organizations", 1)
     
-    # 2. Count how many organizations this user owns
     owned_org_count = db.query(Organization).filter(Organization.owner_id == user.id).count()
     if owned_org_count >= max_orgs:
         raise HTTPException(
@@ -632,26 +840,17 @@ async def create_organization(
         )
         
     try:
-        # 3. Instantiate organization (Plan fields removed here—now derived from owner relation)
-        new_org = Organization(
-            name=payload.name,
-            owner_id=user.id,
-            is_active=True
-        )
+        new_org = Organization(name=payload.name, owner_id=user.id, is_active=True)
         db.add(new_org)
         db.flush() 
 
-        # 4. Automatically insert creator as administrator
-        org_membership = OrgMember(
-            org_id=new_org.id,
-            user_id=user.id,
-            role="admin"
-        )
+        org_membership = OrgMember(org_id=new_org.id, user_id=user.id, role="admin")
         db.add(org_membership)
-        
         db.commit()
         db.refresh(new_org)
         
+        # Inject the role value directly into the returned object to satisfy OrgResponseSchema
+        new_org.role = "admin"
         return new_org
 
     except Exception as e:
@@ -673,13 +872,20 @@ async def get_user_organizations(
 ):
     user, _ = current_auth
     try:
-        user_orgs = (
-            db.query(Organization)
-            .join(OrgMember, OrgMember.org_id == Organization.id)
-            .filter(OrgMember.user_id == user.id)
-            .all()
-        )
-        return user_orgs
+        # Querying membership links directly so we can grab both Org data AND your custom member roles
+        memberships = db.query(OrgMember).filter(OrgMember.user_id == user.id).all()
+        
+        formatted_orgs = []
+        for m in memberships:
+            if m.organization:
+                formatted_orgs.append({
+                    "id": m.organization.id,
+                    "name": m.organization.name,
+                    "owner_id": m.organization.owner_id,
+                    "is_active": m.organization.is_active,
+                    "role": m.role # Populates the newly updated response model parameter
+                })
+        return formatted_orgs
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
