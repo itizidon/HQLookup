@@ -37,9 +37,15 @@ importlib_resources==6.5.2
 Jinja2==3.1.6
 jiter==0.14.0
 joblib==1.5.3
+jsonpatch==1.33
+jsonpointer==3.1.1
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 kubernetes==35.0.0
+langchain-core==1.4.8
+langchain-protocol==0.0.18
+langchain-text-splitters==1.1.2
+langsmith==0.9.3
 lxml==6.0.2
 markdown-it-py==4.0.0
 MarkupSafe==3.0.3
@@ -103,6 +109,7 @@ referencing==0.37.0
 regex==2026.4.4
 requests==2.33.1
 requests-oauthlib==2.0.0
+requests-toolbelt==1.0.0
 rich==14.3.3
 rpds-py==0.30.0
 rsa==4.9.1
@@ -128,9 +135,12 @@ typer==0.24.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.6.3
+uuid_utils==0.16.2
 uvicorn==0.44.0
 uvloop==0.22.1
 watchfiles==1.1.1
 websocket-client==1.9.0
 websockets==16.0
+xxhash==3.8.0
 zipp==3.23.0
+zstandard==0.25.0
