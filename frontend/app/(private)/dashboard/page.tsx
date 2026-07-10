@@ -107,6 +107,13 @@ export default function AdminDashboard() {
     fetchWorkspaceMetrics();
   }, [currentOrgId]);
 
+  // Add this hook to keep your BusinessContext data in sync with the selected organization
+  useEffect(() => {
+    if (currentOrgId && refreshBusinesses) {
+      refreshBusinesses([currentOrgId]); // Wraps the active ID in an array payload
+    }
+  }, [currentOrgId]);
+
   useEffect(() => {
     const fetchUserDataAndWorkspaces = async () => {
       try {
@@ -205,8 +212,8 @@ export default function AdminDashboard() {
         throw new Error(data.detail || "Could not spin up a new business asset.");
       }
 
-      if (refreshBusinesses) {
-        await refreshBusinesses();
+      if (refreshBusinesses && currentOrgId) {
+        await refreshBusinesses([currentOrgId]); // 👈 Change this line to pass the ID inside an array
       } else {
         window.location.reload();
       }

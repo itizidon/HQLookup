@@ -104,6 +104,9 @@ class OrgInviteRequest(BaseModel):
     role: str = "member"
     business_ids: List[int] = []
 
+class MultiOrgBusinessesRequest(BaseModel):
+    org_ids: List[int] = Field(..., description="List of target organization IDs to filter businesses by")
+
 # ── App setup ──────────────────────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(
@@ -361,49 +364,79 @@ async def get_documents(
     return DocumentListResponse(documents=formatted_docs)
 
 
-@app.get("/me/businesses")
+@app.post("/me/businesses")
 def get_my_businesses(
-    org_id: int,  
+    payload:      MultiOrgBusinessesRequest, # Reads cleanly from the JSON body
     db:           Session = Depends(get_db),
     current_user          = Depends(get_current_user),
 ):
     user, _ = current_user
-    
-    # Boundary check: Ensure user belongs to the requested workspace
-    membership = db.query(OrgMember).filter(
-        OrgMember.org_id == org_id,
-        OrgMember.user_id == user.id
-    ).first()
-    
-    if not membership:
-        raise HTTPException(
-            status_code=403, 
-            detail="Access Denied: You are not a member of this workspace container."
-        )
-        
-    org = db.query(Organization).filter(Organization.id == org_id).first()
-    is_owner = org and org.owner_id == user.id
-    is_admin = membership.role == "admin"
+    requested_org_ids = payload.org_ids
 
-    if is_owner or is_admin:
-        # Admins automatically get visibility over ALL properties in the org
-        db_businesses = db.query(Business).filter(Business.org_id == org_id).all()
-    else:
-        # Standard members use the user_business junction table safely
-        db_businesses = (
+    if not requested_org_ids:
+        return {"businesses": [], "message": "No organization context provided."}
+
+    # 1. Verify User Memberships across all requested organizations
+    # Find matching workspace rows for this specific user
+    memberships = db.query(OrgMember).filter(
+        OrgMember.org_id.in_(requested_org_ids),
+        OrgMember.user_id == user.id
+    ).all()
+    
+    # Extract the organization IDs where the user actually holds a valid seat
+    authorized_org_ids = {m.org_id for m in memberships}
+    
+    # Group roles by organization ID for easy lookups
+    org_role_map = {m.org_id: m.role for m in memberships}
+
+    # 2. Separate administrative layers vs standard restricted layers
+    admin_org_ids = []
+    member_org_ids = []
+
+    for org_id in requested_org_ids:
+        # Hard fail if they sneak an ID in that they don't belong to
+        if org_id not in authorized_org_ids:
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Access Denied: You are not a registered member of organization ID {org_id}."
+            )
+        
+        # Check if they are the explicit owner of the organization container
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        is_owner = org and org.owner_id == user.id
+        is_admin = org_role_map.get(org_id) == "admin"
+
+        if is_owner or is_admin:
+            admin_org_ids.append(org_id)
+        else:
+            member_org_ids.append(org_id)
+
+    # 3. Pull records out of the database based on privilege level
+    combined_businesses = []
+
+    # Admins/Owners get *all* locations inside their matching organizations
+    if admin_org_ids:
+        admin_bizs = db.query(Business).filter(Business.org_id.in_(admin_org_ids)).all()
+        combined_businesses.extend(admin_bizs)
+
+    # Standard members only get locations bound to them via the user_business mapping table
+    if member_org_ids:
+        member_bizs = (
             db.query(Business)
             .join(user_business, Business.id == user_business.c.business_id)
             .filter(
-                Business.org_id == org_id,
+                Business.org_id.in_(member_org_ids),
                 user_business.c.user_id == user.id
             )
             .all()
         )
-    
+        combined_businesses.extend(member_bizs)
+
+    # 4. Return serialized payload structure
     return {
         "businesses": [
             {"id": b.id, "name": b.name, "org_id": b.org_id} 
-            for b in db_businesses
+            for b in combined_businesses
         ]
     }
 
