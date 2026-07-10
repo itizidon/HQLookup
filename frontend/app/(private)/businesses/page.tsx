@@ -30,6 +30,11 @@ export default function EnterpriseBusinessDetail() {
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
 
+  // ── INLINE SINGLE INVITE FORM STATES ──
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [isSendingInvite, setIsSendingInvite] = useState(false);
+  const [inviteStatus, setInviteStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
   // Memoized client-side filter for the location picker dropdown
   const filteredBusinesses = useMemo(() => {
     if (!searchQuery) return businesses;
@@ -45,6 +50,10 @@ export default function EnterpriseBusinessDetail() {
     // Reset settings tracking parameters to match the active context
     setLocalAlloc(selectedBusiness.query_allocation ?? 25);
     setSettingsError(null);
+    
+    // Clear out stale invitation form states when switching contexts
+    setInviteEmail('');
+    setInviteStatus(null);
 
     const fetchDocs = async () => {
       setDocsLoading(true);
@@ -115,7 +124,6 @@ export default function EnterpriseBusinessDetail() {
       const res = await fetch(`http://localhost:8000/documents/${docId}?business_id=${selectedBusiness.id}`,
         {
           credentials: "include",
-
           method: "DELETE",
         });
       if (res.ok) {
@@ -136,7 +144,7 @@ export default function EnterpriseBusinessDetail() {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
-          business_id: selectedBusiness.id, // Pulled from your local/context storage
+          business_id: selectedBusiness.id, 
           query_allocation: Number(localAlloc) 
         }),
         credentials: "include",
@@ -146,12 +154,45 @@ export default function EnterpriseBusinessDetail() {
         throw new Error(data.detail || "Could not patch settings profile.");
       }
 
-      // Update our contextual values inline to synchronize the parent tree changes
       selectedBusiness.query_allocation = Number(localAlloc);
     } catch (err: any) {
       setSettingsError(err.message || "An unhandled error occurred.");
     } finally {
       setIsSavingSettings(false);
+    }
+  };
+
+  // ── INLINE SINGLE BUSINESS INVITE ACTION PIPELINE ──
+  const handleInlineInvite = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inviteEmail.trim() || !selectedBusiness) return;
+
+    setIsSendingInvite(true);
+    setInviteStatus(null);
+
+    try {
+      const res = await fetch(`http://localhost:8000/organizations/${selectedBusiness.org_id}/invite`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          email: inviteEmail.trim(),
+          role: "member",
+          business_ids: [selectedBusiness.id] // Encapsulates the 1 targeted business scope
+        })
+      });
+
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.detail || "Could not complete workspace invitation.");
+      }
+
+      setInviteStatus({ type: 'success', message: `Invitation dispatched successfully to ${inviteEmail}!` });
+      setInviteEmail('');
+    } catch (err: any) {
+      setInviteStatus({ type: 'error', message: err.message || "An unhandled network error occurred." });
+    } finally {
+      setIsSendingInvite(false);
     }
   };
 
@@ -368,10 +409,45 @@ export default function EnterpriseBusinessDetail() {
                     </div>
                   </div>
 
-                  <div style={{ display: 'flex', gap: '8px', maxWidth: '480px', marginBottom: '20px' }}>
-                    <input type="email" placeholder="teammate@company.com" style={{ ...s.formInput, flex: 1 }} />
-                    <button className="btn btn-primary" style={{ fontSize: '12px' }}><UserPlus size={14} /> Add User</button>
-                  </div>
+                  {/* ── UPDATED SINGLE INVITE MVP FORM ── */}
+                  <form onSubmit={handleInlineInvite} style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxWidth: '480px', marginBottom: '20px' }}>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <input 
+                        type="email" 
+                        placeholder="teammate@company.com" 
+                        value={inviteEmail}
+                        onChange={(e) => setInviteEmail(e.target.value)}
+                        required
+                        disabled={isSendingInvite}
+                        style={{ ...s.formInput, flex: 1 }} 
+                      />
+                      <button 
+                        type="submit" 
+                        className="btn btn-primary" 
+                        disabled={isSendingInvite || !inviteEmail.trim()}
+                        style={{ fontSize: '12px', whiteSpace: 'nowrap', gap: '6px', display: 'flex', alignItems: 'center' }}
+                      >
+                        {isSendingInvite ? <Loader2 className="animate-spin" size={14} /> : <UserPlus size={14} />} 
+                        {isSendingInvite ? "Adding..." : "Add User"}
+                      </button>
+                    </div>
+
+                    {inviteStatus && (
+                      <div style={{
+                        fontSize: '12px',
+                        padding: '6px 10px',
+                        borderRadius: '4px',
+                        marginTop: '4px',
+                        backgroundColor: inviteStatus.type === 'success' ? '#f0fdf4' : '#fef2f2',
+                        border: inviteStatus.type === 'success' ? '1px solid #bbf7d0' : '1px solid #fee2e2',
+                        color: inviteStatus.type === 'success' ? '#16a34a' : '#ef4444',
+                        display: 'flex',
+                        alignItems: 'center'
+                      }}>
+                        {inviteStatus.message}
+                      </div>
+                    )}
+                  </form>
 
                   <div style={s.docItemRow}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
