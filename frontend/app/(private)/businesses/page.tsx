@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo, ChangeEvent } from 'react';
 import Link from 'next/link';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { ArrowLeft, Search, Upload, Trash2, FileText, UserPlus, ChevronsUpDown, Building2, Loader2, ShieldAlert, Sliders, Users } from 'lucide-react';
 import { useBusiness } from '@/app/context/BusinessContext';
 
@@ -14,6 +15,12 @@ interface ServerDocument {
 
 export default function EnterpriseBusinessDetail() {
   const { businesses, selectedBusiness, selectBusiness, clearSelection, isLoading: contextLoading } = useBusiness();
+  
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // Read current tracking active parameters straight from the browser address bar lookup
+  const urlBizId = searchParams.get('bizId');
 
   // Tab Routing State
   const [activeTab, setActiveTab] = useState<'files' | 'settings' | 'team'>('files');
@@ -24,16 +31,58 @@ export default function EnterpriseBusinessDetail() {
   const [documents, setDocuments] = useState<ServerDocument[]>([]);
   const [docsLoading, setDocsLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
-
+  
   // Settings Allocation Form States
   const [localAlloc, setLocalAlloc] = useState<number>(25);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
 
-  // ── INLINE SINGLE INVITE FORM STATES ──
+  // Inline Single Invite Form States
   const [inviteEmail, setInviteEmail] = useState('');
   const [isSendingInvite, setIsSendingInvite] = useState(false);
   const [inviteStatus, setInviteStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  // ── ACCESS CONTROL UNIFIED REPOSITORIES ──
+  const [teamLoading, setTeamLoading] = useState(false);
+  const [allMembers, setAllMembers] = useState<any[]>([]);
+
+  // ── HYDRATION PIPELINE: Sync context automatically if address param keys persist on refresh ──
+  useEffect(() => {
+    if (contextLoading || !businesses.length) return;
+
+    if (urlBizId && (!selectedBusiness || selectedBusiness.id !== Number(urlBizId))) {
+      const matchedBiz = businesses.find(b => b.id === Number(urlBizId));
+      if (matchedBiz) {
+        selectBusiness(matchedBiz);
+      }
+    }
+  }, [urlBizId, businesses, contextLoading]);
+
+  // Split the unified backend array into active and pending lists on the fly
+  const { teamMembers, pendingInvites } = useMemo(() => {
+    const active: any[] = [];
+    const pending: any[] = [];
+
+    allMembers.forEach((m) => {
+      if (m.status === 'pending') {
+        pending.push({
+          id: m.id,
+          email: m.email,
+          role: m.role,
+          created_at: m.created_at || new Date().toISOString()
+        });
+      } else {
+        active.push({
+          id: m.id,
+          email: m.email,
+          role: m.role,
+          is_root: m.is_root
+        });
+      }
+    });
+
+    return { teamMembers: active, pendingInvites: pending };
+  }, [allMembers]);
 
   // Memoized client-side filter for the location picker dropdown
   const filteredBusinesses = useMemo(() => {
@@ -47,10 +96,16 @@ export default function EnterpriseBusinessDetail() {
   useEffect(() => {
     if (!selectedBusiness) return;
 
+    // Smoothly synchronize the active workspace parameter state straight to the address bar history
+    const currentUrl = new URL(window.location.href);
+    currentUrl.searchParams.set('orgId', selectedBusiness.org_id.toString());
+    currentUrl.searchParams.set('bizId', selectedBusiness.id.toString());
+    window.history.pushState({}, '', currentUrl.toString());
+
     // Reset settings tracking parameters to match the active context
     setLocalAlloc(selectedBusiness.query_allocation ?? 25);
     setSettingsError(null);
-    
+
     // Clear out stale invitation form states when switching contexts
     setInviteEmail('');
     setInviteStatus(null);
@@ -79,7 +134,28 @@ export default function EnterpriseBusinessDetail() {
       }
     };
 
+    // ── FETCH UNIFIED ACTIVE AND PENDING LIST FROM COMBINED ROUTE ──
+    const fetchTeamAndInvites = async () => {
+      setTeamLoading(true);
+      try {
+        const res = await fetch(
+          `http://localhost:8000/organizations/${selectedBusiness.org_id}/businesses/${selectedBusiness.id}/members`,
+          { credentials: "include" }
+        );
+
+        if (res.ok) {
+          const data = await res.json();
+          setAllMembers(data.members || []);
+        }
+      } catch (err) {
+        console.error("Error retrieving unified access control data list:", err);
+      } finally {
+        setTeamLoading(false);
+      }
+    };
+
     fetchDocs();
+    fetchTeamAndInvites();
   }, [selectedBusiness]);
 
   // Handle document attachment array pipelines
@@ -143,9 +219,9 @@ export default function EnterpriseBusinessDetail() {
       const res = await fetch(`http://localhost:8000/businesses/settings`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          business_id: selectedBusiness.id, 
-          query_allocation: Number(localAlloc) 
+        body: JSON.stringify({
+          business_id: selectedBusiness.id,
+          query_allocation: Number(localAlloc)
         }),
         credentials: "include",
       });
@@ -162,7 +238,7 @@ export default function EnterpriseBusinessDetail() {
     }
   };
 
-  // ── INLINE SINGLE BUSINESS INVITE ACTION PIPELINE ──
+  // Inline single business invite action pipeline
   const handleInlineInvite = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inviteEmail.trim() || !selectedBusiness) return;
@@ -178,7 +254,7 @@ export default function EnterpriseBusinessDetail() {
         body: JSON.stringify({
           email: inviteEmail.trim(),
           role: "member",
-          business_ids: [selectedBusiness.id] // Encapsulates the 1 targeted business scope
+          business_ids: [selectedBusiness.id]
         })
       });
 
@@ -188,11 +264,39 @@ export default function EnterpriseBusinessDetail() {
       }
 
       setInviteStatus({ type: 'success', message: `Invitation dispatched successfully to ${inviteEmail}!` });
+
+      // Optimistically inject the new entry directly into the unified allMembers tracking engine
+      const simulatedInvite = {
+        id: `pending_${Math.random().toString()}`,
+        email: inviteEmail.trim(),
+        role: "member",
+        status: "pending",
+        created_at: new Date().toISOString()
+      };
+      setAllMembers(prev => [simulatedInvite, ...prev]);
       setInviteEmail('');
     } catch (err: any) {
       setInviteStatus({ type: 'error', message: err.message || "An unhandled network error occurred." });
     } finally {
       setIsSendingInvite(false);
+    }
+  };
+
+  // ── REVOKE/DELETE PENDING SEAT INVITE FROM UNIFIED ARRAYS ──
+  const handleRevokeInvite = async (inviteId: string) => {
+    if (!selectedBusiness) return;
+    try {
+      // Clean string prefix parsing if needed to evaluate pure backend integer/string IDs
+      const parsedId = inviteId.replace('pending_', '');
+      const res = await fetch(`http://localhost:8000/organizations/${selectedBusiness.org_id}/invitations/${parsedId}`, {
+        method: "DELETE",
+        credentials: "include"
+      });
+      if (res.ok) {
+        setAllMembers(prev => prev.filter(member => member.id !== inviteId));
+      }
+    } catch (err) {
+      console.error("Failed to revoke database invitation entity:", err);
     }
   };
 
@@ -291,7 +395,14 @@ export default function EnterpriseBusinessDetail() {
                 <h1 style={{ fontSize: '16px', fontWeight: 600, margin: 0 }}>{selectedBusiness.name}</h1>
                 <p style={{ fontSize: '11px', color: 'var(--color-text-secondary)', margin: '4px 0 0 0' }}>Instance Resource Key: #{selectedBusiness.id}</p>
               </div>
-              <button className="btn btn-secondary" style={{ fontSize: '12px', padding: '4px 10px', color: '#ef4444' }} onClick={clearSelection}>
+              <button 
+                className="btn btn-secondary" 
+                style={{ fontSize: '12px', padding: '4px 10px', color: '#ef4444' }} 
+                onClick={() => {
+                  clearSelection();
+                  router.push(window.location.pathname); // Strips the query URL markers on context unmount
+                }}
+              >
                 Unmount Context
               </button>
             </div>
@@ -409,25 +520,25 @@ export default function EnterpriseBusinessDetail() {
                     </div>
                   </div>
 
-                  {/* ── UPDATED SINGLE INVITE MVP FORM ── */}
-                  <form onSubmit={handleInlineInvite} style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxWidth: '480px', marginBottom: '20px' }}>
+                  {/* Single Invite MVP Form */}
+                  <form onSubmit={handleInlineInvite} style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxWidth: '480px', marginBottom: '24px' }}>
                     <div style={{ display: 'flex', gap: '8px' }}>
-                      <input 
-                        type="email" 
-                        placeholder="teammate@company.com" 
+                      <input
+                        type="email"
+                        placeholder="teammate@company.com"
                         value={inviteEmail}
                         onChange={(e) => setInviteEmail(e.target.value)}
                         required
                         disabled={isSendingInvite}
-                        style={{ ...s.formInput, flex: 1 }} 
+                        style={{ ...s.formInput, flex: 1 }}
                       />
-                      <button 
-                        type="submit" 
-                        className="btn btn-primary" 
+                      <button
+                        type="submit"
+                        className="btn btn-primary"
                         disabled={isSendingInvite || !inviteEmail.trim()}
                         style={{ fontSize: '12px', whiteSpace: 'nowrap', gap: '6px', display: 'flex', alignItems: 'center' }}
                       >
-                        {isSendingInvite ? <Loader2 className="animate-spin" size={14} /> : <UserPlus size={14} />} 
+                        {isSendingInvite ? <Loader2 className="animate-spin" size={14} /> : <UserPlus size={14} />}
                         {isSendingInvite ? "Adding..." : "Add User"}
                       </button>
                     </div>
@@ -449,18 +560,81 @@ export default function EnterpriseBusinessDetail() {
                     )}
                   </form>
 
-                  <div style={s.docItemRow}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                      <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: 'var(--color-primary, #4f46e5)', color: '#fff', fontSize: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600 }}>
-                        SYS
-                      </div>
-                      <div>
-                        <div style={{ fontSize: '13px', fontWeight: 500 }}>Organization Administrator Account</div>
-                        <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)' }}>Inherited Master Clearance</div>
-                      </div>
+                  {/* ── COMPONENT LOADING RENDER SPINNER ── */}
+                  {teamLoading ? (
+                    <div style={{ padding: '24px', display: 'flex', justifyContent: 'center' }}>
+                      <Loader2 className="animate-spin" size={20} />
                     </div>
-                    <span style={{ fontSize: '10px', padding: '2px 6px', background: '#e0e7ff', color: '#4f46e5', borderRadius: '4px', fontWeight: 600 }}>Root Account</span>
-                  </div>
+                  ) : (
+                    <>
+                      {/* Section 1: Active Team Members */}
+                      <div style={{ marginBottom: '24px' }}>
+                        <h4 style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: '8px', letterSpacing: '0.05em' }}>
+                          ACTIVE MEMBERS ({teamMembers.length})
+                        </h4>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                          {teamMembers.map((member) => (
+                            <div key={member.id} style={s.docItemRow}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: member.is_root ? 'var(--color-primary, #4f46e5)' : '#e4e4e7', color: member.is_root ? '#fff' : '#18181b', fontSize: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600 }}>
+                                  {member.email.slice(0, 2).toUpperCase()}
+                                </div>
+                                <div>
+                                  <div style={{ fontSize: '13px', fontWeight: 500 }}>{member.email}</div>
+                                  <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)' }}>Role context classification: {member.role}</div>
+                                </div>
+                              </div>
+                              <span style={{ fontSize: '10px', padding: '2px 6px', background: member.is_root ? '#e0e7ff' : '#f4f4f5', color: member.is_root ? '#4f46e5' : '#71717a', borderRadius: '4px', fontWeight: 600 }}>
+                                {member.is_root ? "Root Account" : "Active"}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Section 2: Pending Invitations */}
+                      <div>
+                        <h4 style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: '8px', letterSpacing: '0.05em' }}>
+                          PENDING INVITATIONS ({pendingInvites.length})
+                        </h4>
+                        {pendingInvites.length === 0 ? (
+                          <div style={{ fontSize: '12px', color: 'var(--color-text-tertiary)', padding: '16px 0', textAlign: 'center', border: '1px dashed var(--color-border-tertiary)', borderRadius: '8px' }}>
+                            No pending invitations active for this scope.
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                            {pendingInvites.map((invite) => (
+                              <div key={invite.id} style={s.docItemRow}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                  <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: '#fafafa', color: '#a1a1aa', fontSize: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600, border: '1px dashed #e4e4e7' }}>
+                                    ?
+                                  </div>
+                                  <div>
+                                    <div style={{ fontSize: '13px', fontWeight: 500 }}>{invite.email}</div>
+                                    <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)' }}>
+                                      Sent {new Date(invite.created_at).toLocaleDateString()}
+                                    </div>
+                                  </div>
+                                </div>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                                  <span style={{ fontSize: '10px', padding: '2px 6px', background: '#fef3c7', color: '#d97706', borderRadius: '4px', fontWeight: 600 }}>
+                                    Pending Seat
+                                  </span>
+                                  <button
+                                    className="btn btn-secondary"
+                                    style={{ padding: '4px 8px', fontSize: '11px', color: '#ef4444', border: '1px solid #fee2e2' }}
+                                    onClick={() => handleRevokeInvite(invite.id)}
+                                  >
+                                    Revoke
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -472,7 +646,6 @@ export default function EnterpriseBusinessDetail() {
   );
 }
 
-// ── STYLE DECLARATIONS OBJECT ──
 const s: Record<string, React.CSSProperties> = {
   dropdownMenu: { position: 'absolute', top: 'calc(100% + 4px)', left: 0, width: '100%', background: 'var(--color-background-primary, #ffffff)', border: '1px solid var(--color-border-tertiary, #e4e4e7)', borderRadius: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.08)', zIndex: 100, padding: '4px' },
   dropdownInput: { width: '100%', fontSize: '12px', padding: '6px 10px', marginBottom: '4px', borderRadius: '6px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', outline: 'none' },

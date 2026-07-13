@@ -139,3 +139,18 @@ class QueryLog(Base):
     organization    = relationship("Organization", back_populates="query_logs")
     business        = relationship("Business",     back_populates="query_logs")
     user            = relationship("User")
+
+class Invitation(Base):
+    __tablename__ = "invitations"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    org_id      = Column(Integer, ForeignKey("organizations.id"), nullable=False, index=True)
+    business_id = Column(Integer, ForeignKey("businesses.id"),    nullable=False, index=True)
+    email       = Column(String, nullable=False)
+    role        = Column(String, nullable=False, default="member")
+    status      = Column(String, nullable=False, default="pending")  # pending / accepted / revoked
+    token       = Column(String, nullable=True)   # the JWT token sent in the email
+    created_at  = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    organization = relationship("Organization")
+    business     = relationship("Business")
