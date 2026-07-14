@@ -13,19 +13,32 @@ interface ServerDocument {
   business_id: number;
 }
 
+interface BusinessDetails {
+  id: number;
+  name: string;
+  org_id: number;
+  query_allocation: number;
+}
+
 export default function EnterpriseBusinessDetail() {
-  const { businesses, selectedBusiness, selectBusiness, clearSelection, isLoading: contextLoading } = useBusiness();
-  
+  // Pulling context sources to read the central business directory list
+  const { businesses, isLoading: contextLoading } = useBusiness();
+  console.log(businesses)
   const router = useRouter();
   const searchParams = useSearchParams();
 
-  // Read current tracking active parameters straight from the browser address bar lookup
+  // ── THE ABSOLUTE SOURCES OF TRUTH (URL Parameters) ──
   const urlBizId = searchParams.get('bizId');
+  const urlOrgId = searchParams.get('orgId');
 
-  // Tab Routing State
+  const activeBizId = urlBizId ? Number(urlBizId) : null;
+  const activeOrgId = urlOrgId ? Number(urlOrgId) : null;
+
+  // ── LOCAL STATE MATRICES ──
+  const [businessDetails, setBusinessDetails] = useState<BusinessDetails | null>(null);
   const [activeTab, setActiveTab] = useState<'files' | 'settings' | 'team'>('files');
 
-  // Interactive UI / Form States
+  // Interactive UI / Search Filter States
   const [searchQuery, setSearchQuery] = useState('');
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [documents, setDocuments] = useState<ServerDocument[]>([]);
@@ -42,23 +55,11 @@ export default function EnterpriseBusinessDetail() {
   const [isSendingInvite, setIsSendingInvite] = useState(false);
   const [inviteStatus, setInviteStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
-  // ── ACCESS CONTROL UNIFIED REPOSITORIES ──
+  // Access Control Repositories
   const [teamLoading, setTeamLoading] = useState(false);
   const [allMembers, setAllMembers] = useState<any[]>([]);
 
-  // ── HYDRATION PIPELINE: Sync context automatically if address param keys persist on refresh ──
-  useEffect(() => {
-    if (contextLoading || !businesses.length) return;
-
-    if (urlBizId && (!selectedBusiness || selectedBusiness.id !== Number(urlBizId))) {
-      const matchedBiz = businesses.find(b => b.id === Number(urlBizId));
-      if (matchedBiz) {
-        selectBusiness(matchedBiz);
-      }
-    }
-  }, [urlBizId, businesses, contextLoading]);
-
-  // Split the unified backend array into active and pending lists on the fly
+  // Split unified members payload cleanly into active/pending structures on the fly
   const { teamMembers, pendingInvites } = useMemo(() => {
     const active: any[] = [];
     const pending: any[] = [];
@@ -84,7 +85,7 @@ export default function EnterpriseBusinessDetail() {
     return { teamMembers: active, pendingInvites: pending };
   }, [allMembers]);
 
-  // Memoized client-side filter for the location picker dropdown
+  // Memoized client-side filter for the picker dropdown selector
   const filteredBusinesses = useMemo(() => {
     if (!searchQuery) return businesses;
     return businesses.filter((biz) =>
@@ -92,24 +93,36 @@ export default function EnterpriseBusinessDetail() {
     );
   }, [searchQuery, businesses]);
 
-  // Sync internal configuration data whenever selectedBusiness hooks change
+  // ── REFRESH-PROOF PIPELINE ──
+  // Evaluates dynamically if the user targets the browser directly or contexts load asynchronously
   useEffect(() => {
-    if (!selectedBusiness) return;
+    if (!activeBizId || !activeOrgId) {
+      setBusinessDetails(null);
+      setDocuments([]);
+      setAllMembers([]);
+      return;
+    }
 
-    // Smoothly synchronize the active workspace parameter state straight to the address bar history
-    const currentUrl = new URL(window.location.href);
-    currentUrl.searchParams.set('orgId', selectedBusiness.org_id.toString());
-    currentUrl.searchParams.set('bizId', selectedBusiness.id.toString());
-    window.history.pushState({}, '', currentUrl.toString());
-
-    // Reset settings tracking parameters to match the active context
-    setLocalAlloc(selectedBusiness.query_allocation ?? 25);
+    // Reset temporary validation / form UI states on context pivot
     setSettingsError(null);
-
-    // Clear out stale invitation form states when switching contexts
     setInviteEmail('');
     setInviteStatus(null);
 
+    // Look up the metadata directly from the context sync layer once it loads
+    if (businesses && businesses.length > 0) {
+      const matched = businesses.find(b => b.id === activeBizId);
+      if (matched) {
+        setBusinessDetails({
+          id: matched.id,
+          name: matched.name,
+          org_id: matched.org_id,
+          query_allocation: matched.query_allocation ?? 25
+        });
+        setLocalAlloc(matched.query_allocation ?? 25);
+      }
+    }
+
+    // 1. Fetch specific vector indices metrics
     const fetchDocs = async () => {
       setDocsLoading(true);
       try {
@@ -118,7 +131,7 @@ export default function EnterpriseBusinessDetail() {
           headers: { "Content-Type": "application/json" },
           credentials: "include",
           body: JSON.stringify({
-            business_ids: [selectedBusiness.id],
+            business_ids: [activeBizId],
             page: 1,
             page_size: 50
           })
@@ -134,12 +147,12 @@ export default function EnterpriseBusinessDetail() {
       }
     };
 
-    // ── FETCH UNIFIED ACTIVE AND PENDING LIST FROM COMBINED ROUTE ──
+    // 2. Fetch unified team user authorization records
     const fetchTeamAndInvites = async () => {
       setTeamLoading(true);
       try {
         const res = await fetch(
-          `http://localhost:8000/organizations/${selectedBusiness.org_id}/businesses/${selectedBusiness.id}/members`,
+          `http://localhost:8000/organizations/${activeOrgId}/businesses/${activeBizId}/members`,
           { credentials: "include" }
         );
 
@@ -156,15 +169,22 @@ export default function EnterpriseBusinessDetail() {
 
     fetchDocs();
     fetchTeamAndInvites();
-  }, [selectedBusiness]);
+  }, [activeBizId, activeOrgId, businesses]); // 👈 Listens to businesses updating to resolve delayed context hydration instantly
 
-  // Handle document attachment array pipelines
+  // Update URL directly via Router parameter modifications to prevent infinite rendering cycles
+  const handleSelectBusiness = (biz: typeof businesses[0]) => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.set('orgId', biz.org_id.toString());
+    params.set('bizId', biz.id.toString());
+    router.push(`${window.location.pathname}?${params.toString()}`);
+  };
+
   const handleUpload = async (e: ChangeEvent<HTMLInputElement>) => {
-    if (!e.target.files || e.target.files.length === 0 || !selectedBusiness) return;
+    if (!e.target.files || e.target.files.length === 0 || !activeBizId) return;
 
     setUploading(true);
     const formData = new FormData();
-    formData.append("business_id", selectedBusiness.id.toString());
+    formData.append("business_id", activeBizId.toString());
 
     Array.from(e.target.files).forEach((file) => {
       formData.append("files", file);
@@ -182,7 +202,7 @@ export default function EnterpriseBusinessDetail() {
           id: u.document_id.toString(),
           name: u.filename,
           type: u.filename.split('.').pop()?.toUpperCase() || 'UNKNOWN',
-          business_id: selectedBusiness.id
+          business_id: activeBizId
         }));
         setDocuments((prev) => [...newDocs, ...prev]);
       }
@@ -193,15 +213,13 @@ export default function EnterpriseBusinessDetail() {
     }
   };
 
-  // Handle absolute data purging requests
   const handleDeleteDoc = async (docId: string) => {
-    if (!selectedBusiness) return;
+    if (!activeBizId) return;
     try {
-      const res = await fetch(`http://localhost:8000/documents/${docId}?business_id=${selectedBusiness.id}`,
-        {
-          credentials: "include",
-          method: "DELETE",
-        });
+      const res = await fetch(`http://localhost:8000/documents/${docId}?business_id=${activeBizId}`, {
+        credentials: "include",
+        method: "DELETE",
+      });
       if (res.ok) {
         setDocuments((prev) => prev.filter(d => d.id !== docId));
       }
@@ -210,9 +228,8 @@ export default function EnterpriseBusinessDetail() {
     }
   };
 
-  // Handle mutations to query pool allocations
   const handleSaveSettings = async () => {
-    if (!selectedBusiness) return;
+    if (!activeBizId) return;
     setIsSavingSettings(true);
     setSettingsError(null);
     try {
@@ -220,7 +237,7 @@ export default function EnterpriseBusinessDetail() {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          business_id: selectedBusiness.id,
+          business_id: activeBizId,
           query_allocation: Number(localAlloc)
         }),
         credentials: "include",
@@ -229,8 +246,8 @@ export default function EnterpriseBusinessDetail() {
         const data = await res.json();
         throw new Error(data.detail || "Could not patch settings profile.");
       }
-
-      selectedBusiness.query_allocation = Number(localAlloc);
+      
+      setBusinessDetails(prev => prev ? { ...prev, query_allocation: Number(localAlloc) } : null);
     } catch (err: any) {
       setSettingsError(err.message || "An unhandled error occurred.");
     } finally {
@@ -238,23 +255,22 @@ export default function EnterpriseBusinessDetail() {
     }
   };
 
-  // Inline single business invite action pipeline
   const handleInlineInvite = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inviteEmail.trim() || !selectedBusiness) return;
+    if (!inviteEmail.trim() || !activeBizId || !activeOrgId) return;
 
     setIsSendingInvite(true);
     setInviteStatus(null);
 
     try {
-      const res = await fetch(`http://localhost:8000/organizations/${selectedBusiness.org_id}/invite`, {
+      const res = await fetch(`http://localhost:8000/organizations/${activeOrgId}/invite`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
         body: JSON.stringify({
           email: inviteEmail.trim(),
           role: "member",
-          business_ids: [selectedBusiness.id]
+          business_ids: [activeBizId]
         })
       });
 
@@ -265,7 +281,6 @@ export default function EnterpriseBusinessDetail() {
 
       setInviteStatus({ type: 'success', message: `Invitation dispatched successfully to ${inviteEmail}!` });
 
-      // Optimistically inject the new entry directly into the unified allMembers tracking engine
       const simulatedInvite = {
         id: `pending_${Math.random().toString()}`,
         email: inviteEmail.trim(),
@@ -282,13 +297,11 @@ export default function EnterpriseBusinessDetail() {
     }
   };
 
-  // ── REVOKE/DELETE PENDING SEAT INVITE FROM UNIFIED ARRAYS ──
   const handleRevokeInvite = async (inviteId: string) => {
-    if (!selectedBusiness) return;
+    if (!activeOrgId) return;
     try {
-      // Clean string prefix parsing if needed to evaluate pure backend integer/string IDs
       const parsedId = inviteId.replace('pending_', '');
-      const res = await fetch(`http://localhost:8000/organizations/${selectedBusiness.org_id}/invitations/${parsedId}`, {
+      const res = await fetch(`http://localhost:8000/organizations/${activeOrgId}/invitations/${parsedId}`, {
         method: "DELETE",
         credentials: "include"
       });
@@ -300,14 +313,6 @@ export default function EnterpriseBusinessDetail() {
     }
   };
 
-  if (contextLoading) {
-    return (
-      <div className="screen" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '520px' }}>
-        <Loader2 className="animate-spin" size={24} style={{ color: 'var(--color-text-info)' }} />
-      </div>
-    );
-  }
-
   return (
     <div className="screen" style={{ position: 'relative' }}>
 
@@ -318,7 +323,7 @@ export default function EnterpriseBusinessDetail() {
             <ArrowLeft size={14} /> Dashboard
           </Link>
 
-          {/* Location Picker Custom Input Selector */}
+          {/* Switcher Dropdown Menu */}
           <div style={{ position: 'relative', width: '280px' }}>
             <button
               className="btn"
@@ -327,7 +332,7 @@ export default function EnterpriseBusinessDetail() {
             >
               <span style={{ display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontSize: '13px', fontWeight: 500 }}>
                 <Building2 size={14} style={{ color: 'var(--color-text-secondary)' }} />
-                {selectedBusiness ? selectedBusiness.name : "Select a business..."}
+                {contextLoading ? "Loading details..." : businessDetails ? businessDetails.name : "Select a business..."}
               </span>
               <ChevronsUpDown size={14} style={{ color: 'var(--color-text-tertiary)', flexShrink: 0 }} />
             </button>
@@ -351,11 +356,11 @@ export default function EnterpriseBusinessDetail() {
                         key={biz.id}
                         style={{
                           ...s.dropdownItem,
-                          background: selectedBusiness?.id === biz.id ? 'var(--color-background-secondary, #f4f4f5)' : 'transparent',
-                          fontWeight: selectedBusiness?.id === biz.id ? 600 : 400
+                          background: activeBizId === biz.id ? 'var(--color-background-secondary, #f4f4f5)' : 'transparent',
+                          fontWeight: activeBizId === biz.id ? 600 : 400
                         }}
                         onClick={() => {
-                          selectBusiness(biz);
+                          handleSelectBusiness(biz);
                           setIsDropdownOpen(false);
                           setSearchQuery('');
                         }}
@@ -370,7 +375,7 @@ export default function EnterpriseBusinessDetail() {
           </div>
         </div>
 
-        {selectedBusiness && (
+        {activeBizId && (
           <Link href="/search" className="btn btn-primary" style={{ flexShrink: 0, fontSize: '13px' }}>
             <Search size={14} /> Open search
           </Link>
@@ -379,7 +384,7 @@ export default function EnterpriseBusinessDetail() {
 
       {/* ── MAIN WORKSPACE CONTENT WINDOW ── */}
       <div style={{ padding: '24px' }}>
-        {!selectedBusiness ? (
+        {!activeBizId ? (
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '360px', color: 'var(--color-text-secondary)', gap: '12px' }}>
             <Building2 size={36} style={{ strokeWidth: 1.5, color: 'var(--color-text-secondary)' }} />
             <div style={{ fontSize: '14px', textAlign: 'center' }}>
@@ -392,15 +397,17 @@ export default function EnterpriseBusinessDetail() {
             {/* Context Sub-Header info block */}
             <div style={{ padding: '20px 24px', borderBottom: '1px solid var(--color-border-tertiary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#fafafa' }}>
               <div>
-                <h1 style={{ fontSize: '16px', fontWeight: 600, margin: 0 }}>{selectedBusiness.name}</h1>
-                <p style={{ fontSize: '11px', color: 'var(--color-text-secondary)', margin: '4px 0 0 0' }}>Instance Resource Key: #{selectedBusiness.id}</p>
+                <h1 style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '16px', fontWeight: 600, margin: 0 }}>
+                  {contextLoading && <Loader2 className="animate-spin" size={14} style={{ color: 'var(--color-text-info)' }} />}
+                  {businessDetails ? businessDetails.name : "Loading Workspace details..."}
+                </h1>
+                <p style={{ fontSize: '11px', color: 'var(--color-text-secondary)', margin: '4px 0 0 0' }}>Instance Resource Key: #{activeBizId}</p>
               </div>
               <button 
                 className="btn btn-secondary" 
                 style={{ fontSize: '12px', padding: '4px 10px', color: '#ef4444' }} 
                 onClick={() => {
-                  clearSelection();
-                  router.push(window.location.pathname); // Strips the query URL markers on context unmount
+                  router.push(window.location.pathname); // Strips all parameters from URL routing layers entirely
                 }}
               >
                 Unmount Context
@@ -475,7 +482,7 @@ export default function EnterpriseBusinessDetail() {
                 </div>
               )}
 
-              {/* SUB-PANEL 2: USAGE ALIGNMENT ALLOCATIONS */}
+              {/* SUB-PANEL 2: USAGE LIMITS */}
               {activeTab === 'settings' && (
                 <div style={{ maxWidth: '480px' }}>
                   <h3 style={{ fontSize: '14px', fontWeight: 500, margin: '0 0 4px 0' }}>Quota Threshold Controls</h3>
@@ -510,7 +517,7 @@ export default function EnterpriseBusinessDetail() {
                 </div>
               )}
 
-              {/* SUB-PANEL 3: SEAT COLLABORATORS PERMISSIONS */}
+              {/* SUB-PANEL 3: ACCESS CONTROL */}
               {activeTab === 'team' && (
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
@@ -520,7 +527,7 @@ export default function EnterpriseBusinessDetail() {
                     </div>
                   </div>
 
-                  {/* Single Invite MVP Form */}
+                  {/* Single Invite Form */}
                   <form onSubmit={handleInlineInvite} style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxWidth: '480px', marginBottom: '24px' }}>
                     <div style={{ display: 'flex', gap: '8px' }}>
                       <input
@@ -560,7 +567,6 @@ export default function EnterpriseBusinessDetail() {
                     )}
                   </form>
 
-                  {/* ── COMPONENT LOADING RENDER SPINNER ── */}
                   {teamLoading ? (
                     <div style={{ padding: '24px', display: 'flex', justifyContent: 'center' }}>
                       <Loader2 className="animate-spin" size={20} />

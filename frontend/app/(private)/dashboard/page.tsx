@@ -107,10 +107,10 @@ export default function AdminDashboard() {
     fetchWorkspaceMetrics();
   }, [currentOrgId]);
 
-  // Add this hook to keep your BusinessContext data in sync with the selected organization
+  // Keep BusinessContext data in sync with the selected organization
   useEffect(() => {
     if (currentOrgId && refreshBusinesses) {
-      refreshBusinesses([currentOrgId]); // Wraps the active ID in an array payload
+      refreshBusinesses([currentOrgId]);
     }
   }, [currentOrgId]);
 
@@ -151,7 +151,7 @@ export default function AdminDashboard() {
 
   const activeOrg = organizations.find(o => o.id === currentOrgId);
 
-  // ── Read dynamic tier bounds directly from backend profile response payload ──
+  // Read dynamic tier bounds directly from backend profile response payload
   const userPlanKey = userProfile?.plan?.toLowerCase() || 'free';
 
   const maxOrganizationsAllowed = userProfile?.max_organizations ?? 1;
@@ -213,7 +213,7 @@ export default function AdminDashboard() {
       }
 
       if (refreshBusinesses && currentOrgId) {
-        await refreshBusinesses([currentOrgId]); // 👈 Change this line to pass the ID inside an array
+        await refreshBusinesses([currentOrgId]);
       } else {
         window.location.reload();
       }
@@ -227,10 +227,16 @@ export default function AdminDashboard() {
     }
   };
 
-  // Synchronizes context selection, then pushes programmatic routing to /businesses
+  // Synchronizes context selection, then explicitly maps key references directly to URL parameters
   const handleManageBusinessRedirect = (biz: any) => {
     selectBusiness(biz);
-    router.push('/businesses');
+    
+    // Explicitly structure routing context metrics straight into URL query strings
+    if (currentOrgId) {
+      router.push(`/businesses?orgId=${currentOrgId}&bizId=${biz.id}`);
+    } else {
+      router.push(`/businesses?orgId=${biz.org_id}&bizId=${biz.id}`);
+    }
   };
 
   return (
@@ -385,10 +391,10 @@ export default function AdminDashboard() {
             })}
           </div>
         )}
+        
         {/* Global Performance Metrics */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' }}>
           {metricsData?.is_owner ? (
-            // ── BILL PAYER VIEW: Total Shared Pool Progress ──
             <MetricCard
               label="Account usage this month"
               value={String(metricsData.total_combined_usage)}
@@ -396,7 +402,6 @@ export default function AdminDashboard() {
               progressPercentage={Math.min(Math.round((metricsData.total_combined_usage / metricsData.max_queries_allowed) * 100), 100)}
             />
           ) : (
-            // ── COLLABORATOR VIEW: Flat Individual Activity Tracker ──
             <MetricCard
               label="Your searches this month"
               value={String(metricsData?.personal_user_usage ?? 0)}

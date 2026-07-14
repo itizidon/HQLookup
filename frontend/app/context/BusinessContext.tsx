@@ -4,7 +4,7 @@ import {
   createContext,
   useContext,
   useReducer,
-  useEffect,
+  useCallback, // 👈 Added useCallback
   ReactNode,
 } from "react";
 
@@ -12,7 +12,7 @@ import {
 export type Business = {
   id: number;
   name: string;
-  org_id: number; // Added org_id to match your backend payload
+  org_id: number;
 };
 
 type State = {
@@ -23,7 +23,7 @@ type State = {
 
 type Action =
   | { type: "SET_BUSINESSES"; payload: Business[] }
-  | { type: "SELECT_BUSINESS"; payload: Business }
+  | { type: "SELECT_BUSINESS"; payload: Business | null } // Allowed null here for clearSelection
   | { type: "CLEAR_SELECTION" }
   | { type: "SET_LOADING"; payload: boolean };
 
@@ -40,6 +40,7 @@ function businessReducer(state: State, action: Action): State {
         ...state,
         businesses: action.payload,
         isLoading: false,
+        // Auto-select the first business if we don't have one selected yet
         selectedBusiness: state.selectedBusiness || action.payload[0] || null,
       };
     case "SELECT_BUSINESS":
@@ -59,7 +60,8 @@ type BusinessContextType = {
   isLoading: boolean;
   selectBusiness: (business: Business) => void;
   clearSelection: () => void;
-  // ✅ FIX 1: Updated signature to accept orgIds array
+  setBusinesses: (businesses: Business[]) => void; // 👈 Expose stable setter
+  setIsLoading: (loading: boolean) => void;        // 👈 Expose stable setter
   refreshBusinesses: (orgIds: number[]) => Promise<Business[] | undefined>;
 };
 
@@ -68,8 +70,19 @@ const BusinessContext = createContext<BusinessContextType | undefined>(undefined
 export function BusinessProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(businessReducer, initialState);
 
-  // Updated handler to correctly pass arrays to your POST endpoint
-  const refreshBusinesses = async (orgIds: number[]) => {
+  // ✅ Stable Setter 1: Wrapped in useCallback to prevent reference changes
+  const setBusinesses = useCallback((businesses: Business[]) => {
+    dispatch({ type: "SET_BUSINESSES", payload: businesses });
+  }, []);
+
+  // ✅ Stable Setter 2: Wrapped in useCallback
+  const setIsLoading = useCallback((loading: boolean) => {
+    dispatch({ type: "SET_LOADING", payload: loading });
+  }, []);
+
+  // ✅ FIX: Wrapped in useCallback with an empty dependency array.
+  // This guarantees its reference NEVER changes, breaking the infinite loop in your Gate's useEffect!
+  const refreshBusinesses = useCallback(async (orgIds: number[]) => {
     if (!orgIds || orgIds.length === 0) {
       dispatch({ type: "SET_BUSINESSES", payload: [] });
       return [];
@@ -91,27 +104,23 @@ export function BusinessProvider({ children }: { children: ReactNode }) {
       if (!res.ok) throw new Error("Could not reconcile business data.");
       
       const data = await res.json();
+      const businessesList = data.businesses || [];
       
-      // ✅ FIX 2: You forgot to dispatch the loaded businesses to your reducer!
-      dispatch({ type: "SET_BUSINESSES", payload: data.businesses });
-      return data.businesses as Business[];
+      dispatch({ type: "SET_BUSINESSES", payload: businessesList });
+      return businessesList as Business[];
     } catch (err) {
       console.error("Multi-org fetch failed:", err);
       dispatch({ type: "SET_LOADING", payload: false });
     }
-  };
+  }, []); // 👈 Keeps this function reference static across all renders
 
-  // ✅ FIX 3: Removed the blank initial useEffect mount call because the context 
-  // doesn't know *which* organization's businesses to grab until the user logs in 
-  // or your AdminDashboard component triggers it with an active layout array context.
-
-  const selectBusiness = (business: Business) => {
+  const selectBusiness = useCallback((business: Business) => {
     dispatch({ type: "SELECT_BUSINESS", payload: business });
-  };
+  }, []);
 
-  const clearSelection = () => {
+  const clearSelection = useCallback(() => {
     dispatch({ type: "CLEAR_SELECTION" });
-  };
+  }, []);
 
   return (
     <BusinessContext.Provider
@@ -121,6 +130,8 @@ export function BusinessProvider({ children }: { children: ReactNode }) {
         isLoading: state.isLoading,
         selectBusiness,
         clearSelection,
+        setBusinesses,
+        setIsLoading,
         refreshBusinesses,
       }}
     >
