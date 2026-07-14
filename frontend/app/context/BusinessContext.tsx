@@ -8,9 +8,11 @@ import {
   ReactNode,
 } from "react";
 
+// Update type definition to match your new multi-tenant organization structure
 export type Business = {
   id: number;
   name: string;
+  org_id: number; // Added org_id to match your backend payload
 };
 
 type State = {
@@ -38,7 +40,6 @@ function businessReducer(state: State, action: Action): State {
         ...state,
         businesses: action.payload,
         isLoading: false,
-        // Auto-select the first business as a baseline default if none selected
         selectedBusiness: state.selectedBusiness || action.payload[0] || null,
       };
     case "SELECT_BUSINESS":
@@ -58,7 +59,8 @@ type BusinessContextType = {
   isLoading: boolean;
   selectBusiness: (business: Business) => void;
   clearSelection: () => void;
-  refreshBusinesses: () => Promise<void>;
+  // ✅ FIX 1: Updated signature to accept orgIds array
+  refreshBusinesses: (orgIds: number[]) => Promise<Business[] | undefined>;
 };
 
 const BusinessContext = createContext<BusinessContextType | undefined>(undefined);
@@ -66,28 +68,42 @@ const BusinessContext = createContext<BusinessContextType | undefined>(undefined
 export function BusinessProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(businessReducer, initialState);
 
-  const refreshBusinesses = async () => {
+  // Updated handler to correctly pass arrays to your POST endpoint
+  const refreshBusinesses = async (orgIds: number[]) => {
+    if (!orgIds || orgIds.length === 0) {
+      dispatch({ type: "SET_BUSINESSES", payload: [] });
+      return [];
+    }
+
+    dispatch({ type: "SET_LOADING", payload: true });
     try {
-      dispatch({ type: "SET_LOADING", payload: true });
-      // Replace with your proxy domain setup if running outside localhost
       const res = await fetch("http://localhost:8000/me/businesses", {
-        headers: { "Content-Type": "application/json" },
-        // If cookies/session auth is handling get_current_user:
-        credentials: "include", 
+        method: "POST",
+        credentials: "include",
+        headers: { 
+          "Content-Type": "application/json" 
+        },
+        body: JSON.stringify({
+          org_ids: orgIds 
+        }),
       });
+  
+      if (!res.ok) throw new Error("Could not reconcile business data.");
+      
       const data = await res.json();
-      if (data.businesses) {
-        dispatch({ type: "SET_BUSINESSES", payload: data.businesses });
-      }
+      
+      // ✅ FIX 2: You forgot to dispatch the loaded businesses to your reducer!
+      dispatch({ type: "SET_BUSINESSES", payload: data.businesses });
+      return data.businesses as Business[];
     } catch (err) {
-      console.error("Failed to sync client accounts:", err);
+      console.error("Multi-org fetch failed:", err);
       dispatch({ type: "SET_LOADING", payload: false });
     }
   };
 
-  useEffect(() => {
-    refreshBusinesses();
-  }, []);
+  // ✅ FIX 3: Removed the blank initial useEffect mount call because the context 
+  // doesn't know *which* organization's businesses to grab until the user logs in 
+  // or your AdminDashboard component triggers it with an active layout array context.
 
   const selectBusiness = (business: Business) => {
     dispatch({ type: "SELECT_BUSINESS", payload: business });
