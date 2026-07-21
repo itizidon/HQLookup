@@ -102,6 +102,7 @@ class Document(Base):
     business_id     = Column(Integer, ForeignKey("businesses.id"), nullable=False, index=True)
     filename        = Column(String, nullable=False)
     content         = Column(Text, nullable=True)
+    description     = Column(Text, nullable=True)  # Stores spreadsheet context / user notes
     status          = Column(String, nullable=False, default="ready")
     created_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

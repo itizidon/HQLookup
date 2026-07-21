@@ -1,7 +1,9 @@
 import uvicorn
+import json
 from fastapi import FastAPI, UploadFile, File, Depends, Query, HTTPException, Form, status
-from typing import List, Tuple
+from typing import List, Optional
 from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
 from app.database import get_db
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -69,11 +71,13 @@ class DocumentRequest(BaseModel):
     page:         int = 1
     page_size:    int = 50
 
+# If your Pydantic schema looks like this:
 class DocumentResponseItem(BaseModel):
-    id:     int
-    name:   str
-    type:   str
+    id: int
+    name: str
+    type: str
     status: str
+    description: Optional[str] = None  # 👈 Make sure this is Optional!
 
 class DocumentListResponse(BaseModel):
     documents: List[DocumentResponseItem]
@@ -300,6 +304,7 @@ async def get_comprehensive_usage_metrics(
 @app.post("/upload-multiple")
 async def upload_documents(
     business_id:     int              = Form(...),
+    file_contexts:   Optional[str]    = Form(None),  # JSON string from frontend
     current_context: User             = Depends(get_current_user),
     files:           List[UploadFile] = File(...),
     db:              Session          = Depends(get_db),
@@ -315,23 +320,58 @@ async def upload_documents(
     if not business:
         raise HTTPException(status_code=403, detail="Business not found or access denied.")
 
+    # Parse optional JSON map: {"filename.xlsx": "context note"}
+    contexts_map = {}
+    if file_contexts:
+        try:
+            contexts_map = json.loads(file_contexts)
+        except Exception as e:
+            print(f"Failed to parse file_contexts payload: {e}")
+
     uploaded = []
     for file in files:
-        temp_path = f"/tmp/{uuid.uuid4()}_{file.filename}"
-        with open(temp_path, "wb") as f:
-            f.write(await file.read())
+        # 1. Sanitize filename & retrieve specific context note FIRST
+        safe_filename = Path(file.filename).name
+        specific_context = contexts_map.get(safe_filename, "").strip() or None
 
-        doc = Document(business_id=business.id, filename=file.filename, content="", status="ready")
+        temp_path = f"/tmp/{uuid.uuid4()}_{safe_filename}"
+        
+        # 2. Save temporary file to disk
+        contents = await file.read()
+        with open(temp_path, "wb") as f:
+            f.write(contents)
+
+        # 3. Create document record with description attached
+        doc = Document(
+            business_id=business.id, 
+            filename=safe_filename, 
+            content="", 
+            description=specific_context,
+            status="ready"
+        )
         db.add(doc)
         db.commit()
         db.refresh(doc)
 
-        chunks_count = ingest_document(
-            db=db, business_id=business.id, document_id=doc.id,
-            file_path=temp_path, mime_type=file.content_type, filename=file.filename,
-        )
-        uploaded.append({"filename": file.filename, "document_id": doc.id, "chunks": chunks_count})
-        os.remove(temp_path)
+        # 4. Ingest and chunk document
+        try:
+            chunks_count = ingest_document(
+                db=db, 
+                business_id=business.id, 
+                document_id=doc.id,
+                file_path=temp_path, 
+                mime_type=file.content_type, 
+                filename=safe_filename,
+                file_context=specific_context
+            )
+            uploaded.append({
+                "filename": safe_filename, 
+                "document_id": doc.id, 
+                "chunks": chunks_count
+            })
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     clear_active_query(user.id)
     return {"uploaded": uploaded}
@@ -347,32 +387,48 @@ async def get_documents(
     user, _      = current_auth
     user_org_ids = get_user_org_ids(db, user.id)
 
+    # 1. Authorize requested business IDs
     allowed_business_ids = {
         b.id for b in db.query(Business.id).filter(Business.org_id.in_(user_org_ids)).all()
     }
+    
+    if not payload.business_ids:
+        return DocumentListResponse(documents=[], total=0)
+
     for requested_id in payload.business_ids:
         if requested_id not in allowed_business_ids:
             raise HTTPException(status_code=403, detail=f"Not authorized for business ID: {requested_id}")
 
-    offset        = (payload.page - 1) * payload.page_size
+    # 2. Compute safe pagination bounds
+    page = max(payload.page, 1)
+    page_size = max(payload.page_size, 1)
+    offset = (page - 1) * page_size
+
+    # 3. Query documents
+    query = db.query(Document).filter(Document.business_id.in_(payload.business_ids))
+    total_count = query.count()  # Optional: include if response schema requires total
+
     query_results = (
-        db.query(Document)
-        .filter(Document.business_id.in_(payload.business_ids))
+        query
         .order_by(Document.created_at.desc())
         .offset(offset)
-        .limit(payload.page_size)
+        .limit(page_size)
         .all()
     )
 
-    return DocumentListResponse(documents=[
+    # 4. Construct response items with description attached
+    documents = [
         DocumentResponseItem(
             id=doc.id,
             name=doc.filename,
-            type=doc.filename.split(".")[-1].upper() if "." in doc.filename else "FILE",
+            type=doc.filename.rsplit(".", 1)[-1].upper() if "." in doc.filename else "FILE",
             status=doc.status,
+            description=doc.description,  # Pass new field to Pydantic
         )
         for doc in query_results
-    ])
+    ]
+
+    return DocumentListResponse(documents=documents, total=total_count)
 
 
 # ── Get businesses (multi-org) ─────────────────────────────────────────────────

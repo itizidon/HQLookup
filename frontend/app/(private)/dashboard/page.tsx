@@ -107,13 +107,6 @@ export default function AdminDashboard() {
     fetchWorkspaceMetrics();
   }, [currentOrgId]);
 
-  // Keep BusinessContext data in sync with the selected organization
-  useEffect(() => {
-    if (currentOrgId && refreshBusinesses) {
-      refreshBusinesses([currentOrgId]);
-    }
-  }, [currentOrgId]);
-
   useEffect(() => {
     const fetchUserDataAndWorkspaces = async () => {
       try {
@@ -230,7 +223,7 @@ export default function AdminDashboard() {
   // Synchronizes context selection, then explicitly maps key references directly to URL parameters
   const handleManageBusinessRedirect = (biz: any) => {
     selectBusiness(biz);
-    
+
     // Explicitly structure routing context metrics straight into URL query strings
     if (currentOrgId) {
       router.push(`/businesses?orgId=${currentOrgId}&bizId=${biz.id}`);
@@ -256,7 +249,15 @@ export default function AdminDashboard() {
                 <div style={s.dropdownContainer}>
                   <select
                     value={currentOrgId ?? ""}
-                    onChange={(e) => setCurrentOrgId(Number(e.target.value))}
+                    onChange={(e) => {
+                      const newOrgId = Number(e.target.value);
+                      setCurrentOrgId(newOrgId);
+
+                      const alreadyLoaded = businesses.some(b => b.org_id === newOrgId);
+                      if (!alreadyLoaded && refreshBusinesses) {
+                        refreshBusinesses([newOrgId]);
+                      }
+                    }}
                     style={s.orgSelect}
                   >
                     {organizations.map(org => (
@@ -391,7 +392,7 @@ export default function AdminDashboard() {
             })}
           </div>
         )}
-        
+
         {/* Global Performance Metrics */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' }}>
           {metricsData?.is_owner ? (

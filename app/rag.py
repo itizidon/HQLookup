@@ -5,8 +5,9 @@ Handles: document ingestion → chunking → embedding → PostgreSQL storage �
 import os
 import json
 import redis
+import pandas as pd
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -73,6 +74,190 @@ ACTIVE_QUERY_TTL_SECONDS = 60 * 60 * 6  # 6 hours
 
 # ── Singleton embedder ─────────────────────────────────────────────────────────
 _embedder = None
+
+
+def analyze_sheet_structure(
+    raw_rows: list,
+    sheet_name: str,
+    filename: str,
+    user_context: Optional[str] = None,
+) -> dict:
+    """
+    Sends raw rows (as CSV text) to the LLM and asks it to identify:
+      - Where the real header row is
+      - Whether there are multiple tables
+      - What each table represents
+      - Which columns are IDs vs dollar amounts vs dates
+ 
+    Returns a dict the ingestion code uses to read the file correctly.
+    """
+    # Convert raw rows to readable CSV-ish text (max 30 rows to stay within tokens)
+    row_lines = []
+    for i, row in enumerate(raw_rows[:30]):
+        vals = [str(v) if pd.notna(v) else "" for v in row]
+        row_lines.append(f"Row {i}: {' | '.join(vals)}")
+    raw_sample = "\n".join(row_lines)
+ 
+    prompt = f"""You are analyzing a raw Excel sheet to prepare it for ingestion into a vector search database.
+ 
+Filename: {filename}
+Sheet: {sheet_name}
+User context: {user_context or 'None provided'}
+ 
+Raw sheet content (first 30 rows, zero-indexed):
+{raw_sample}
+ 
+Analyze this sheet and respond with ONLY valid JSON — no markdown, no explanation.
+ 
+Return this exact structure:
+{{
+  "tables": [
+    {{
+      "table_name": "descriptive name for this table",
+      "header_row": 0,
+      "data_start_row": 1,
+      "data_end_row": null,
+      "description": "what each row represents in plain english",
+      "column_notes": {{
+        "ColumnName": "what this column contains — flag if it is an ID/reference not a dollar amount"
+      }},
+      "disambiguation": "any important notes to prevent the LLM from confusing columns e.g. Statement Number is a bill ID not a dollar amount"
+    }}
+  ],
+  "skip_rows": [],
+  "structural_notes": "any other important layout notes"
+}}
+ 
+Rules:
+- header_row is the zero-based row index where the REAL column headers are
+- data_start_row is the first row of actual data (usually header_row + 1)
+- data_end_row is null if data goes to the end, otherwise the last data row index
+- skip_rows lists row indices that are metadata/totals/blank — NOT real data
+- If there are multiple separate tables on the same sheet, list each one
+- If all columns are unnamed, set header_row to the row with the most descriptive text
+- IMPORTANT: Identify columns that look like amounts/money vs ID numbers"""
+ 
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,  # low temp — we want structured reliable output
+            max_tokens=800,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        result = json.loads(raw)
+        print(f"[LLM Structure] {sheet_name}: {len(result.get('tables', []))} table(s) detected")
+        return result
+    except Exception as e:
+        print(f"[LLM Structure] Failed for {sheet_name}: {e} — using fallback detection")
+        return None
+ 
+ 
+def fallback_detect_header(df_raw: pd.DataFrame) -> int:
+    """Score-based header detection when LLM fails."""
+    best_score = 0
+    best_row   = 0
+    for i in range(min(20, len(df_raw))):
+        row_vals = df_raw.iloc[i].tolist()
+        score = sum(
+            1 for v in row_vals
+            if isinstance(v, str)
+            and len(v.strip()) > 1
+            and not v.strip().replace(".", "").replace(",", "").replace("-", "").isnumeric()
+        )
+        # Penalize if first cell looks like a date
+        first = str(row_vals[0]) if row_vals else ""
+        if any(yr in first for yr in ["2020", "2021", "2022", "2023", "2024", "2025", "2026"]):
+            score -= 3
+        if score > best_score:
+            best_score = score
+            best_row   = i
+    return best_row
+ 
+ 
+def extract_table_from_structure(
+    df_raw: pd.DataFrame,
+    table_spec: dict,
+    sheet_name: str,
+) -> tuple[str, pd.DataFrame, str, str]:
+    """
+    Uses the LLM-provided table spec to correctly slice and header the DataFrame.
+    Returns (table_name, clean_df, description, disambiguation).
+    """
+    header_row     = table_spec.get("header_row", 0)
+    data_start     = table_spec.get("data_start_row", header_row + 1)
+    data_end       = table_spec.get("data_end_row", None)
+    table_name     = table_spec.get("table_name", sheet_name)
+    description    = table_spec.get("description", "")
+    disambiguation = table_spec.get("disambiguation", "")
+    skip_rows      = table_spec.get("skip_rows", [])
+ 
+    # Extract header from the identified row
+    headers = df_raw.iloc[header_row].tolist()
+    headers = [
+        str(h).replace("\n", " ").strip() if pd.notna(h) else f"Column_{i}"
+        for i, h in enumerate(headers)
+    ]
+ 
+    # Slice data rows
+    if data_end is not None:
+        df_data = df_raw.iloc[data_start:data_end + 1].copy()
+    else:
+        df_data = df_raw.iloc[data_start:].copy()
+ 
+    df_data.columns = headers
+ 
+    # Drop skip rows (adjust index since we sliced)
+    adjusted_skips = [r - data_start for r in skip_rows if data_start <= r < (data_end or len(df_raw))]
+    if adjusted_skips:
+        df_data = df_data.drop(index=adjusted_skips, errors="ignore")
+ 
+    # Drop unnamed columns
+    df_data = df_data[[c for c in df_data.columns if not str(c).startswith("Unnamed:") and str(c).strip() not in ("", "nan")]]
+ 
+    # Drop fully empty rows
+    df_data = df_data.dropna(how="all").reset_index(drop=True)
+ 
+    return table_name, df_data, description, disambiguation
+ 
+ 
+def build_schema_chunk(
+    table_name: str,
+    df: pd.DataFrame,
+    filename: str,
+    description: str,
+    disambiguation: str,
+    user_context: Optional[str],
+    column_notes: dict,
+) -> str:
+    """Builds the schema header chunk (chunk_index=0 for this table)."""
+    sample_lines = []
+    for col in df.columns:
+        samples = (
+            df[col].dropna().astype(str).str.strip()
+            .loc[lambda s: s != ""].unique()[:3].tolist()
+        )
+        note = column_notes.get(col, "")
+        flag = f" [{note}]" if note else ""
+        sample_lines.append(
+            f"  - {col}{flag}: e.g. {', '.join(samples)}" if samples else f"  - {col}{flag}"
+        )
+ 
+    parts = [
+        f"[Table: {table_name}]",
+        f"Source file: {filename}",
+    ]
+    if description:
+        parts.append(f"Description: {description}")
+    if user_context:
+        parts.append(f"User notes: {user_context}")
+    parts.append(f"Rows: {len(df)} | Columns: {len(df.columns)}")
+    parts.append("Columns and sample values:\n" + "\n".join(sample_lines))
+    if disambiguation:
+        parts.append(f"\nIMPORTANT — Column disambiguation:\n{disambiguation}")
+ 
+    return "\n".join(parts)
 
 def get_embedder() -> SentenceTransformer:
     global _embedder
@@ -443,77 +628,156 @@ def ingest_document(
     file_path: str,
     mime_type: str,
     filename: str,
+    file_context: Optional[str] = None,
 ) -> int:
     from app.models import Chunk
-    import pandas as pd
-
+ 
     ext      = Path(file_path).suffix.lower()
     embedder = get_embedder()
     chunks   = []
-
+ 
     if ext in [".csv", ".xlsx", ".xls"]:
         try:
-            df = pd.read_csv(file_path) if ext == ".csv" else pd.read_excel(file_path)
-
-            df.columns = [str(c).strip() for c in df.columns]
-            col_list   = ", ".join(df.columns.tolist())
-            num_rows   = len(df)
-            table_name = Path(filename).stem.replace("_", " ").replace("-", " ").title()
-
-            sample_lines = []
-            for col in df.columns:
-                samples = (
-                    df[col].dropna().astype(str).str.strip()
-                    .loc[lambda s: s != ""].unique()[:3].tolist()
+            # ── Collect all (table_name, df, description, disambiguation) tuples ──
+            table_frames: List[tuple] = []
+ 
+            if ext == ".csv":
+                # CSV: simpler — read raw, detect header, clean
+                df_raw = pd.read_csv(file_path, header=None)
+                raw_rows = df_raw.values.tolist()
+ 
+                structure = analyze_sheet_structure(raw_rows, filename, filename, file_context)
+                if structure and structure.get("tables"):
+                    spec = structure["tables"][0]
+                    table_name, df, description, disambiguation = extract_table_from_structure(
+                        df_raw, spec, filename
+                    )
+                    col_notes = spec.get("column_notes", {})
+                else:
+                    # Fallback
+                    header_row = fallback_detect_header(df_raw)
+                    df_raw.columns = df_raw.iloc[header_row].astype(str).str.strip()
+                    df = df_raw.iloc[header_row + 1:].dropna(how="all").reset_index(drop=True)
+                    table_name  = Path(filename).stem.replace("_", " ").replace("-", " ").title()
+                    description = ""
+                    disambiguation = ""
+                    col_notes = {}
+ 
+                table_frames.append((table_name, df, description, disambiguation, col_notes))
+ 
+            else:
+                # XLSX: process every non-empty sheet
+                xl = pd.ExcelFile(file_path)
+ 
+                for sheet_name in xl.sheet_names:
+                    df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+ 
+                    # Skip empty sheets
+                    if df_raw.dropna(how="all").empty:
+                        print(f"[Ingest] Skipping empty sheet: {sheet_name}")
+                        continue
+ 
+                    raw_rows = df_raw.values.tolist()
+ 
+                    # ── Ask LLM to analyse the raw sheet ──────────────────────
+                    structure = analyze_sheet_structure(raw_rows, sheet_name, filename, file_context)
+ 
+                    if structure and structure.get("tables"):
+                        # LLM found one or more tables
+                        for table_spec in structure["tables"]:
+                            try:
+                                table_name, df, description, disambiguation = extract_table_from_structure(
+                                    df_raw, table_spec, sheet_name
+                                )
+                                col_notes = table_spec.get("column_notes", {})
+                                if not df.empty:
+                                    table_frames.append((table_name, df, description, disambiguation, col_notes))
+                            except Exception as e:
+                                print(f"[Ingest] Failed to extract table from {sheet_name}: {e}")
+                    else:
+                        # LLM failed — use score-based fallback
+                        header_row = fallback_detect_header(df_raw)
+                        df_raw.columns = (
+                            df_raw.iloc[header_row]
+                            .astype(str)
+                            .str.replace("\n", " ")
+                            .str.strip()
+                        )
+                        df = df_raw.iloc[header_row + 1:].dropna(how="all").reset_index(drop=True)
+                        df = df[[c for c in df.columns if not str(c).startswith("Unnamed:")]]
+                        table_name = sheet_name
+                        table_frames.append((table_name, df, "", "", {}))
+ 
+            # ── Chunk every table ──────────────────────────────────────────────
+            for table_name, df, description, disambiguation, col_notes in table_frames:
+                if df.empty:
+                    continue
+ 
+                df.columns  = [str(c).strip() for c in df.columns]
+                col_list    = ", ".join(df.columns.tolist())
+                num_rows    = len(df)
+ 
+                print(f"[Ingest] Chunking '{table_name}': {num_rows} rows × {len(df.columns)} cols")
+ 
+                # ── Chunk 0: Schema header ─────────────────────────────────────
+                schema = build_schema_chunk(
+                    table_name, df, filename,
+                    description, disambiguation,
+                    file_context, col_notes,
                 )
-                sample_lines.append(
-                    f"  - {col}: e.g. {', '.join(samples)}" if samples else f"  - {col}"
-                )
-
-            chunks.append(
-                f"[Table: {table_name}]\n"
-                f"This table has {num_rows} rows and {len(df.columns)} columns.\n"
-                f"Columns and sample values:\n" + "\n".join(sample_lines) + "\n"
-                f"Source file: {filename}"
-            )
-
-            WINDOW_SIZE = 10
-            OVERLAP     = 2
-            step        = WINDOW_SIZE - OVERLAP
-
-            for start in range(0, num_rows, step):
-                end    = min(start + WINDOW_SIZE, num_rows)
-                window = df.iloc[start:end]
-                lines  = [
-                    f"[Table: {table_name} | Columns: {col_list} | "
-                    f"Rows {start + 1}–{end} of {num_rows}]"
-                ]
-                for row_idx, (_, row) in enumerate(window.iterrows(), start=start + 1):
-                    pairs = [
-                        f"{col}: {val}"
-                        for col, val in row.items()
-                        if pd.notna(val) and str(val).strip() != ""
-                    ]
-                    lines.append(f"  Row {row_idx}: " + " | ".join(pairs))
-                chunks.append("\n".join(lines))
-
+                chunks.append(schema)
+ 
+                # ── Chunks 1-N: Row windows ────────────────────────────────────
+                WINDOW_SIZE = 10
+                OVERLAP     = 2
+                step        = WINDOW_SIZE - OVERLAP
+ 
+                for start in range(0, num_rows, step):
+                    end    = min(start + WINDOW_SIZE, num_rows)
+                    window = df.iloc[start:end]
+ 
+                    header_line = (
+                        f"[Table: {table_name} | Columns: {col_list} | "
+                        f"Rows {start + 1}–{end} of {num_rows}]"
+                    )
+                    if file_context:
+                        header_line += f"\n[User note: {file_context}]"
+                    if disambiguation:
+                        header_line += f"\n[{disambiguation}]"
+ 
+                    lines = [header_line]
+                    for row_idx, (_, row) in enumerate(window.iterrows(), start=start + 1):
+                        pairs = [
+                            f"{col}: {val}"
+                            for col, val in row.items()
+                            if pd.notna(val) and str(val).strip() not in ("", "nan", "NaT")
+                        ]
+                        if pairs:
+                            lines.append(f"  Row {row_idx}: " + " | ".join(pairs))
+ 
+                    chunks.append("\n".join(lines))
+ 
         except Exception as e:
-            print(f"Tabular extraction failed: {e}")
+            import traceback
+            print(f"[Ingest] Tabular extraction failed for {filename}: {e}")
+            traceback.print_exc()
             return 0
+ 
     else:
         raw_text = extract_text(file_path, mime_type)
         raw_text = clean_text(raw_text)
         if not raw_text:
             return 0
         chunks = chunk_text(raw_text)
-
+ 
     if not chunks:
         return 0
-
+ 
+    # ── Embed and store ────────────────────────────────────────────────────────
     embeddings = embedder.encode(
         chunks, show_progress_bar=False, normalize_embeddings=True
     ).tolist()
-
+ 
     db.add_all([
         Chunk(
             business_id=business_id,
@@ -526,6 +790,7 @@ def ingest_document(
     ])
     db.commit()
     return len(chunks)
+
 
 
 # ── Retrieval (single HyDE) ────────────────────────────────────────────────────
