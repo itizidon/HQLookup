@@ -896,9 +896,6 @@ def ask_question(
     user_plan = user.plan if hasattr(user, "plan") else "free"
     config    = PLAN_CONFIG.get(user_plan, PLAN_CONFIG["free"])
 
-    if not check_rate_limit(user.id, user_plan):
-        raise HTTPException(status_code=429, detail="Too many requests. Slow down.")
-
     answer_offset = body.offset or 0
     if answer_offset == 0:
         allowed, current, limit = check_search_limit(org.id, user_plan)
