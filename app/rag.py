@@ -3,6 +3,7 @@ Core RAG service using pgvector.
 Handles: document ingestion → chunking → embedding → PostgreSQL storage → retrieval
 """
 import os
+import re
 import json
 import redis
 import pandas as pd
@@ -175,7 +176,54 @@ def fallback_detect_header(df_raw: pd.DataFrame) -> int:
             best_row   = i
     return best_row
  
- 
+def chunk_text_small_to_big(text: str) -> List[dict]:
+    """
+    Returns list of {child, parent} dicts.
+    Child = small sentence-level chunk for embedding.
+    Parent = surrounding paragraph for LLM context.
+    """
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    # Step 1: Split into large parent chunks (paragraphs)
+    parent_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=0,        # no overlap at parent level
+        separators=["\n\n\n", "\n\n", "\n"],
+    )
+    parents = parent_splitter.split_text(text)
+
+    # Step 2: Split each parent into small child chunks
+    child_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=150,
+        chunk_overlap=0,        # no overlap at child level either
+        separators=[".\n", ". ", "! ", "? ", "\n", " "],
+    )
+
+    result = []
+    for parent in parents:
+        children = child_splitter.split_text(parent)
+        for child in children:
+            if child.strip():
+                result.append({
+                    "child":  child.strip(),
+                    "parent": parent.strip(),
+                })
+
+    return result
+
+def normalize_parent_key(text: str) -> str:
+    """
+    Normalizes text by removing section/appendix headers and taking a middle-sample 
+    fingerprint so identical repeated blocks match without false positives.
+    """
+    # Remove dynamic headers
+    cleaned = re.sub(r'Appendix\s+\d+', '', text, flags=re.IGNORECASE)
+    cleaned = re.sub(r'Section\s+\d+', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\W+', '', cleaned).lower()
+    
+    # Use a longer fingerprint (first 300 chars) to prevent false-positive collisions
+    return cleaned[:300]
+
 def extract_table_from_structure(
     df_raw: pd.DataFrame,
     table_spec: dict,
@@ -482,7 +530,7 @@ def retrieve_chunks_multi(
         sql = f"""
             WITH scored AS (
                 SELECT
-                    c.id, c.text, c.chunk_index, c.document_id, d.filename,
+                    c.id, c.text, c.parent_text, c.chunk_index, c.document_id, d.filename,
                     1 - (c.embedding <=> CAST(:query_vec AS vector)) AS score,
                     (c.text LIKE '[Table:%%') AS is_tabular
                 FROM chunks c
@@ -492,7 +540,7 @@ def retrieve_chunks_multi(
             ),
             tabular_headers AS (
                 SELECT DISTINCT ON (c.document_id)
-                    c.id, c.text, c.chunk_index, c.document_id, d.filename,
+                    c.id, c.text, c.parent_text, c.chunk_index, c.document_id, d.filename,
                     1.0 AS score, TRUE AS is_tabular
                 FROM chunks c
                 JOIN documents d ON d.id = c.document_id
@@ -505,14 +553,14 @@ def retrieve_chunks_multi(
                       WHERE is_tabular AND score >= :min_tabular
                   )
             )
-            SELECT id, text, chunk_index, document_id, filename, score
+            SELECT id, text, parent_text, chunk_index, document_id, filename, score
             FROM (
-                SELECT id, text, chunk_index, document_id, filename, score
+                SELECT id, text, parent_text, chunk_index, document_id, filename, score
                 FROM scored
                 WHERE (is_tabular     AND score >= :min_tabular)
                    OR (NOT is_tabular AND score >= :min_standard)
                 UNION
-                SELECT id, text, chunk_index, document_id, filename, score
+                SELECT id, text, parent_text, chunk_index, document_id, filename, score
                 FROM tabular_headers
             ) combined
             ORDER BY score DESC
@@ -526,7 +574,8 @@ def retrieve_chunks_multi(
             rrf_contribution = 1.0 / (rank + 1 + RRF_K)
             if chunk_id not in rrf_scores:
                 rrf_scores[chunk_id] = {
-                    "text":        row.text,
+                    "text":        row.parent_text or row.text,
+                    "child_text":  row.text,
                     "filename":    row.filename,
                     "document_id": row.document_id,
                     "score":       row.score,
@@ -534,12 +583,23 @@ def retrieve_chunks_multi(
                 }
             rrf_scores[chunk_id]["rrf_score"] += rrf_contribution
 
+    # Sort all results by RRF score
     merged = sorted(rrf_scores.values(), key=lambda x: x["rrf_score"], reverse=True)
 
-    print(f"\n[MultiQuery] {len(vectors)} variants → {len(merged)} unique chunks after RRF")
-    for r in merged[:8]:
-        print(f"  rrf={r['rrf_score']:.4f} score={r['score']:.4f} | {r['filename']} | {r['text'][:100]}")
+    # Deduplicate by normalized parent fingerprint
+    seen_parents = set()
+    deduped = []
+    for r in merged:
+        parent_text = r.get("text", "")
+        key = normalize_parent_key(parent_text)
+        
+        if key not in seen_parents:
+            seen_parents.add(key)
+            deduped.append(r)
 
+    merged = deduped
+
+    # Slice page and set has_more AFTER deduplication
     has_more = len(merged) > (offset + get_k)
     page     = merged[offset: offset + get_k]
 
@@ -768,28 +828,31 @@ def ingest_document(
         raw_text = clean_text(raw_text)
         if not raw_text:
             return 0
-        chunks = chunk_text(raw_text)
- 
-    if not chunks:
-        return 0
- 
-    # ── Embed and store ────────────────────────────────────────────────────────
-    embeddings = embedder.encode(
-        chunks, show_progress_bar=False, normalize_embeddings=True
-    ).tolist()
- 
-    db.add_all([
-        Chunk(
-            business_id=business_id,
-            document_id=document_id,
-            chunk_index=i,
-            text=chunk_text_item,
-            embedding=embedding,
-        )
-        for i, (chunk_text_item, embedding) in enumerate(zip(chunks, embeddings))
-    ])
-    db.commit()
-    return len(chunks)
+
+        pairs = chunk_text_small_to_big(raw_text)
+        if not pairs:
+            return 0
+
+        # Embed only the child text
+        child_texts = [p["child"] for p in pairs]
+        embeddings  = embedder.encode(
+            child_texts, show_progress_bar=False, normalize_embeddings=True
+        ).tolist()
+
+        db.add_all([
+            Chunk(
+                business_id=business_id,
+                document_id=document_id,
+                chunk_index=i,
+                text=p["child"],          # small — used for retrieval
+                parent_text=p["parent"],  # large — used for LLM
+                chunk_type="child",
+                embedding=embedding,
+            )
+            for i, (p, embedding) in enumerate(zip(pairs, embeddings))
+        ])
+        db.commit()
+        return len(pairs)
 
 
 
@@ -825,45 +888,45 @@ def retrieve_chunks(
         params["doc_ids"] = document_ids
 
     sql = f"""
-        WITH scored AS (
-            SELECT
-                c.id, c.text, c.chunk_index, c.document_id, d.filename,
-                1 - (c.embedding <=> CAST(:query_vec AS vector)) AS score,
-                (c.text LIKE '[Table:%%') AS is_tabular
-            FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE c.business_id = :business_id
-            {doc_filter_sql}
-        ),
-        tabular_headers AS (
-            SELECT DISTINCT ON (c.document_id)
-                c.id, c.text, c.chunk_index, c.document_id, d.filename,
-                1.0 AS score, TRUE AS is_tabular
-            FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE c.business_id = :business_id
-              AND c.chunk_index = 0
-              AND c.text LIKE '[Table:%%'
-              {doc_filter_sql}
-              AND c.document_id IN (
-                  SELECT document_id FROM scored
-                  WHERE is_tabular AND score >= :min_tabular
-              )
-        )
-        SELECT id, text, chunk_index, document_id, filename, score
-        FROM (
-            SELECT id, text, chunk_index, document_id, filename, score
-            FROM scored
-            WHERE (is_tabular     AND score >= :min_tabular)
-               OR (NOT is_tabular AND score >= :min_standard)
-            UNION
-            SELECT id, text, chunk_index, document_id, filename, score
-            FROM tabular_headers
-        ) combined
-        ORDER BY score DESC
-        LIMIT :limit_plus_one
-        OFFSET :offset
-    """
+            WITH scored AS (
+                SELECT
+                    c.id, c.text, c.parent_text, c.chunk_index, c.document_id, d.filename,
+                    1 - (c.embedding <=> CAST(:query_vec AS vector)) AS score,
+                    (c.text LIKE '[Table:%%') AS is_tabular
+                FROM chunks c
+                JOIN documents d ON d.id = c.document_id
+                WHERE c.business_id = :business_id
+                {doc_filter_sql}
+            ),
+            tabular_headers AS (
+                SELECT DISTINCT ON (c.document_id)
+                    c.id, c.text, c.parent_text, c.chunk_index, c.document_id, d.filename,
+                    1.0 AS score, TRUE AS is_tabular
+                FROM chunks c
+                JOIN documents d ON d.id = c.document_id
+                WHERE c.business_id = :business_id
+                  AND c.chunk_index = 0
+                  AND c.text LIKE '[Table:%%'
+                  {doc_filter_sql}
+                  AND c.document_id IN (
+                      SELECT document_id FROM scored
+                      WHERE is_tabular AND score >= :min_tabular
+                  )
+            )
+            SELECT id, text, parent_text, chunk_index, document_id, filename, score
+            FROM (
+                SELECT id, text, parent_text, chunk_index, document_id, filename, score
+                FROM scored
+                WHERE (is_tabular     AND score >= :min_tabular)
+                   OR (NOT is_tabular AND score >= :min_standard)
+                UNION
+                SELECT id, text, parent_text, chunk_index, document_id, filename, score
+                FROM tabular_headers
+            ) combined
+            ORDER BY score DESC
+            LIMIT :limit_plus_one
+            OFFSET :offset
+        """
 
     results  = db.execute(text(sql), params).fetchall()
     has_more = len(results) > get_k

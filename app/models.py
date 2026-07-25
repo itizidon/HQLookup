@@ -115,13 +115,16 @@ class Chunk(Base):
 
     id              = Column(Integer, primary_key=True, index=True)
     business_id     = Column(Integer, ForeignKey("businesses.id"), nullable=False, index=True)
-    document_id     = Column(Integer, ForeignKey("documents.id"),  nullable=False, index=True)
+    document_id     = Column(Integer, ForeignKey("documents.id"), nullable=False, index=True)
     chunk_index     = Column(Integer, nullable=False)
-    text            = Column(Text, nullable=False)
+    text            = Column(Text, nullable=False)           # child text (small, for embedding)
+    parent_text     = Column(Text, nullable=True)            # parent text (large, for LLM)
+    chunk_type      = Column(String, nullable=False, default="child")  # "child" or "parent"
+    parent_chunk_id = Column(Integer, ForeignKey("chunks.id"), nullable=True)
     embedding       = Column(Vector(384), nullable=False)
     created_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    document        = relationship("Document", back_populates="chunks")
+    document = relationship("Document", back_populates="chunks")
 
 
 class QueryLog(Base):

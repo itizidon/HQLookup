@@ -928,7 +928,6 @@ async def update_business_settings(
 ANSWER_PAGE_SIZE    = 10
 CHUNK_BATCH_SIZE    = 3
 RETRIEVAL_POOL_SIZE = 50
-MAX_LLM_CALLS       = 10
 
 
 @app.post("/ask")
@@ -952,14 +951,17 @@ def ask_question(
     user_plan = user.plan if hasattr(user, "plan") else "free"
     config    = PLAN_CONFIG.get(user_plan, PLAN_CONFIG["free"])
 
+    # 1. Check search limit and calculate remaining calls for the plan
+    allowed, current, limit = check_search_limit(org.id, user_plan)
+    if not allowed:
+        raise HTTPException(status_code=402, detail={
+            "message": f"Monthly limit of {limit} searches reached.",
+            "current": current, "limit": limit, "upgrade_url": "/pricing",
+        })
+
+    remaining_plan_calls = max(0, limit - current)
+
     answer_offset = body.offset or 0
-    if answer_offset == 0:
-        allowed, current, limit = check_search_limit(org.id, user_plan)
-        if not allowed:
-            raise HTTPException(status_code=402, detail={
-                "message": f"Monthly limit of {limit} searches reached.",
-                "current": current, "limit": limit, "upgrade_url": "/pricing",
-            })
 
     current_doc_state = get_business_doc_state(db, body.business_id)
     cached            = get_active_query(user.id)
@@ -989,19 +991,27 @@ def ask_question(
 
         all_answers       = []
         next_chunk_offset = 0
+        
+        # Count initial search execution
         increment_search_count(org.id)
+        remaining_plan_calls -= 1
 
     target    = answer_offset + ANSWER_PAGE_SIZE
     llm_calls = 0
-    while len(all_answers) < target and next_chunk_offset is not None and llm_calls < MAX_LLM_CALLS:
+
+    # 2. Process chunks without a hardcoded MAX_LLM_CALLS limit
+    while len(all_answers) < target and next_chunk_offset is not None and llm_calls < remaining_plan_calls:
         chunks = retrieval_results[next_chunk_offset: next_chunk_offset + CHUNK_BATCH_SIZE]
         if not chunks:
             next_chunk_offset = None
             break
+
         new_answers = generate_answer(body.question, chunks).get("answers", [])
         all_answers.extend(new_answers)
+
         next_chunk_offset += CHUNK_BATCH_SIZE
         llm_calls         += 1
+
         if next_chunk_offset >= len(retrieval_results):
             next_chunk_offset = None
 
