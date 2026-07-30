@@ -30,53 +30,138 @@ def build_prompt(question: str, chunks: List[dict], task_type: str = "general") 
 
     for i, chunk in enumerate(chunks, 1):
         context_blocks.append(
-            f"[{i}] FILE: {chunk['filename']} (Score: {chunk['score']})\n{chunk['text'].strip()}"
+            f"""
+CHUNK {i}
+FILE: {chunk["filename"]}
+Score: {chunk["score"]}
+
+{chunk["parent_text"] or chunk["text"]}
+""".strip()
         )
 
-    context = "\n\n---\n\n".join(context_blocks)
-
-    # Optional rule injection for strict financial parsing
-    extra_requirements = ""
-    if task_type == "transactions":
-        extra_requirements = """
-- Extract each matching financial transaction as an individual array object.
-- Keep charges and dollar values separated per item.
-"""
+    context = "\n\n=============================\n\n".join(context_blocks)
 
     return f"""
-You are a retrieval assistant. Answer the user's question using ONLY the provided context.
+You are a document retrieval assistant.
 
-IMPORTANT RULES:
-- Return ONLY valid JSON.
-- Do NOT include markdown code fences (no ```json).
-- Do NOT include explanations outside the JSON.
-- If the answer is not found in the context, return: {{"answers": []}}
+Your job is to answer the user's question ONLY using the provided context.
 
-Return format:
+----------------------------
+PRIMARY OBJECTIVE
+----------------------------
+
+First determine what information the user is actually asking for.
+
+Then locate ONLY the data that answers that question.
+
+Do NOT extract unrelated information.
+
+----------------------------
+VERY IMPORTANT
+----------------------------
+
+Many documents contain repeated information.
+
+Many retrieved chunks overlap.
+
+If multiple chunks describe the same thing:
+
+• Return ONE answer
+• Merge the sources
+• Never repeat the same fact twice
+
+----------------------------
+SPREADSHEETS
+----------------------------
+
+If the context comes from a spreadsheet:
+
+1. Determine which column answers the question.
+
+Example:
+
+Question:
+How much did Dr. Sue charge?
+
+Correct column:
+Price
+
+Incorrect columns:
+Invoice Number
+Procedure ID
+Patient Number
+Row Number
+
+Never return values from the wrong column.
+
+----------------------------
+TABLES
+----------------------------
+
+Treat every row as one logical record.
+
+Do NOT split one row into multiple answers.
+
+Do NOT combine different rows together.
+
+----------------------------
+TEXT DOCUMENTS
+----------------------------
+
+If multiple paragraphs describe the same protocol,
+procedure,
+policy,
+or instruction,
+
+return ONE combined answer.
+
+----------------------------
+OUTPUT RULES
+----------------------------
+
+Return ONLY valid JSON.
+
+No markdown.
+
+No explanations.
+
+Return this format:
+
 {{
-  "answers": [
-    {{
-      "fact": "short factual statement",
-      "sources": [
+    "answers": [
         {{
-          "chunk": 1,
-          "filename": "example.pdf"
+            "fact": "...",
+            "sources": [
+                {{
+                    "chunk": 1,
+                    "filename": "example.pdf"
+                }}
+            ]
         }}
-      ]
-    }}
-  ]
+    ]
 }}
 
 Requirements:
-- Extract ONLY facts that directly answer the user's prompt. Filter out irrelevant data.
-- Each distinct answer item should be its own array object.
-- Combine duplicate facts across multiple chunks into a single item.
-- Do not hallucinate or invent details not in the context.
-{extra_requirements}
-CONTEXT:
+
+• Every answer must be unique.
+• Never repeat the same fact.
+• Merge duplicate information.
+• Merge overlapping information.
+• Prefer the most complete version.
+• If the answer cannot be found return
+
+{{"answers":[]}}
+
+----------------------------
+CONTEXT
+----------------------------
+
 {context}
 
-QUESTION:
+----------------------------
+QUESTION
+----------------------------
+
 {question}
 """.strip()
 

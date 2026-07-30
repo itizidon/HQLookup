@@ -8,9 +8,8 @@ from app.database import get_db
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.routes.auth import router as auth_router
-from app.models import Business, User, Document, QueryLog, Organization, OrgMember, Invitation, user_business
+from app.models import Business, User, Document, QueryLog,Chunk , Organization, OrgMember, Invitation, user_business
 from app.rag import (
-    ingest_document,
     retrieve_chunks,
     retrieve_chunks_multi,
     check_search_limit,
@@ -22,6 +21,7 @@ from app.rag import (
     normalize_query,
     PLAN_CONFIG,
 )
+from app.ingestion.pipeline import ingest_document
 from app.llm import generate_answer
 from pydantic import BaseModel, Field, EmailStr
 from app.auth import get_current_user
@@ -30,10 +30,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from math import ceil
 from app.routes.billing import router as billing_router
-
+from app.services.deduplicate import deduplicate_answers
 import jwt
 import resend
-
+import io
+import os
+import pandas as pd
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your_super_secret_signing_key_change_this_in_production")
 JWT_ALGORITHM  = "HS256"
 
@@ -301,6 +303,8 @@ async def get_comprehensive_usage_metrics(
 
 
 # ── Upload documents ───────────────────────────────────────────────────────────
+# app/routers/documents.py (or your route file)
+
 @app.post("/upload-multiple")
 async def upload_documents(
     business_id:     int              = Form(...),
@@ -329,19 +333,19 @@ async def upload_documents(
             print(f"Failed to parse file_contexts payload: {e}")
 
     uploaded = []
+    
     for file in files:
-        # 1. Sanitize filename & retrieve specific context note FIRST
         safe_filename = Path(file.filename).name
         specific_context = contexts_map.get(safe_filename, "").strip() or None
 
-        temp_path = f"/tmp/{uuid.uuid4()}_{safe_filename}"
-        
-        # 2. Save temporary file to disk
+        # 1. Read file bytes ONCE and store in memory
         contents = await file.read()
+
+        temp_path = f"/tmp/{uuid.uuid4()}_{safe_filename}"
         with open(temp_path, "wb") as f:
             f.write(contents)
 
-        # 3. Create document record with description attached
+        # 2. Create parent Document record in DB
         doc = Document(
             business_id=business.id, 
             filename=safe_filename, 
@@ -353,29 +357,60 @@ async def upload_documents(
         db.commit()
         db.refresh(doc)
 
-        # 4. Ingest and chunk document
         try:
-            chunks_count = ingest_document(
-                db=db, 
-                business_id=business.id, 
-                document_id=doc.id,
-                file_path=temp_path, 
-                mime_type=file.content_type, 
+            # 3. Run through your updated modular pipeline dispatcher
+            pipeline_result = ingest_document(
+                file_bytes=contents,
                 filename=safe_filename,
-                file_context=specific_context
+                # analyze_region_func=... # Pass your region analyzer function here if needed for xlsx
             )
+
+            # Handle return structure depending on file type
+            if isinstance(pipeline_result, tuple):
+                final_chunks, workbook_graph = pipeline_result
+            else:
+                final_chunks = pipeline_result
+
+            # 4. Map pipeline RAGChunks to your database Chunk model
+            db_chunks = []
+            for i, chunk in enumerate(final_chunks):
+                meta = chunk.metadata or {}
+                
+                if specific_context and "file_context" not in meta:
+                    meta["file_context"] = specific_context
+
+                db_chunks.append(
+                    Chunk(
+                        business_id=business.id,
+                        document_id=doc.id,
+                        chunk_index=meta.get("chunk_index", i),
+                        text=chunk.content,
+                        parent_text=meta.get("parent_text") or meta.get("parent_id"),
+                        chunk_type=meta.get("chunk_type", "child"),
+                        embedding=chunk.embedding,
+                    )
+                )
+
+            if db_chunks:
+                db.add_all(db_chunks)
+                db.commit()
+
             uploaded.append({
                 "filename": safe_filename, 
                 "document_id": doc.id, 
-                "chunks": chunks_count
+                "chunks": len(db_chunks)
             })
+
+        except Exception as e:
+            db.rollback()
+            print(f"Error ingesting file {safe_filename}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to ingest {safe_filename}: {str(e)}")
+            
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
-    clear_active_query(user.id)
     return {"uploaded": uploaded}
-
 
 # ── Get documents ──────────────────────────────────────────────────────────────
 @app.post("/documents", response_model=DocumentListResponse, status_code=status.HTTP_200_OK)
@@ -926,7 +961,7 @@ async def update_business_settings(
 
 # ── Ask ────────────────────────────────────────────────────────────────────────
 ANSWER_PAGE_SIZE    = 10
-CHUNK_BATCH_SIZE    = 3
+PARENT_BATCH_SIZE    = 3
 RETRIEVAL_POOL_SIZE = 50
 
 
@@ -1001,15 +1036,21 @@ def ask_question(
 
     # 2. Process chunks without a hardcoded MAX_LLM_CALLS limit
     while len(all_answers) < target and next_chunk_offset is not None and llm_calls < remaining_plan_calls:
-        chunks = retrieval_results[next_chunk_offset: next_chunk_offset + CHUNK_BATCH_SIZE]
+        chunks = retrieval_results[next_chunk_offset: next_chunk_offset + PARENT_BATCH_SIZE]
         if not chunks:
             next_chunk_offset = None
             break
 
-        new_answers = generate_answer(body.question, chunks).get("answers", [])
+        new_answers = generate_answer(
+            body.question,
+            chunks
+        ).get("answers", [])
+
         all_answers.extend(new_answers)
 
-        next_chunk_offset += CHUNK_BATCH_SIZE
+        all_answers = deduplicate_answers(all_answers)
+
+        next_chunk_offset += PARENT_BATCH_SIZE
         llm_calls         += 1
 
         if next_chunk_offset >= len(retrieval_results):
