@@ -502,10 +502,13 @@ def retrieve_chunks_multi(
     get_k: int,
     offset: int = 0,
     document_ids: List[int] | None = None,
+    vectors: list | None = None,
 ) -> dict:
     embedder = get_embedder()
-    vectors  = build_multi_hyde_vectors(query, embedder)
-
+ 
+    if vectors is None:
+        vectors = build_multi_hyde_vectors(query, embedder)
+ 
     doc_filter_sql = ""
     base_params    = {
         "business_id":  business_id,
@@ -515,10 +518,10 @@ def retrieve_chunks_multi(
     if document_ids:
         doc_filter_sql         = "AND c.document_id = ANY(:doc_ids)"
         base_params["doc_ids"] = document_ids
-
+ 
     rrf_scores: dict = {}
     RRF_K            = 60
-
+ 
     for query_vector in vectors:
         params = {
             **base_params,
@@ -526,11 +529,16 @@ def retrieve_chunks_multi(
             "limit_plus_one": get_k * 3 + 1,
             "offset":         0,
         }
-
+ 
         sql = f"""
             WITH scored AS (
                 SELECT
-                    c.id, c.text, c.parent_text, c.chunk_index, c.document_id, d.filename,
+                    c.id,
+                    c.text,
+                    c.parent_text,
+                    c.chunk_index,
+                    c.document_id,
+                    d.filename,
                     1 - (c.embedding <=> CAST(:query_vec AS vector)) AS score,
                     (c.text LIKE '[Table:%%') AS is_tabular
                 FROM chunks c
@@ -540,7 +548,8 @@ def retrieve_chunks_multi(
             ),
             tabular_headers AS (
                 SELECT DISTINCT ON (c.document_id)
-                    c.id, c.text, c.parent_text, c.chunk_index, c.document_id, d.filename,
+                    c.id, c.text, c.parent_text, c.chunk_index,
+                    c.document_id, d.filename,
                     1.0 AS score, TRUE AS is_tabular
                 FROM chunks c
                 JOIN documents d ON d.id = c.document_id
@@ -567,64 +576,61 @@ def retrieve_chunks_multi(
             LIMIT :limit_plus_one
             OFFSET :offset
         """
-
+ 
         rows = db.execute(text(sql), params).fetchall()
         for rank, row in enumerate(rows):
-            chunk_id = row.id
+            chunk_id         = row.id
             rrf_contribution = 1.0 / (rank + 1 + RRF_K)
             if chunk_id not in rrf_scores:
                 rrf_scores[chunk_id] = {
-                    "text":        row.parent_text or row.text,
-                    "child_text":  row.text,
+                    "text":        row.text,
+                    "parent_text": row.parent_text,
                     "filename":    row.filename,
                     "document_id": row.document_id,
                     "score":       row.score,
                     "rrf_score":   0.0,
                 }
             rrf_scores[chunk_id]["rrf_score"] += rrf_contribution
-
-    # Sort all results by RRF score
+ 
+    # ── Sort by RRF score ──────────────────────────────────────────────────────
     merged = sorted(rrf_scores.values(), key=lambda x: x["rrf_score"], reverse=True)
-
-    # Deduplicate by normalized parent fingerprint
-    seen_parents = set()
-    deduped = []
+ 
+    # ── Deduplicate by parent_text ─────────────────────────────────────────────
+    # Multiple child chunks may share the same parent paragraph.
+    # Only keep the highest-ranked child per unique parent so the LLM
+    # never sees the same paragraph twice — this is what eliminates duplicates.
+    seen_parents: set  = set()
+    deduped: list      = []
+ 
     for r in merged:
-        parent_text = r.get("text", "")
-        key = normalize_parent_key(parent_text)
-        
-        if key not in seen_parents:
-            seen_parents.add(key)
-            deduped.append(r)
-
-    merged = deduped
-
-    # Slice page and set has_more AFTER deduplication
-    has_more = len(merged) > (offset + get_k)
-    page     = merged[offset: offset + get_k]
-
+        parent = r.get("parent_text") or r["text"]  # tabular chunks have no parent
+        parent_key = parent.strip()[:200]            # first 200 chars as identity key
+ 
+        if parent_key not in seen_parents:
+            seen_parents.add(parent_key)
+            # Send parent_text to LLM (richer context), child text was used for retrieval
+            deduped.append({
+                "text":        parent if parent else r["text"],  # LLM gets parent
+                "child_text":  r["text"],                        # for debugging
+                "filename":    r["filename"],
+                "document_id": r["document_id"],
+                "score":       float(round(r["score"], 4)),
+            })
+ 
+    print(f"\n[MultiQuery] {len(vectors)} variants → {len(merged)} chunks → {len(deduped)} after parent dedup")
+    for r in deduped[:8]:
+        print(f"  score={r['score']:.4f} | {r['filename']} | {r['text'][:80]}")
+ 
+    has_more = len(deduped) > (offset + get_k)
+    page     = deduped[offset: offset + get_k]
+ 
     return {
-        "results": [
-            {
-                "text":        r["text"],
-                "filename":    r["filename"],
-                "document_id": r["document_id"],
-                "score":       float(round(r["score"], 4)),
-            }
-            for r in page
-        ],
-        "allResults": [
-            {
-                "text":        r["text"],
-                "filename":    r["filename"],
-                "document_id": r["document_id"],
-                "score":       float(round(r["score"], 4)),
-            }
-            for r in merged
-        ],
+        "results":    page,
+        "allResults": deduped,   # full deduped list for cache
         "hasMore":    has_more,
         "nextOffset": offset + get_k if has_more else None,
     }
+
 
 
 # ── Text extraction ────────────────────────────────────────────────────────────
