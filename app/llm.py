@@ -25,32 +25,33 @@ def clean_json_response(raw_text: str) -> str:
     return cleaned.strip()
 
 # ── Prompt builder ─────────────────────────────────────────────────────────────
-def build_prompt(question: str, chunks: List[dict], task_type: str = "general") -> str:
+def build_prompt(question: str, chunks: List[dict]) -> str:
     context_blocks = []
 
     for i, chunk in enumerate(chunks, 1):
         context_blocks.append(
-            f"[{i}] FILE: {chunk['filename']} (Score: {chunk['score']})\n{chunk['text'].strip()}"
+            f"""[{i}]
+          FILE: {chunk['filename']}
+          SCORE: {chunk['score']}
+          {chunk['text']}
+          """
         )
 
     context = "\n\n---\n\n".join(context_blocks)
 
-    # Optional rule injection for strict financial parsing
-    extra_requirements = ""
-    if task_type == "transactions":
-        extra_requirements = """
-- Extract each matching financial transaction as an individual array object.
-- Keep charges and dollar values separated per item.
-"""
-
     return f"""
-You are a retrieval assistant. Answer the user's question using ONLY the provided context.
+You are a retrieval assistant.
+
+Answer the user's question using ONLY the provided context.
 
 IMPORTANT RULES:
 - Return ONLY valid JSON.
-- Do NOT include markdown code fences (no ```json).
+- Do NOT include markdown.
 - Do NOT include explanations outside the JSON.
-- If the answer is not found in the context, return: {{"answers": []}}
+- If the answer is not found, return:
+{{
+  "answers": []
+}}
 
 Return format:
 {{
@@ -68,11 +69,16 @@ Return format:
 }}
 
 Requirements:
-- Extract ONLY facts that directly answer the user's prompt. Filter out irrelevant data.
-- Each distinct answer item should be its own array object.
-- Combine duplicate facts across multiple chunks into a single item.
-- Do not hallucinate or invent details not in the context.
-{extra_requirements}
+- Each distinct fact should be its own array item.
+- Combine duplicate facts.
+- Keep facts concise.
+- A fact may reference multiple chunks if needed.
+- Do not hallucinate.
+- NEVER combine numeric facts.
+- Each unique value must be its own fact.
+- Do not summarize multiple charges into one sentence.
+- A single fact may contain at most ONE numeric value.
+
 CONTEXT:
 {context}
 

@@ -7,6 +7,8 @@ import re
 import json
 import redis
 import pandas as pd
+import openpyxl
+from openpyxl.utils import range_boundaries
 from datetime import datetime
 from typing import List, Optional
 from pathlib import Path
@@ -36,30 +38,34 @@ MIN_SCORE_TABULAR  = 0.25
 # ── Plan config ────────────────────────────────────────────────────────────────
 PLAN_CONFIG = {
     "free": {
-        "monthly_searches": 50,
-        "use_hyde":         True,
-        "use_multiquery":   True,
-        "rate_per_minute":  3,
-        "rate_per_hour":    20,
-        "price_monthly":    0,
-        "price_yearly":     0,
-        "display_name":     "Free",
-        "max_businesses":   1,
-        "max_users":        2,
-        "max_organizations": 1,
+        "monthly_searches":   50,
+        "use_hyde":           True,
+        "use_multiquery":     True,
+        "rate_per_minute":    3,
+        "rate_per_hour":      20,
+        "price_monthly":      0,
+        "price_yearly":       0,
+        "display_name":       "Free",
+        "max_businesses":     1,
+        "max_users":          2,
+        "max_organizations":  1,
+        "max_rows":           500,
+        "max_file_mb":        5,
     },
     "starter": {
-        "monthly_searches": 2000,
-        "use_hyde":         True,
-        "use_multiquery":   True,
-        "rate_per_minute":  10,
-        "rate_per_hour":    100,
-        "price_monthly":    49,
-        "price_yearly":     470,
-        "display_name":     "Starter",
-        "max_businesses":   3,
-        "max_users":        10,
-        "max_organizations": 1,
+        "monthly_searches":   2000,
+        "use_hyde":           True,
+        "use_multiquery":     True,
+        "rate_per_minute":    10,
+        "rate_per_hour":      100,
+        "price_monthly":      49,
+        "price_yearly":       470,
+        "display_name":       "Starter",
+        "max_businesses":     3,
+        "max_users":          10,
+        "max_organizations":  1,
+        "max_rows":           1000,
+        "max_file_mb":        10,
     },
 }
 
@@ -76,7 +82,139 @@ ACTIVE_QUERY_TTL_SECONDS = 60 * 60 * 6  # 6 hours
 # ── Singleton embedder ─────────────────────────────────────────────────────────
 _embedder = None
 
+def extract_spreadsheet_to_text(file_path: str) -> str:
+    sheet_texts = []
+    
+    try:
+        wb = openpyxl.load_workbook(file_path, data_only=True)
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            if ws._charts:
+                sheet_texts.append(f"=== SHEET: {sheet_name} (Charts) ===\n")
+                for i, chart in enumerate(ws._charts, 1):
+                    chart_type = type(chart).__name__
+                    title = getattr(chart, 'title', None)
+                    title_str = title.text if title and hasattr(title, 'text') else str(title or "Untitled")
+                    sheet_texts.append(f"- Chart {i}: Type={chart_type}, Title='{title_str}'\n")
+                sheet_texts.append("\n")
+    except Exception as e:
+        print(f"[Spreadsheet] Chart extraction warning: {e}")
 
+    excel_data = pd.ExcelFile(file_path)
+    for sheet_name in excel_data.sheet_names:
+        df = pd.read_excel(excel_data, sheet_name=sheet_name, header=None)
+        sheet_texts.append(f"--- Data Grid for {sheet_name} ---\n")
+        sheet_texts.append(df.to_string(na_rep="", index=True, header=True))
+        sheet_texts.append("\n\n")
+        
+    return "".join(sheet_texts)
+
+def chunk_table_deterministically(file_path: str, table_meta: dict) -> list[str]:
+    table_name  = table_meta.get("table_name", "Unknown Table")
+    cell_range  = table_meta.get("cell_range", "")
+    sheet_target = table_meta.get("sheet_name", None)
+    headers     = table_meta.get("column_headers", [])
+    description = table_meta.get("description", "")
+
+    try:
+        excel_file = pd.ExcelFile(file_path)
+        # Fall back to sheet 0 if the LLM's sheet name doesn't match exactly
+        sheet_name = sheet_target if sheet_target in excel_file.sheet_names else excel_file.sheet_names[0]
+        df_full = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
+    except Exception as e:
+        print(f"[Chunker] Error reading excel file for chunking: {e}")
+        return []
+
+    df_slice = df_full
+    if cell_range:
+        try:
+            min_col, min_row, max_col, max_row = range_boundaries(cell_range)
+            df_slice = df_full.iloc[min_row-1:max_row, min_col-1:max_col]
+        except Exception:
+            pass
+
+    context_prefix = f"Table: {table_name} (Sheet: {sheet_name})\nDescription: {description}\nHeaders: {', '.join(headers)}\n---"
+
+    row_chunks = []
+    for _, row in df_slice.iterrows():
+        row_str = " | ".join([
+            f"{headers[i]}: {val}" if i < len(headers) and pd.notna(val) else str(val) 
+            for i, val in enumerate(row.values) if pd.notna(val)
+        ])
+
+        if row_str.strip():
+            row_chunks.append(f"{context_prefix}\nRow Data: {row_str}")
+
+    return row_chunks
+
+def analyze_spreadsheet_with_llm(file_path: str, client: OpenAI = None) -> dict:
+    if client is None:
+        client = OpenAI()
+
+    spreadsheet_text = extract_spreadsheet_to_text(file_path)
+    print(f"[Spreadsheet LLM] Extracted text length: {len(spreadsheet_text)} chars from {file_path}")
+
+    prompt = f"""
+You are an expert data extraction and spreadsheet analysis assistant. Your task is to analyze the provided spreadsheet data (sheet names, cell contents, or structural text dumps) and identify the logical structure of the workbook.
+
+Your goal is to detect:
+- All distinct tables (even if they are not formatted as Excel Tables).
+- The cell range occupied by each table.
+- The column headers for each table.
+- Any charts or visualizations.
+- Important summary metrics or findings.
+
+Return your response as a single, valid JSON object and nothing else. Do not include markdown code blocks (such as json), explanations, or conversational text.
+
+The JSON object must strictly conform to the following schema:
+{{
+  "spreadsheet_summary": "A brief overview of the workbook contents.",
+  "tables": [
+    {{
+      "table_name": "Name or inferred title of the table",
+      "cell_range": "e.g., A1:D15",
+      "column_headers": ["Header1", "Header2"],
+      "description": "Brief description of the table contents"
+    }}
+  ],
+  "charts": [
+    {{
+      "chart_name": "Name or inferred title of the chart",
+      "chart_type": "e.g., Bar, Line, Pie",
+      "location_or_range": "Cell location if identifiable",
+      "description": "Brief description of what the chart visualizes"
+    }}
+  ],
+  "key_findings": [
+    "Notable data insight or summary total"
+  ]
+}}
+
+Analyze the following spreadsheet content:
+{spreadsheet_text}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a precise data extraction assistant that outputs strictly valid JSON objects."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.0
+    )
+
+    raw_content = response.choices[0].message.content
+    print(f"[Spreadsheet LLM] Raw JSON response received (first 300 chars): {raw_content[:300]}...")
+
+    try:
+        parsed_data = json.loads(raw_content)
+        print(f"[Spreadsheet LLM] Parsed successfully -> Tables found: {len(parsed_data.get('tables', []))}, Charts found: {len(parsed_data.get('charts', []))}")
+        return parsed_data
+    except Exception as e:
+        print(f"[Spreadsheet LLM] JSON parse error: {e}. Raw content was: {raw_content}")
+        return {"tables": [], "charts": [], "key_findings": [], "spreadsheet_summary": ""}
+    
 def analyze_sheet_structure(
     raw_rows: list,
     sheet_name: str,
@@ -114,6 +252,7 @@ Return this exact structure:
 {{
   "tables": [
     {{
+      "sheet_name": "Name of the Excel tab/sheet",
       "table_name": "descriptive name for this table",
       "header_row": 0,
       "data_start_row": 1,
@@ -700,135 +839,101 @@ def ingest_document(
  
     ext      = Path(file_path).suffix.lower()
     embedder = get_embedder()
-    chunks   = []
+    chunks_to_add = []
  
-    if ext in [".csv", ".xlsx", ".xls"]:
+    # ── 1. Excel Spreadsheets (.xlsx, .xls) ──────────────────────────────────
+    if ext in [".xlsx", ".xls"]:
         try:
-            # ── Collect all (table_name, df, description, disambiguation) tuples ──
-            table_frames: List[tuple] = []
- 
-            if ext == ".csv":
-                # CSV: simpler — read raw, detect header, clean
-                df_raw = pd.read_csv(file_path, header=None)
-                raw_rows = df_raw.values.tolist()
- 
-                structure = analyze_sheet_structure(raw_rows, filename, filename, file_context)
-                if structure and structure.get("tables"):
-                    spec = structure["tables"][0]
-                    table_name, df, description, disambiguation = extract_table_from_structure(
-                        df_raw, spec, filename
-                    )
-                    col_notes = spec.get("column_notes", {})
-                else:
-                    # Fallback
-                    header_row = fallback_detect_header(df_raw)
-                    df_raw.columns = df_raw.iloc[header_row].astype(str).str.strip()
-                    df = df_raw.iloc[header_row + 1:].dropna(how="all").reset_index(drop=True)
-                    table_name  = Path(filename).stem.replace("_", " ").replace("-", " ").title()
-                    description = ""
-                    disambiguation = ""
-                    col_notes = {}
- 
-                table_frames.append((table_name, df, description, disambiguation, col_notes))
- 
-            else:
-                # XLSX: process every non-empty sheet
-                xl = pd.ExcelFile(file_path)
- 
-                for sheet_name in xl.sheet_names:
-                    df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
- 
-                    # Skip empty sheets
-                    if df_raw.dropna(how="all").empty:
-                        print(f"[Ingest] Skipping empty sheet: {sheet_name}")
-                        continue
- 
-                    raw_rows = df_raw.values.tolist()
- 
-                    # ── Ask LLM to analyse the raw sheet ──────────────────────
-                    structure = analyze_sheet_structure(raw_rows, sheet_name, filename, file_context)
- 
-                    if structure and structure.get("tables"):
-                        # LLM found one or more tables
-                        for table_spec in structure["tables"]:
-                            try:
-                                table_name, df, description, disambiguation = extract_table_from_structure(
-                                    df_raw, table_spec, sheet_name
-                                )
-                                col_notes = table_spec.get("column_notes", {})
-                                if not df.empty:
-                                    table_frames.append((table_name, df, description, disambiguation, col_notes))
-                            except Exception as e:
-                                print(f"[Ingest] Failed to extract table from {sheet_name}: {e}")
-                    else:
-                        # LLM failed — use score-based fallback
-                        header_row = fallback_detect_header(df_raw)
-                        df_raw.columns = (
-                            df_raw.iloc[header_row]
-                            .astype(str)
-                            .str.replace("\n", " ")
-                            .str.strip()
-                        )
-                        df = df_raw.iloc[header_row + 1:].dropna(how="all").reset_index(drop=True)
-                        df = df[[c for c in df.columns if not str(c).startswith("Unnamed:")]]
-                        table_name = sheet_name
-                        table_frames.append((table_name, df, "", "", {}))
- 
-            # ── Chunk every table ──────────────────────────────────────────────
-            for table_name, df, description, disambiguation, col_notes in table_frames:
-                if df.empty:
-                    continue
- 
-                df.columns  = [str(c).strip() for c in df.columns]
-                col_list    = ", ".join(df.columns.tolist())
-                num_rows    = len(df)
- 
-                print(f"[Ingest] Chunking '{table_name}': {num_rows} rows × {len(df.columns)} cols")
- 
-                # ── Chunk 0: Schema header ─────────────────────────────────────
-                schema = build_schema_chunk(
-                    table_name, df, filename,
-                    description, disambiguation,
-                    file_context, col_notes,
-                )
-                chunks.append(schema)
- 
-                # ── Chunks 1-N: Row windows ────────────────────────────────────
-                WINDOW_SIZE = 10
-                OVERLAP     = 2
-                step        = WINDOW_SIZE - OVERLAP
- 
-                for start in range(0, num_rows, step):
-                    end    = min(start + WINDOW_SIZE, num_rows)
-                    window = df.iloc[start:end]
- 
-                    header_line = (
-                        f"[Table: {table_name} | Columns: {col_list} | "
-                        f"Rows {start + 1}–{end} of {num_rows}]"
-                    )
-                    if file_context:
-                        header_line += f"\n[User note: {file_context}]"
-                    if disambiguation:
-                        header_line += f"\n[{disambiguation}]"
- 
-                    lines = [header_line]
-                    for row_idx, (_, row) in enumerate(window.iterrows(), start=start + 1):
-                        pairs = [
-                            f"{col}: {val}"
-                            for col, val in row.items()
-                            if pd.notna(val) and str(val).strip() not in ("", "nan", "NaT")
-                        ]
-                        if pairs:
-                            lines.append(f"  Row {row_idx}: " + " | ".join(pairs))
- 
-                    chunks.append("\n".join(lines))
- 
+            spreadsheet_meta = analyze_spreadsheet_with_llm(file_path)
         except Exception as e:
-            import traceback
-            print(f"[Ingest] Tabular extraction failed for {filename}: {e}")
-            traceback.print_exc()
+            print(f"[Ingest] LLM spreadsheet analysis failed for {filename}: {e}")
+            spreadsheet_meta = {"tables": [], "charts": [], "key_findings": [], "spreadsheet_summary": ""}
+
+        tables = spreadsheet_meta.get("tables", [])
+
+        # Loop through each detected table and run deterministic row-level chunking
+        for table in tables:
+            table_chunks = chunk_table_deterministically(file_path, table)
+            for chunk_text in table_chunks:
+                chunks_to_add.append({
+                    "text": chunk_text,
+                    "parent": chunk_text
+                })
+
+        # FALLBACK: If the LLM returned 0 tables, don't drop the data! Chunk the whole sheet raw.
+        if not tables:
+            print(f"[Ingest] Warning: LLM detected 0 tables for {filename}. Falling back to full sheet raw ingestion.")
+            try:
+                df_full = pd.read_excel(file_path, header=None)
+                for _, row in df_full.iterrows():
+                    row_str = " | ".join([str(val) for val in row.values if pd.notna(val)])
+                    if row_str.strip():
+                        chunks_to_add.append({"text": row_str, "parent": row_str})
+            except Exception as e:
+                print(f"[Ingest] Fallback raw ingestion failed: {e}")
+
+        # Package summary, charts, and key findings into a metadata chunk
+        summary  = spreadsheet_meta.get("spreadsheet_summary", "")
+        charts   = spreadsheet_meta.get("charts", [])
+        findings = spreadsheet_meta.get("key_findings", [])
+        
+        meta_lines = []
+        if summary:
+            meta_lines.append(f"Workbook Summary: {summary}")
+        if charts:
+            meta_lines.append("Detected Charts & Visualizations:")
+            for c in charts:
+                meta_lines.append(f"- {c.get('chart_name')} ({c.get('chart_type')} at {c.get('location_or_range')}): {c.get('description')}")
+        if findings:
+            meta_lines.append("Key Findings & Insights:")
+            for f in findings:
+                meta_lines.append(f"- {f}")
+                
+        if meta_lines:
+            meta_text = "\n".join(meta_lines)
+            chunks_to_add.append({
+                "text": meta_text,
+                "parent": meta_text
+            })
+
+    # ── 2. CSV Files (.csv) ──────────────────────────────────────────────────
+    elif ext == ".csv":
+        df = pd.read_csv(file_path)
+        csv_text = df.to_string(index=False)
+        chunks_to_add.append({
+            "text": csv_text,
+            "parent": csv_text
+        })
+
+    # ── 3. Handle Embedding & Saving for Spreadsheets / CSVs ─────────────────
+    if ext in [".csv", ".xlsx", ".xls"]:
+        print(f"[Ingest] Total spreadsheet/CSV chunks ready to embed and save: {len(chunks_to_add)}")
+        if not chunks_to_add:
+            print(f"[Ingest] Error: 0 chunks generated for {filename}")
             return 0
- 
+        
+        child_texts = [c["text"] for c in chunks_to_add]
+        embeddings = embedder.encode(
+            child_texts, show_progress_bar=False, normalize_embeddings=True
+        ).tolist()
+
+        db.add_all([
+            Chunk(
+                business_id=business_id,
+                document_id=document_id,
+                chunk_index=i,
+                text=c["text"],
+                parent_text=c["parent"],
+                chunk_type="child",
+                embedding=embedding,
+            )
+            for i, (c, embedding) in enumerate(zip(chunks_to_add, embeddings))
+        ])
+        db.commit()
+        print(f"[Ingest] Successfully committed {len(chunks_to_add)} chunks for {filename}")
+        return len(chunks_to_add)
+
+    # ── 4. Fallback for Standard Text / PDFs ─────────────────────────────────
     else:
         raw_text = extract_text(file_path, mime_type)
         raw_text = clean_text(raw_text)
@@ -839,7 +944,6 @@ def ingest_document(
         if not pairs:
             return 0
 
-        # Embed only the child text
         child_texts = [p["child"] for p in pairs]
         embeddings  = embedder.encode(
             child_texts, show_progress_bar=False, normalize_embeddings=True
@@ -850,8 +954,8 @@ def ingest_document(
                 business_id=business_id,
                 document_id=document_id,
                 chunk_index=i,
-                text=p["child"],          # small — used for retrieval
-                parent_text=p["parent"],  # large — used for LLM
+                text=p["child"],          
+                parent_text=p["parent"],  
                 chunk_type="child",
                 embedding=embedding,
             )

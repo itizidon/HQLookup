@@ -304,11 +304,13 @@ async def get_comprehensive_usage_metrics(
 @app.post("/upload-multiple")
 async def upload_documents(
     business_id:     int              = Form(...),
-    file_contexts:   Optional[str]    = Form(None),  # JSON string from frontend
+    file_contexts:   Optional[str]    = Form(None),
     current_context: User             = Depends(get_current_user),
     files:           List[UploadFile] = File(...),
     db:              Session          = Depends(get_db),
 ):
+    import pandas as pd
+
     user, _      = current_context
     user_org_ids = get_user_org_ids(db, user.id)
 
@@ -320,6 +322,12 @@ async def upload_documents(
     if not business:
         raise HTTPException(status_code=403, detail="Business not found or access denied.")
 
+    # ── Plan limits ────────────────────────────────────────────────────────────
+    user_plan = user.plan if hasattr(user, "plan") else "free"
+    config    = PLAN_CONFIG.get(user_plan, PLAN_CONFIG["free"])
+    max_rows  = config["max_rows"]
+    max_mb    = config["max_file_mb"]
+
     # Parse optional JSON map: {"filename.xlsx": "context note"}
     contexts_map = {}
     if file_contexts:
@@ -330,44 +338,87 @@ async def upload_documents(
 
     uploaded = []
     for file in files:
-        # 1. Sanitize filename & retrieve specific context note FIRST
-        safe_filename = Path(file.filename).name
+        safe_filename    = Path(file.filename).name
         specific_context = contexts_map.get(safe_filename, "").strip() or None
+        ext              = Path(safe_filename).suffix.lower()
+        temp_path        = f"/tmp/{uuid.uuid4()}_{safe_filename}"
 
-        temp_path = f"/tmp/{uuid.uuid4()}_{safe_filename}"
-        
-        # 2. Save temporary file to disk
+        # Save to disk
         contents = await file.read()
         with open(temp_path, "wb") as f:
             f.write(contents)
 
-        # 3. Create document record with description attached
-        doc = Document(
-            business_id=business.id, 
-            filename=safe_filename, 
-            content="", 
-            description=specific_context,
-            status="ready"
-        )
-        db.add(doc)
-        db.commit()
-        db.refresh(doc)
-
-        # 4. Ingest and chunk document
         try:
-            chunks_count = ingest_document(
-                db=db, 
-                business_id=business.id, 
-                document_id=doc.id,
-                file_path=temp_path, 
-                mime_type=file.content_type, 
+            # ── File size check ────────────────────────────────────────────────
+            file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+            if file_size_mb > max_mb:
+                raise HTTPException(status_code=400, detail={
+                    "message":     f"{safe_filename} exceeds the {max_mb}MB limit for your {config['display_name']} plan.",
+                    "size_mb":     round(file_size_mb, 1),
+                    "limit_mb":    max_mb,
+                    "upgrade_url": "/pricing",
+                })
+
+            # ── Row count check (spreadsheets only) ───────────────────────────
+            if ext in [".csv", ".xlsx", ".xls"]:
+                try:
+                    if ext == ".csv":
+                        with open(temp_path) as f:
+                            row_count = sum(1 for _ in f) - 1
+                    else:
+                        xl        = pd.ExcelFile(temp_path)
+                        row_count = sum(
+                            len(pd.read_excel(temp_path, sheet_name=s, header=None))
+                            for s in xl.sheet_names
+                        )
+
+                    if row_count > max_rows:
+                        raise HTTPException(status_code=400, detail={
+                            "message":     f"{safe_filename} has {row_count} rows which exceeds your {config['display_name']} plan limit of {max_rows}.",
+                            "rows":        row_count,
+                            "limit":       max_rows,
+                            "upgrade_url": "/pricing",
+                        })
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    print(f"[Upload] Row count check failed for {safe_filename}: {e}")
+
+            # ── Create document record ─────────────────────────────────────────
+            doc = Document(
+                business_id=business.id,
                 filename=safe_filename,
-                file_context=specific_context
+                content="",
+                description=specific_context,
+                status="ready",
+            )
+            db.add(doc)
+            db.commit()
+            db.refresh(doc)
+
+            # ── Ingest ─────────────────────────────────────────────────────────
+            chunks_count = ingest_document(
+                db=db,
+                business_id=business.id,
+                document_id=doc.id,
+                file_path=temp_path,
+                mime_type=file.content_type,
+                filename=safe_filename,
+                file_context=specific_context,
             )
             uploaded.append({
-                "filename": safe_filename, 
-                "document_id": doc.id, 
-                "chunks": chunks_count
+                "filename":    safe_filename,
+                "document_id": doc.id,
+                "chunks":      chunks_count,
+            })
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[Upload] Failed for {safe_filename}: {e}")
+            uploaded.append({
+                "filename": safe_filename,
+                "error":    str(e),
             })
         finally:
             if os.path.exists(temp_path):
