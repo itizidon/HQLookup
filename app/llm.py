@@ -42,48 +42,63 @@ def build_prompt(question: str, chunks: List[dict]) -> str:
     return f"""
 You are a retrieval assistant.
 
-Answer the user's question using ONLY the provided context.
+Your task is to evaluate each retrieved context block independently.
+
+Each context block is an independent candidate answer. Multiple context blocks may answer the user's question.
+
+Use ONLY the provided context.
 
 IMPORTANT RULES:
-- Return ONLY valid JSON.
-- Do NOT include markdown.
-- Do NOT include explanations outside the JSON.
-- If the answer is not found, return:
-{{
+
+* Return ONLY valid JSON.
+* Do NOT include markdown.
+* Do NOT include explanations outside the JSON.
+* Evaluate every context block independently.
+* If a context block answers the user's question, return one answer object for that context block.
+* NEVER merge multiple context blocks into one answer.
+* NEVER summarize multiple spreadsheet rows into one answer.
+* NEVER combine multiple matching records into one answer.
+* If three different rows answer the question, return three separate answer objects.
+* Preserve all values exactly as they appear in the context.
+* Ignore context blocks that do not answer the user's question.
+* Do not hallucinate.
+* If no context answers the question, return:
+  {{
   "answers": []
-}}
+  }}
 
-Return format:
+Return JSON in exactly this format:
+
 {{
-  "answers": [
-    {{
-      "fact": "short factual statement",
-      "sources": [
-        {{
-          "chunk": 1,
-          "filename": "example.pdf"
-        }}
-      ]
-    }}
-  ]
+"answers": [
+{{
+"answer": "Complete answer taken from this context block.",
+"confidence": 0.98,
+"sources": [
+{{
+"chunk": 1,
+"filename": "example.xlsx"
+}}
+]
+}}
+]
 }}
 
-Requirements:
-- Each distinct fact should be its own array item.
-- Combine duplicate facts.
-- Keep facts concise.
-- A fact may reference multiple chunks if needed.
-- Do not hallucinate.
-- NEVER combine numeric facts.
-- Each unique value must be its own fact.
-- Do not summarize multiple charges into one sentence.
-- A single fact may contain at most ONE numeric value.
+Guidelines:
+
+* Each answer object should correspond to exactly ONE retrieved context block.
+* Do not combine answers from different chunks.
+* Multiple chunks may produce multiple answers.
+* It is acceptable for different answers to contain similar information if they originate from different rows or records.
+* Preserve dates, dollar amounts, IDs, names, and other values exactly as written.
+* Confidence should be between 0.0 and 1.0.
 
 CONTEXT:
 {context}
 
 QUESTION:
 {question}
+
 """.strip()
 
 

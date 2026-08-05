@@ -112,19 +112,16 @@ def extract_spreadsheet_to_text(file_path: str) -> str:
 def chunk_table_deterministically(file_path: str, table_meta: dict) -> list[str]:
     table_name  = table_meta.get("table_name", "Unknown Table")
     cell_range  = table_meta.get("cell_range", "")
-    sheet_target = table_meta.get("sheet_name", None)
     headers     = table_meta.get("column_headers", [])
     description = table_meta.get("description", "")
-
+    
     try:
         excel_file = pd.ExcelFile(file_path)
-        # Fall back to sheet 0 if the LLM's sheet name doesn't match exactly
-        sheet_name = sheet_target if sheet_target in excel_file.sheet_names else excel_file.sheet_names[0]
-        df_full = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
+        df_full = pd.read_excel(excel_file, sheet_name=excel_file.sheet_names[0], header=None)
     except Exception as e:
         print(f"[Chunker] Error reading excel file for chunking: {e}")
         return []
-
+    
     df_slice = df_full
     if cell_range:
         try:
@@ -132,19 +129,31 @@ def chunk_table_deterministically(file_path: str, table_meta: dict) -> list[str]
             df_slice = df_full.iloc[min_row-1:max_row, min_col-1:max_col]
         except Exception:
             pass
-
-    context_prefix = f"Table: {table_name} (Sheet: {sheet_name})\nDescription: {description}\nHeaders: {', '.join(headers)}\n---"
-
+            
+    context_prefix = f"[Table: {table_name}]\nDescription: {description}\nHeaders: {', '.join(headers)}\n---"
+    
     row_chunks = []
+    header_set = {str(h).strip().lower() for h in headers if pd.notna(h)}
+
     for _, row in df_slice.iterrows():
+        # Check if this row is actually just repeating the column headers
+        row_values = [str(val).strip().lower() for val in row.values if pd.notna(val)]
+        if header_set and row_values:
+            # If most values in this row match the header names, it's a header row — skip it!
+            matches = sum(1 for v in row_values if v in header_set)
+            if matches >= len(header_set) * 0.6:  # 60% match threshold
+                continue
+
         row_str = " | ".join([
             f"{headers[i]}: {val}" if i < len(headers) and pd.notna(val) else str(val) 
             for i, val in enumerate(row.values) if pd.notna(val)
         ])
-
+        
         if row_str.strip():
-            row_chunks.append(f"{context_prefix}\nRow Data: {row_str}")
-
+            chunk_text = f"{context_prefix}\nRow Data: {row_str}"
+            row_chunks.append(chunk_text)
+            
+    print(f"[Chunker] Generated {len(row_chunks)} valid row chunks for table '{table_name}' (skipped headers)")
     return row_chunks
 
 def analyze_spreadsheet_with_llm(file_path: str, client: OpenAI = None) -> dict:
@@ -670,51 +679,99 @@ def retrieve_chunks_multi(
         }
  
         sql = f"""
-            WITH scored AS (
-                SELECT
-                    c.id,
-                    c.text,
-                    c.parent_text,
-                    c.chunk_index,
-                    c.document_id,
-                    d.filename,
-                    1 - (c.embedding <=> CAST(:query_vec AS vector)) AS score,
-                    (c.text LIKE '[Table:%%') AS is_tabular
-                FROM chunks c
-                JOIN documents d ON d.id = c.document_id
-                WHERE c.business_id = :business_id
-                {doc_filter_sql}
-            ),
-            tabular_headers AS (
-                SELECT DISTINCT ON (c.document_id)
-                    c.id, c.text, c.parent_text, c.chunk_index,
-                    c.document_id, d.filename,
-                    1.0 AS score, TRUE AS is_tabular
-                FROM chunks c
-                JOIN documents d ON d.id = c.document_id
-                WHERE c.business_id = :business_id
-                  AND c.chunk_index = 0
-                  AND c.text LIKE '[Table:%%'
-                  {doc_filter_sql}
-                  AND c.document_id IN (
-                      SELECT document_id FROM scored
-                      WHERE is_tabular AND score >= :min_tabular
-                  )
-            )
-            SELECT id, text, parent_text, chunk_index, document_id, filename, score
-            FROM (
-                SELECT id, text, parent_text, chunk_index, document_id, filename, score
-                FROM scored
-                WHERE (is_tabular     AND score >= :min_tabular)
-                   OR (NOT is_tabular AND score >= :min_standard)
-                UNION
-                SELECT id, text, parent_text, chunk_index, document_id, filename, score
-                FROM tabular_headers
-            ) combined
-            ORDER BY score DESC
-            LIMIT :limit_plus_one
-            OFFSET :offset
-        """
+WITH scored AS (
+    SELECT
+        c.id,
+        c.text,
+        c.parent_text,
+        c.chunk_index,
+        c.chunk_type,
+        c.document_id,
+        d.filename,
+        1 - (c.embedding <=> CAST(:query_vec AS vector)) AS score
+    FROM chunks c
+    JOIN documents d
+      ON d.id = c.document_id
+    WHERE c.business_id = :business_id
+    {doc_filter_sql}
+),
+
+tabular_headers AS (
+    SELECT DISTINCT ON (c.document_id)
+        c.id,
+        c.text,
+        c.parent_text,
+        c.chunk_index,
+        c.chunk_type,
+        c.document_id,
+        d.filename,
+        1.0 AS score
+    FROM chunks c
+    JOIN documents d
+      ON d.id = c.document_id
+    WHERE c.business_id = :business_id
+      AND c.chunk_type = 'tabular'
+      AND c.chunk_index = 0
+      {doc_filter_sql}
+      AND c.document_id IN (
+            SELECT document_id
+            FROM scored
+            WHERE chunk_type = 'tabular'
+              AND score >= :min_tabular
+      )
+)
+
+SELECT
+    id,
+    text,
+    parent_text,
+    chunk_index,
+    chunk_type,
+    document_id,
+    filename,
+    score
+FROM (
+
+    SELECT
+        id,
+        text,
+        parent_text,
+        chunk_index,
+        chunk_type,
+        document_id,
+        filename,
+        score
+    FROM scored
+    WHERE
+        (
+            chunk_type = 'tabular'
+            AND score >= :min_tabular
+        )
+        OR
+        (
+            chunk_type <> 'tabular'
+            AND score >= :min_standard
+        )
+
+    UNION
+
+    SELECT
+        id,
+        text,
+        parent_text,
+        chunk_index,
+        chunk_type,
+        document_id,
+        filename,
+        score
+    FROM tabular_headers
+
+) combined
+
+ORDER BY score DESC
+LIMIT :limit_plus_one
+OFFSET :offset
+"""
  
         rows = db.execute(text(sql), params).fetchall()
         for rank, row in enumerate(rows):
@@ -722,12 +779,13 @@ def retrieve_chunks_multi(
             rrf_contribution = 1.0 / (rank + 1 + RRF_K)
             if chunk_id not in rrf_scores:
                 rrf_scores[chunk_id] = {
-                    "text":        row.text,
+                    "text": row.text,
                     "parent_text": row.parent_text,
-                    "filename":    row.filename,
+                    "chunk_type": row.chunk_type,
+                    "filename": row.filename,
                     "document_id": row.document_id,
-                    "score":       row.score,
-                    "rrf_score":   0.0,
+                    "score": row.score,
+                    "rrf_score": 0.0,
                 }
             rrf_scores[chunk_id]["rrf_score"] += rrf_contribution
  
@@ -738,23 +796,51 @@ def retrieve_chunks_multi(
     # Multiple child chunks may share the same parent paragraph.
     # Only keep the highest-ranked child per unique parent so the LLM
     # never sees the same paragraph twice — this is what eliminates duplicates.
-    seen_parents: set  = set()
-    deduped: list      = []
- 
+    seen_parents = set()
+    deduped = []
+
     for r in merged:
-        parent = r.get("parent_text") or r["text"]  # tabular chunks have no parent
-        parent_key = parent.strip()[:200]            # first 200 chars as identity key
- 
-        if parent_key not in seen_parents:
-            seen_parents.add(parent_key)
-            # Send parent_text to LLM (richer context), child text was used for retrieval
+
+    #
+    # Spreadsheet pipeline
+    #
+        STRUCTURED_TYPES = {
+            "tabular",
+            "table_metadata",
+            "workbook_metadata",
+            "chart_metadata",
+        }
+
+        if r["chunk_type"] in STRUCTURED_TYPES:
             deduped.append({
-                "text":        parent if parent else r["text"],  # LLM gets parent
-                "child_text":  r["text"],                        # for debugging
-                "filename":    r["filename"],
+                "text": r["text"],
+                "child_text": r["text"],
+                "filename": r["filename"],
                 "document_id": r["document_id"],
-                "score":       float(round(r["score"], 4)),
+                "score": float(round(r["score"], 4)),
+                "chunk_type": r["chunk_type"],
             })
+            continue
+
+    #
+    # Text / PDF pipeline
+    #
+        parent = r.get("parent_text") or r["text"]
+        parent_key = parent.strip()[:200]
+
+        if parent_key in seen_parents:
+            continue
+
+        seen_parents.add(parent_key)
+
+        deduped.append({
+            "text": parent,
+            "child_text": r["text"],
+            "filename": r["filename"],
+            "document_id": r["document_id"],
+            "score": float(round(r["score"], 4)),
+            "chunk_type": r["chunk_type"],
+        })
  
     print(f"\n[MultiQuery] {len(vectors)} variants → {len(merged)} chunks → {len(deduped)} after parent dedup")
     for r in deduped[:8]:
@@ -1002,7 +1088,7 @@ def retrieve_chunks(
                 SELECT
                     c.id, c.text, c.parent_text, c.chunk_index, c.document_id, d.filename,
                     1 - (c.embedding <=> CAST(:query_vec AS vector)) AS score,
-                    (c.text LIKE '[Table:%%') AS is_tabular
+                    (c.text LIKE '[Table:%%')
                 FROM chunks c
                 JOIN documents d ON d.id = c.document_id
                 WHERE c.business_id = :business_id
@@ -1011,24 +1097,32 @@ def retrieve_chunks(
             tabular_headers AS (
                 SELECT DISTINCT ON (c.document_id)
                     c.id, c.text, c.parent_text, c.chunk_index, c.document_id, d.filename,
-                    1.0 AS score, TRUE AS is_tabular
+                    1.0 AS score, TRUE
                 FROM chunks c
                 JOIN documents d ON d.id = c.document_id
                 WHERE c.business_id = :business_id
                   AND c.chunk_index = 0
-                  AND c.text LIKE '[Table:%%'
+                  AND c.chunk_type = 'tabular'
                   {doc_filter_sql}
                   AND c.document_id IN (
                       SELECT document_id FROM scored
-                      WHERE is_tabular AND score >= :min_tabular
+                      WHERE chunk_type = 'tabular' AND score >= :min_tabular
                   )
             )
             SELECT id, text, parent_text, chunk_index, document_id, filename, score
             FROM (
                 SELECT id, text, parent_text, chunk_index, document_id, filename, score
                 FROM scored
-                WHERE (is_tabular     AND score >= :min_tabular)
-                   OR (NOT is_tabular AND score >= :min_standard)
+                WHERE
+                    (
+                        chunk_type = 'tabular'
+                        AND score >= :min_tabular
+                    )
+                    OR
+                    (
+                        chunk_type <> 'tabular'
+                        AND score >= :min_standard
+                    )
                 UNION
                 SELECT id, text, parent_text, chunk_index, document_id, filename, score
                 FROM tabular_headers
