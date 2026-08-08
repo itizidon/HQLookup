@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { Search, ChevronDown, History, Clock, Loader2, Building2, MessageSquare, ArrowRight, Plus, LayoutDashboard } from 'lucide-react';
 import { useBusiness } from '@/app/context/BusinessContext';
@@ -16,18 +16,52 @@ interface RagResponse {
   nextOffset: number | null;
 }
 
+interface RecentQuery {
+  id: number;
+  question: string;
+  answer: string;
+}
+
 export default function SearchHome() {
-  // 1. Consume the real active business from your global state context
   const { selectedBusiness, businesses, selectBusiness } = useBusiness();
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
 
-  // 2. Local states for interactive input and querying
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [result, setResult] = useState<RagResponse | null>(null);
 
-  // 3. Form submit handler pointing to your POST /ask endpoint (Root Trigger)
+  // 1. State for storing fetched recent queries
+  const [recentQueries, setRecentQueries] = useState<RecentQuery[]>([]);
+  const [loadingQueries, setLoadingQueries] = useState(false);
+
+  // 2. Fetch recent queries whenever the selected business changes
+  useEffect(() => {
+    if (!selectedBusiness) {
+      setRecentQueries([]);
+      return;
+    }
+
+    const fetchRecentQueries = async () => {
+      setLoadingQueries(true);
+      try {
+        const res = await fetch(`http://localhost:8000/queries/recent?business_id=${selectedBusiness.id}&page=1&page_size=5`, {
+          method: "GET",
+          credentials: "include",
+        });
+        if (!res.ok) throw new Error("Failed to fetch recent queries");
+        const data = await res.json();
+        setRecentQueries(data.queries || []);
+      } catch (err) {
+        console.error("Recent Queries Error:", err);
+      } finally {
+        setLoadingQueries(false);
+      }
+    };
+
+    fetchRecentQueries();
+  }, [selectedBusiness]);
+
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!query.trim() || !selectedBusiness) return;
@@ -51,6 +85,16 @@ export default function SearchHome() {
       if (!response.ok) throw new Error("Search execution failed");
       const data = await response.json();
       setResult(data);
+
+      // Refresh recent queries list after a new search is executed
+      const updatedRes = await fetch(`http://localhost:8000/queries/recent?business_id=${selectedBusiness.id}&page=1&page_size=5`, {
+        method: "GET",
+        credentials: "include",
+      });
+      if (updatedRes.ok) {
+        const updatedData = await updatedRes.json();
+        setRecentQueries(updatedData.queries || []);
+      }
     } catch (err) {
       console.error("RAG Error:", err);
     } finally {
@@ -58,7 +102,6 @@ export default function SearchHome() {
     }
   };
 
-  // 4. Lazy-loading pagination state worker
   const handleLoadMore = async () => {
     if (!result || !result.hasMore || result.nextOffset === null || !selectedBusiness || loadingMore) return;
 
@@ -100,22 +143,12 @@ export default function SearchHome() {
 
   return (
     <div className="screen" style={{ position: 'relative' }}>
-      {/* Navbar with Top-Left Dashboard and Business Switcher */}
       <div className="nav" style={{ overflow: 'visible' }}>
-        {/* LEFT SIDE: Primary Navigation & App Context */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', position: 'relative' }}>
           <Link
             href="/dashboard"
             className="nav-link"
-            style={{ 
-              display: 'flex', 
-              alignItems: 'center', 
-              gap: '5px', 
-              textDecoration: 'none', 
-              color: 'var(--color-text-primary)', 
-              fontSize: '13px', 
-              fontWeight: 500 
-            }}
+            style={{ display: 'flex', alignItems: 'center', gap: '5px', textDecoration: 'none', color: 'var(--color-text-primary)', fontSize: '13px', fontWeight: 500 }}
           >
             <LayoutDashboard size={14} /> Dashboard
           </Link>
@@ -158,7 +191,6 @@ export default function SearchHome() {
           )}
         </div>
 
-        {/* RIGHT SIDE: User Utilities */}
         <div className="nav-right" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           <button className="nav-link" style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'transparent', border: 'none', cursor: 'pointer' }}>
             <History size={13} /> History
@@ -175,7 +207,6 @@ export default function SearchHome() {
           </div>
         </div>
 
-        {/* Dynamic Search Form Wrapper */}
         <form onSubmit={handleSearch} style={{ display: 'flex', alignItems: 'center', gap: '10px', width: '100%', maxWidth: '520px', padding: '6px 10px 6px 14px', border: '0.5px solid var(--color-border-secondary)', borderRadius: '40px', background: 'var(--color-background-primary)' }}>
           <Search size={16} style={{ color: 'var(--color-text-tertiary)' }} />
           <input
@@ -196,7 +227,6 @@ export default function SearchHome() {
           </button>
         </form>
 
-        {/* Workspace Display Area: Renders the RAG output if available */}
         {result && (
           <div style={{ width: '100%', maxWidth: '520px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
             <div className="card" style={{ width: '100%', padding: '16px', borderRadius: 'var(--border-radius-lg)', background: 'var(--color-background-secondary)' }}>
@@ -229,7 +259,6 @@ export default function SearchHome() {
               )}
             </div>
 
-            {/* ⚡ LOAD MORE CONTROL INTERFACE */}
             {result.hasMore && (
               <DebounceContainer action={handleLoadMore} delay={600}>
                 {({ handleAction, isLoading }) => {
@@ -277,22 +306,38 @@ export default function SearchHome() {
           </div>
         )}
 
-        {/* History Mock fallback section */}
+        {/* Dynamic Recent Queries Section */}
         {!result && (
           <div style={{ width: '100%', maxWidth: '520px' }}>
             <div style={{ fontSize: '12px', color: 'var(--color-text-tertiary)', marginBottom: '8px', fontWeight: 500 }}>Recent queries</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-              <button
-                type="button"
-                className="table-row"
-                style={{ width: '100%', textAlign: 'left', padding: '8px 10px', borderRadius: 'var(--border-radius-md)', border: 'none', background: 'transparent', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}
-                onClick={() => setQuery("How much did Dr. Sue charge?")}
-              >
-                <Clock size={14} style={{ color: 'var(--color-text-tertiary)' }} />
-                <span style={{ fontSize: '13px', color: 'var(--color-text-secondary)', flex: 1 }}>How much did Dr. Sue charge?</span>
-                <ArrowRight size={12} style={{ color: 'var(--color-text-tertiary)' }} />
-              </button>
-            </div>
+            
+            {loadingQueries ? (
+              <div style={{ display: 'flex', justifyContent: 'center', padding: '16px' }}>
+                <Loader2 className="animate-spin" size={16} style={{ color: 'var(--color-text-tertiary)' }} />
+              </div>
+            ) : recentQueries.length > 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                {recentQueries.map((q) => (
+                  <button
+                    key={q.id}
+                    type="button"
+                    className="table-row"
+                    style={{ width: '100%', textAlign: 'left', padding: '8px 10px', borderRadius: 'var(--border-radius-md)', border: 'none', background: 'transparent', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}
+                    onClick={() => setQuery(q.question)}
+                  >
+                    <Clock size={14} style={{ color: 'var(--color-text-tertiary)' }} />
+                    <span style={{ fontSize: '13px', color: 'var(--color-text-secondary)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {q.question}
+                    </span>
+                    <ArrowRight size={12} style={{ color: 'var(--color-text-tertiary)' }} />
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div style={{ fontSize: '12px', color: 'var(--color-text-tertiary)', padding: '8px 0' }}>
+                No recent queries found for this business.
+              </div>
+            )}
           </div>
         )}
       </div>
