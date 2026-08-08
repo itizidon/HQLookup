@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
+import { FileText } from 'lucide-react';
 import { Search, ChevronDown, History, Clock, Loader2, Building2, MessageSquare, ArrowRight, Plus } from 'lucide-react';
 import { useBusiness } from '@/app/context/BusinessContext';
 import { DebounceContainer } from '@/components/Debounce';
@@ -147,10 +148,8 @@ export default function SearchHome() {
             href="/dashboard"
             style={{ display: 'flex', alignItems: 'center', gap: '8px', textDecoration: 'none', color: 'var(--color-text-primary)' }}
           >
-            <div style={{ width: '24px', height: '24px', borderRadius: '6px', background: 'var(--color-primary, #4f46e5)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: '11px', fontWeight: 700 }}>
-              AI
-            </div>
-            <span style={{ fontSize: '14px', fontWeight: 600, letterSpacing: '-0.2px' }}>AskAI</span>
+          <FileText size={18} style={{ color: 'var(--color-text-info)' }} /> HQLookup
+
           </Link>
 
           <div style={{ width: '1px', height: '14px', background: 'var(--color-border-secondary)' }} />

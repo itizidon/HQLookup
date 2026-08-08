@@ -228,7 +228,7 @@ export default function AdminDashboard() {
   return (
     <div className="screen" style={{ position: 'relative', overflowX: 'hidden' }}>
       <Navbar />
-      <div style={{ padding: '16px 20px', maxWidth: '1200px', margin: '0 auto' }}>
+      <div style={{ padding: '24px' }}>
 
         {/* Title & Action Buttons Header */}
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', marginBottom: '20px', justifyContent: 'space-between', gap: '12px' }}>
@@ -268,7 +268,7 @@ export default function AdminDashboard() {
 
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
             {/* New Org Button */}
-            <div style={{ position: 'relative', display: 'inline-block' }}>
+            <div style={{ position: 'relative', display: 'inline-block' }} className="group">
               <button
                 className="btn btn-secondary"
                 onClick={() => setIsOrgModalOpen(true)}
@@ -283,7 +283,7 @@ export default function AdminDashboard() {
               </button>
 
               {isOrgLimitReached && (
-                <div style={s.tooltip}>
+                <div className="group-hover:block hidden" style={s.tooltip}>
                   Your current account profile tier ({userPlanKey.toUpperCase()}) is restricted to {maxOrganizationsAllowed} organization workspace.
                   <div style={s.tooltipArrow} />
                 </div>
@@ -315,13 +315,13 @@ export default function AdminDashboard() {
           </div>
         </div>
 
-        {/* Workspace Grid Cards (Responsive Auto-Fit) */}
+        {/* Workspace Grid Cards (Fixed 3-Column Layout) */}
         {isLoading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '160px' }}>
             <Loader2 className="animate-spin" size={18} />
           </div>
         ) : (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '12px', marginBottom: '20px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '20px' }}>
             {filteredBusinesses.map((biz) => {
               const match = metricsData?.businesses?.find((b: any) => b.id === biz.id);
               const bizUsage = match?.usage ?? 0;
@@ -389,8 +389,8 @@ export default function AdminDashboard() {
           </div>
         )}
 
-        {/* Global Performance Metrics (Responsive Auto-Fit) */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '12px' }}>
+        {/* Global Performance Metrics (Fixed 3-Column Layout) */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' }}>
           {metricsData?.is_owner ? (
             <MetricCard
               label="Account usage this month"
@@ -555,8 +555,6 @@ const s: Record<string, React.CSSProperties> = {
   modalInput: { width: '100%', padding: '8px 12px', fontSize: '13px', borderRadius: '6px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', background: 'transparent', color: 'var(--color-text-primary, #18181b)', outline: 'none', marginTop: '4px' },
   errorAlert: { display: 'flex', gap: '8px', alignItems: 'flex-start', padding: '10px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', border: '1px solid #fee2e2', color: '#ef4444' },
   closeBtn: { background: 'none', border: 'none', color: 'var(--color-text-secondary, #71717a)', cursor: 'pointer', padding: '4px', display: 'flex', alignItems: 'center' },
-
-  // 💡 Tooltip styling updated with visibility control
   tooltip: {
     position: 'absolute',
     bottom: '135%',
@@ -572,7 +570,7 @@ const s: Record<string, React.CSSProperties> = {
     boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
     zIndex: 3000,
     pointerEvents: 'none',
-    display: 'none' // Hidden by default
+    display: 'none'
   },
   tooltipArrow: { position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)', borderWidth: '5px', borderStyle: 'solid', borderColor: '#1f2937 transparent transparent transparent' },
 };
