@@ -1,7 +1,8 @@
 'use client';
 
 import { useState } from 'react';
-import { Search, ChevronDown, History, Clock, Loader2, Building2, MessageSquare, ArrowRight, Plus } from 'lucide-react';
+import Link from 'next/link';
+import { Search, ChevronDown, History, Clock, Loader2, Building2, MessageSquare, ArrowRight, Plus, LayoutDashboard } from 'lucide-react';
 import { useBusiness } from '@/app/context/BusinessContext';
 import { DebounceContainer } from '@/components/Debounce';
 
@@ -23,7 +24,7 @@ export default function SearchHome() {
   // 2. Local states for interactive input and querying
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false); // 👈 Track load more independent from root queries
+  const [loadingMore, setLoadingMore] = useState(false);
   const [result, setResult] = useState<RagResponse | null>(null);
 
   // 3. Form submit handler pointing to your POST /ask endpoint (Root Trigger)
@@ -32,7 +33,7 @@ export default function SearchHome() {
     if (!query.trim() || !selectedBusiness) return;
 
     setLoading(true);
-    setResult(null); // Fresh query clears out historical state frames
+    setResult(null);
 
     try {
       const response = await fetch("http://localhost:8000/ask", {
@@ -43,7 +44,7 @@ export default function SearchHome() {
           question: query,
           business_id: selectedBusiness.id,
           get_k: 5,
-          offset: 0 // Reset pagination offset sequence baseline
+          offset: 0
         })
       });
 
@@ -72,14 +73,13 @@ export default function SearchHome() {
           question: query,
           business_id: selectedBusiness.id,
           get_k: 5,
-          offset: result.nextOffset // Pull items starting exactly from the active offset checkpoint
+          offset: result.nextOffset
         })
       });
 
       if (!response.ok) throw new Error("Pagination iteration step failed");
       const data: RagResponse = await response.json();
 
-      // Append incoming macro generations cleanly to your existing state payload
       setResult((prev) => {
         if (!prev) return data;
         return {
@@ -98,13 +98,30 @@ export default function SearchHome() {
     }
   };
 
-  console.log(result, 'this is results');
-
   return (
     <div className="screen" style={{ position: 'relative' }}>
-      {/* Navbar with Scaled Business Switcher */}
+      {/* Navbar with Top-Left Dashboard and Business Switcher */}
       <div className="nav" style={{ overflow: 'visible' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', position: 'relative' }}>
+        {/* LEFT SIDE: Primary Navigation & App Context */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', position: 'relative' }}>
+          <Link
+            href="/dashboard"
+            className="nav-link"
+            style={{ 
+              display: 'flex', 
+              alignItems: 'center', 
+              gap: '5px', 
+              textDecoration: 'none', 
+              color: 'var(--color-text-primary)', 
+              fontSize: '13px', 
+              fontWeight: 500 
+            }}
+          >
+            <LayoutDashboard size={14} /> Dashboard
+          </Link>
+
+          <div style={{ width: '1px', height: '14px', background: 'var(--color-border-secondary)' }} />
+
           <button
             className="btn"
             style={{ fontSize: '13px', padding: '5px 10px', display: 'flex', alignItems: 'center', gap: '6px' }}
@@ -116,7 +133,7 @@ export default function SearchHome() {
 
           {isDropdownOpen && (
             <div style={{
-              position: 'absolute', top: 'calc(100% + 4px)', left: 0, width: '220px',
+              position: 'absolute', top: 'calc(100% + 4px)', left: '90px', width: '220px',
               background: 'var(--color-background-primary)', border: '0.5px solid var(--color-border-secondary)',
               borderRadius: 'var(--border-radius-md)', boxShadow: '0 4px 12px rgba(0,0,0,0.08)', zIndex: 100, padding: '4px'
             }}>
@@ -131,7 +148,7 @@ export default function SearchHome() {
                   onClick={() => {
                     selectBusiness(biz);
                     setIsDropdownOpen(false);
-                    setResult(null); // Clear previous results upon swapping domains
+                    setResult(null);
                   }}
                 >
                   {biz.name}
@@ -140,8 +157,12 @@ export default function SearchHome() {
             </div>
           )}
         </div>
-        <div className="nav-right">
-          <button className="nav-link" style={{ display: 'flex', alignItems: 'center', gap: '4px' }}><History size={13} /> History</button>
+
+        {/* RIGHT SIDE: User Utilities */}
+        <div className="nav-right" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <button className="nav-link" style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'transparent', border: 'none', cursor: 'pointer' }}>
+            <History size={13} /> History
+          </button>
           <div className="avatar">BS</div>
         </div>
       </div>
@@ -212,7 +233,6 @@ export default function SearchHome() {
             {result.hasMore && (
               <DebounceContainer action={handleLoadMore} delay={600}>
                 {({ handleAction, isLoading }) => {
-                  // Establish an aggregated guard condition to lock out overlapping execution contexts
                   const isProcessing = loadingMore || isLoading;
 
                   return (
@@ -257,7 +277,7 @@ export default function SearchHome() {
           </div>
         )}
 
-        {/* History Mock fallback section remains clean */}
+        {/* History Mock fallback section */}
         {!result && (
           <div style={{ width: '100%', maxWidth: '520px' }}>
             <div style={{ fontSize: '12px', color: 'var(--color-text-tertiary)', marginBottom: '8px', fontWeight: 500 }}>Recent queries</div>
