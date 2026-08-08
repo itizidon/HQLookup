@@ -3,7 +3,11 @@
 import { useState, useEffect, useMemo, ChangeEvent } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { ArrowLeft, Search, Upload, Trash2, FileText, UserPlus, ChevronsUpDown, Building2, Loader2, ShieldAlert, Sliders, Users } from 'lucide-react';
+import { 
+  ArrowLeft, Search, Upload, Trash2, FileText, UserPlus, 
+  ChevronsUpDown, Building2, Loader2, ShieldAlert, Sliders, 
+  Users, ChevronDown, ChevronRight, Sparkles, FileSpreadsheet, X 
+} from 'lucide-react';
 import { useBusiness } from '@/app/context/BusinessContext';
 
 interface ServerDocument {
@@ -20,10 +24,17 @@ interface BusinessDetails {
   query_allocation: number;
 }
 
+interface PendingFile {
+  file: File;
+  id: string;
+  isExcel: boolean;
+  context: string;
+  isExpanded: boolean;
+}
+
 export default function EnterpriseBusinessDetail() {
   // Pulling context sources to read the central business directory list
   const { businesses, isLoading: contextLoading } = useBusiness();
-  console.log(businesses)
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -45,6 +56,9 @@ export default function EnterpriseBusinessDetail() {
   const [docsLoading, setDocsLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   
+  // Pending File Staging State for XLSX Context Injection
+  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+
   // Settings Allocation Form States
   const [localAlloc, setLocalAlloc] = useState<number>(25);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
@@ -94,7 +108,6 @@ export default function EnterpriseBusinessDetail() {
   }, [searchQuery, businesses]);
 
   // ── REFRESH-PROOF PIPELINE ──
-  // Evaluates dynamically if the user targets the browser directly or contexts load asynchronously
   useEffect(() => {
     if (!activeBizId || !activeOrgId) {
       setBusinessDetails(null);
@@ -103,12 +116,10 @@ export default function EnterpriseBusinessDetail() {
       return;
     }
 
-    // Reset temporary validation / form UI states on context pivot
     setSettingsError(null);
     setInviteEmail('');
     setInviteStatus(null);
 
-    // Look up the metadata directly from the context sync layer once it loads
     if (businesses && businesses.length > 0) {
       const matched = businesses.find(b => b.id === activeBizId);
       if (matched) {
@@ -122,7 +133,6 @@ export default function EnterpriseBusinessDetail() {
       }
     }
 
-    // 1. Fetch specific vector indices metrics
     const fetchDocs = async () => {
       setDocsLoading(true);
       try {
@@ -147,7 +157,6 @@ export default function EnterpriseBusinessDetail() {
       }
     };
 
-    // 2. Fetch unified team user authorization records
     const fetchTeamAndInvites = async () => {
       setTeamLoading(true);
       try {
@@ -169,9 +178,8 @@ export default function EnterpriseBusinessDetail() {
 
     fetchDocs();
     fetchTeamAndInvites();
-  }, [activeBizId, activeOrgId, businesses]); // 👈 Listens to businesses updating to resolve delayed context hydration instantly
+  }, [activeBizId, activeOrgId, businesses]);
 
-  // Update URL directly via Router parameter modifications to prevent infinite rendering cycles
   const handleSelectBusiness = (biz: typeof businesses[0]) => {
     const params = new URLSearchParams(searchParams.toString());
     params.set('orgId', biz.org_id.toString());
@@ -179,16 +187,71 @@ export default function EnterpriseBusinessDetail() {
     router.push(`${window.location.pathname}?${params.toString()}`);
   };
 
-  const handleUpload = async (e: ChangeEvent<HTMLInputElement>) => {
-    if (!e.target.files || e.target.files.length === 0 || !activeBizId) return;
+  // Stage files into pending list when picked from disk
+  const handleFileSelection = (e: ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || e.target.files.length === 0) return;
+
+    const newFiles: PendingFile[] = Array.from(e.target.files).map((f) => {
+      const isExcel = f.name.endsWith('.xlsx') || f.name.endsWith('.xls');
+      return {
+        file: f,
+        id: `${f.name}_${Date.now()}_${Math.random()}`,
+        isExcel,
+        context: '',
+        isExpanded: isExcel // Auto-expand spreadsheets by default to invite optional notes
+      };
+    });
+
+    setPendingFiles((prev) => [...prev, ...newFiles]);
+    e.target.value = ''; // Reset input target
+  };
+
+  const removePendingFile = (id: string) => {
+    setPendingFiles((prev) => prev.filter((f) => f.id !== id));
+  };
+
+  const toggleExpandPendingFile = (id: string) => {
+    setPendingFiles((prev) =>
+      prev.map((f) => (f.id === id ? { ...f, isExpanded: !f.isExpanded } : f))
+    );
+  };
+
+  const updatePendingFileContext = (id: string, text: string) => {
+    setPendingFiles((prev) =>
+      prev.map((f) => (f.id === id ? { ...f, context: text } : f))
+    );
+  };
+
+  const addPresetChip = (id: string, presetText: string) => {
+    setPendingFiles((prev) =>
+      prev.map((f) => {
+        if (f.id !== id) return f;
+        const current = f.context.trim();
+        const updated = current ? `${current}; ${presetText}` : presetText;
+        return { ...f, context: updated };
+      })
+    );
+  };
+
+  // Execute actual upload API call with file contexts
+  const handleStartUpload = async () => {
+    if (pendingFiles.length === 0 || !activeBizId) return;
 
     setUploading(true);
     const formData = new FormData();
     formData.append("business_id", activeBizId.toString());
 
-    Array.from(e.target.files).forEach((file) => {
-      formData.append("files", file);
+    // Map file metadata contexts as a JSON string array to pass alongside FormData
+    const contextsPayload: Record<string, string> = {};
+
+    pendingFiles.forEach((p) => {
+      formData.append("files", p.file);
+      if (p.isExcel && p.context.trim()) {
+        contextsPayload[p.file.name] = p.context.trim();
+      }
     });
+
+    formData.append("file_contexts", JSON.stringify(contextsPayload));
 
     try {
       const res = await fetch("http://localhost:8000/upload-multiple", {
@@ -205,6 +268,7 @@ export default function EnterpriseBusinessDetail() {
           business_id: activeBizId
         }));
         setDocuments((prev) => [...newDocs, ...prev]);
+        setPendingFiles([]); // Clear staging queue
       }
     } catch (err) {
       console.error("Upload failure:", err);
@@ -376,7 +440,11 @@ export default function EnterpriseBusinessDetail() {
         </div>
 
         {activeBizId && (
-          <Link href="/search" className="btn btn-primary" style={{ flexShrink: 0, fontSize: '13px' }}>
+          <Link 
+            href={`/search?orgId=${activeOrgId}&bizId=${activeBizId}`} 
+            className="btn btn-primary" 
+            style={{ flexShrink: '0', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px', textDecoration: 'none' }}
+          >
             <Search size={14} /> Open search
           </Link>
         )}
@@ -401,13 +469,12 @@ export default function EnterpriseBusinessDetail() {
                   {contextLoading && <Loader2 className="animate-spin" size={14} style={{ color: 'var(--color-text-info)' }} />}
                   {businessDetails ? businessDetails.name : "Loading Workspace details..."}
                 </h1>
-                <p style={{ fontSize: '11px', color: 'var(--color-text-secondary)', margin: '4px 0 0 0' }}>Instance Resource Key: #{activeBizId}</p>
               </div>
               <button 
                 className="btn btn-secondary" 
                 style={{ fontSize: '12px', padding: '4px 10px', color: '#ef4444' }} 
                 onClick={() => {
-                  router.push(window.location.pathname); // Strips all parameters from URL routing layers entirely
+                  router.push(window.location.pathname);
                 }}
               >
                 Unmount Context
@@ -445,16 +512,150 @@ export default function EnterpriseBusinessDetail() {
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
                     <div>
-                      <h3 style={{ fontSize: '14px', fontWeight: 500, margin: 0 }}>Indexed Knowledge Corpora</h3>
-                      <p style={{ fontSize: '12px', color: 'var(--color-text-secondary)', margin: '2px 0 0 0' }}>Files ingested into the vector search embedding space.</p>
+                      <h3 style={{ fontSize: '14px', fontWeight: 500, margin: 0 }}>Document Library</h3>
+                      <p style={{ fontSize: '12px', color: 'var(--color-text-secondary)', margin: '2px 0 0 0' }}>Files ingested into the AI search index for this location.</p>
                     </div>
-                    <label className="btn btn-primary" style={{ fontSize: '12px', padding: '6px 12px', cursor: 'pointer' }}>
-                      {uploading ? <Loader2 className="animate-spin" size={13} /> : <Upload size={13} />}
-                      {uploading ? " Ingesting..." : " Add Documents"}
-                      <input type="file" multiple onChange={handleUpload} style={{ display: 'none' }} disabled={uploading} />
+                    
+                    <label className="btn btn-primary" style={{ fontSize: '12px', padding: '6px 12px', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                      <Upload size={13} />
+                      Select Files
+                      <input type="file" multiple onChange={handleFileSelection} style={{ display: 'none' }} disabled={uploading} />
                     </label>
                   </div>
 
+                  {/* STAGING QUEUE (PENDING FILES BEFORE INGESTION) */}
+                  {pendingFiles.length > 0 && (
+                    <div style={{ marginBottom: '24px', padding: '16px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '8px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                        <span style={{ fontSize: '12px', fontWeight: 600, color: '#334155' }}>
+                          READY TO INGEST ({pendingFiles.length} file{pendingFiles.length > 1 ? 's' : ''})
+                        </span>
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                          <button 
+                            className="btn btn-secondary" 
+                            style={{ fontSize: '12px', padding: '4px 8px' }} 
+                            onClick={() => setPendingFiles([])}
+                            disabled={uploading}
+                          >
+                            Clear Staging
+                          </button>
+                          <button 
+                            className="btn btn-primary" 
+                            style={{ fontSize: '12px', padding: '4px 12px', gap: '6px' }}
+                            onClick={handleStartUpload}
+                            disabled={uploading}
+                          >
+                            {uploading ? <Loader2 className="animate-spin" size={13} /> : <Upload size={13} />}
+                            {uploading ? "Ingesting..." : "Confirm & Ingest"}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        {pendingFiles.map((p) => (
+                          <div key={p.id} style={{ border: '1px solid #cbd5e1', borderRadius: '6px', background: '#ffffff', overflow: 'hidden' }}>
+                            {/* Primary Row Header */}
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 12px' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: 1, minWidth: 0 }}>
+                                {p.isExcel ? (
+                                  <FileSpreadsheet size={16} style={{ color: '#16a34a', flexShrink: 0 }} />
+                                ) : (
+                                  <FileText size={16} style={{ color: '#64748b', flexShrink: 0 }} />
+                                )}
+                                <span style={{ fontSize: '13px', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {p.file.name}
+                                </span>
+                                <span style={{ fontSize: '11px', color: '#94a3b8' }}>
+                                  ({(p.file.size / 1024).toFixed(1)} KB)
+                                </span>
+                              </div>
+
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                {p.isExcel && (
+                                  <button
+                                    className="btn btn-secondary"
+                                    onClick={() => toggleExpandPendingFile(p.id)}
+                                    style={{
+                                      fontSize: '11px',
+                                      padding: '3px 8px',
+                                      gap: '4px',
+                                      background: p.context ? '#f0fdf4' : '#f8fafc',
+                                      borderColor: p.context ? '#bbf7d0' : '#e2e8f0',
+                                      color: p.context ? '#166534' : '#475569'
+                                    }}
+                                  >
+                                    <Sparkles size={12} style={{ color: p.context ? '#16a34a' : '#94a3b8' }} />
+                                    {p.context ? "Notes Added" : "Add AI Notes"}
+                                    {p.isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                                  </button>
+                                )}
+                                <button
+                                  className="btn btn-secondary"
+                                  style={{ padding: '4px', color: '#ef4444' }}
+                                  onClick={() => removePendingFile(p.id)}
+                                >
+                                  <X size={13} />
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Inline Expandable Drawer for XLSX Context Notes */}
+                            {p.isExcel && p.isExpanded && (
+                              <div style={{ padding: '12px', background: '#f8fafc', borderTop: '1px solid #e2e8f0' }}>
+                                <label style={{ display: 'block', fontSize: '11px', fontWeight: 600, color: '#475569', marginBottom: '4px' }}>
+                                  Spreadsheet Processing Context (Optional)
+                                </label>
+                                <textarea
+                                  value={p.context}
+                                  onChange={(e) => updatePendingFileContext(p.id, e.target.value)}
+                                  placeholder="e.g. Yellow highlighted cells mean pending approval; Columns A-D are Q1 data."
+                                  rows={2}
+                                  style={{
+                                    width: '100%',
+                                    fontSize: '12px',
+                                    padding: '6px 10px',
+                                    borderRadius: '6px',
+                                    border: '1px solid #cbd5e1',
+                                    outline: 'none',
+                                    resize: 'vertical',
+                                    fontFamily: 'inherit'
+                                  }}
+                                />
+
+                                {/* Quick Preset Chips */}
+                                <div style={{ display: 'flex', gap: '6px', marginTop: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                                  <span style={{ fontSize: '10px', color: '#64748b', fontWeight: 500 }}>Quick Presets:</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => addPresetChip(p.id, "Yellow cells indicate pending items")}
+                                    style={s.presetChip}
+                                  >
+                                    + Yellow = Pending
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => addPresetChip(p.id, "Contains multiple side-by-side tables")}
+                                    style={s.presetChip}
+                                  >
+                                    + Multi-Table
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => addPresetChip(p.id, "Top 3 rows contain KPI summary cards")}
+                                    style={s.presetChip}
+                                  >
+                                    + Top KPI Cards
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* INDEXED DOCUMENTS LIST */}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                     {docsLoading ? (
                       <div style={{ padding: '40px', display: 'flex', justifyContent: 'center' }}><Loader2 className="animate-spin" size={20} /></div>
@@ -527,120 +728,61 @@ export default function EnterpriseBusinessDetail() {
                     </div>
                   </div>
 
-                  {/* Single Invite Form */}
-                  <form onSubmit={handleInlineInvite} style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxWidth: '480px', marginBottom: '24px' }}>
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                      <input
-                        type="email"
-                        placeholder="teammate@company.com"
-                        value={inviteEmail}
-                        onChange={(e) => setInviteEmail(e.target.value)}
-                        required
-                        disabled={isSendingInvite}
-                        style={{ ...s.formInput, flex: 1 }}
-                      />
-                      <button
-                        type="submit"
-                        className="btn btn-primary"
-                        disabled={isSendingInvite || !inviteEmail.trim()}
-                        style={{ fontSize: '12px', whiteSpace: 'nowrap', gap: '6px', display: 'flex', alignItems: 'center' }}
-                      >
-                        {isSendingInvite ? <Loader2 className="animate-spin" size={14} /> : <UserPlus size={14} />}
-                        {isSendingInvite ? "Adding..." : "Add User"}
-                      </button>
-                    </div>
-
-                    {inviteStatus && (
-                      <div style={{
-                        fontSize: '12px',
-                        padding: '6px 10px',
-                        borderRadius: '4px',
-                        marginTop: '4px',
-                        backgroundColor: inviteStatus.type === 'success' ? '#f0fdf4' : '#fef2f2',
-                        border: inviteStatus.type === 'success' ? '1px solid #bbf7d0' : '1px solid #fee2e2',
-                        color: inviteStatus.type === 'success' ? '#16a34a' : '#ef4444',
-                        display: 'flex',
-                        alignItems: 'center'
-                      }}>
-                        {inviteStatus.message}
-                      </div>
-                    )}
+                  {/* Inline Invite Form */}
+                  <form onSubmit={handleInlineInvite} style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
+                    <input 
+                      type="email" 
+                      placeholder="colleague@company.com" 
+                      value={inviteEmail}
+                      onChange={(e) => setInviteEmail(e.target.value)}
+                      style={{ ...s.formInput, flex: 1, marginTop: 0 }}
+                      required
+                    />
+                    <button type="submit" className="btn btn-primary" disabled={isSendingInvite || !inviteEmail.trim()} style={{ fontSize: '13px', whiteSpace: 'nowrap' }}>
+                      {isSendingInvite ? <Loader2 className="animate-spin" size={13} /> : <UserPlus size={13} />}
+                      Send Invite
+                    </button>
                   </form>
 
-                  {teamLoading ? (
-                    <div style={{ padding: '24px', display: 'flex', justifyContent: 'center' }}>
-                      <Loader2 className="animate-spin" size={20} />
+                  {inviteStatus && (
+                    <div style={{ ...s.errorBox, backgroundColor: inviteStatus.type === 'success' ? '#f0fdf4' : '#fef2f2', borderColor: inviteStatus.type === 'success' ? '#bbf7d0' : '#fee2e2', color: inviteStatus.type === 'success' ? '#166534' : '#ef4444', marginBottom: '16px' }}>
+                      <span style={{ fontSize: '12px' }}>{inviteStatus.message}</span>
                     </div>
-                  ) : (
-                    <>
-                      {/* Section 1: Active Team Members */}
-                      <div style={{ marginBottom: '24px' }}>
-                        <h4 style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: '8px', letterSpacing: '0.05em' }}>
-                          ACTIVE MEMBERS ({teamMembers.length})
-                        </h4>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                          {teamMembers.map((member) => (
-                            <div key={member.id} style={s.docItemRow}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                                <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: member.is_root ? 'var(--color-primary, #4f46e5)' : '#e4e4e7', color: member.is_root ? '#fff' : '#18181b', fontSize: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600 }}>
-                                  {member.email.slice(0, 2).toUpperCase()}
-                                </div>
-                                <div>
-                                  <div style={{ fontSize: '13px', fontWeight: 500 }}>{member.email}</div>
-                                  <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)' }}>Role context classification: {member.role}</div>
-                                </div>
-                              </div>
-                              <span style={{ fontSize: '10px', padding: '2px 6px', background: member.is_root ? '#e0e7ff' : '#f4f4f5', color: member.is_root ? '#4f46e5' : '#71717a', borderRadius: '4px', fontWeight: 600 }}>
-                                {member.is_root ? "Root Account" : "Active"}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-
-                      {/* Section 2: Pending Invitations */}
-                      <div>
-                        <h4 style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: '8px', letterSpacing: '0.05em' }}>
-                          PENDING INVITATIONS ({pendingInvites.length})
-                        </h4>
-                        {pendingInvites.length === 0 ? (
-                          <div style={{ fontSize: '12px', color: 'var(--color-text-tertiary)', padding: '16px 0', textAlign: 'center', border: '1px dashed var(--color-border-tertiary)', borderRadius: '8px' }}>
-                            No pending invitations active for this scope.
-                          </div>
-                        ) : (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                            {pendingInvites.map((invite) => (
-                              <div key={invite.id} style={s.docItemRow}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                                  <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: '#fafafa', color: '#a1a1aa', fontSize: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600, border: '1px dashed #e4e4e7' }}>
-                                    ?
-                                  </div>
-                                  <div>
-                                    <div style={{ fontSize: '13px', fontWeight: 500 }}>{invite.email}</div>
-                                    <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)' }}>
-                                      Sent {new Date(invite.created_at).toLocaleDateString()}
-                                    </div>
-                                  </div>
-                                </div>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                                  <span style={{ fontSize: '10px', padding: '2px 6px', background: '#fef3c7', color: '#d97706', borderRadius: '4px', fontWeight: 600 }}>
-                                    Pending Seat
-                                  </span>
-                                  <button
-                                    className="btn btn-secondary"
-                                    style={{ padding: '4px 8px', fontSize: '11px', color: '#ef4444', border: '1px solid #fee2e2' }}
-                                    onClick={() => handleRevokeInvite(invite.id)}
-                                  >
-                                    Revoke
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    </>
                   )}
+
+                  {/* Team Members List */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    {teamLoading ? (
+                      <div style={{ padding: '30px', display: 'flex', justifyContent: 'center' }}><Loader2 className="animate-spin" size={18} /></div>
+                    ) : teamMembers.length === 0 && pendingInvites.length === 0 ? (
+                      <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', padding: '24px 0', textAlign: 'center', border: '1px dashed var(--color-border-tertiary)', borderRadius: '8px' }}>
+                        No members assigned.
+                      </div>
+                    ) : (
+                      <>
+                        {teamMembers.map((m) => (
+                          <div key={m.id} style={s.docItemRow}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              <span style={{ fontSize: '13px', fontWeight: 500 }}>{m.email}</span>
+                              {m.is_root && <span style={{ fontSize: '10px', background: '#e0e7ff', color: '#4f46e5', padding: '1px 6px', borderRadius: '4px' }}>Owner</span>}
+                            </div>
+                            <span style={{ fontSize: '11px', color: 'var(--color-text-secondary)', textTransform: 'capitalize' }}>{m.role}</span>
+                          </div>
+                        ))}
+                        {pendingInvites.map((p) => (
+                          <div key={p.id} style={{ ...s.docItemRow, opacity: 0.75 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              <span style={{ fontSize: '13px' }}>{p.email}</span>
+                              <span style={{ fontSize: '10px', background: '#fef3c7', color: '#d97706', padding: '1px 6px', borderRadius: '4px' }}>Pending Invite</span>
+                            </div>
+                            <button className="btn btn-secondary" style={{ padding: '4px 8px', fontSize: '11px', color: '#ef4444' }} onClick={() => handleRevokeInvite(p.id)}>
+                              Revoke
+                            </button>
+                          </div>
+                        ))}
+                      </>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -653,11 +795,12 @@ export default function EnterpriseBusinessDetail() {
 }
 
 const s: Record<string, React.CSSProperties> = {
-  dropdownMenu: { position: 'absolute', top: 'calc(100% + 4px)', left: 0, width: '100%', background: 'var(--color-background-primary, #ffffff)', border: '1px solid var(--color-border-tertiary, #e4e4e7)', borderRadius: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.08)', zIndex: 100, padding: '4px' },
-  dropdownInput: { width: '100%', fontSize: '12px', padding: '6px 10px', marginBottom: '4px', borderRadius: '6px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', outline: 'none' },
-  dropdownItem: { width: '100%', textAlign: 'left', padding: '8px 10px', border: 'none', borderRadius: '6px', fontSize: '12px', cursor: 'pointer', display: 'block', color: 'var(--color-text-primary, #18181b)' },
-  tabLink: { display: 'flex', alignItems: 'center', gap: '6px', padding: '12px 16px', fontSize: '13px', background: 'transparent', border: 'none', cursor: 'pointer', outline: 'none', transition: 'all 0.15s ease' },
-  docItemRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', borderRadius: '8px', backgroundColor: '#ffffff' },
-  formInput: { width: '100%', padding: '8px 12px', fontSize: '13px', borderRadius: '6px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', outline: 'none', background: '#ffffff' },
-  errorBox: { display: 'flex', gap: '8px', alignItems: 'center', padding: '8px 12px', background: '#fef2f2', border: '1px solid #fee2e2', color: '#ef4444', borderRadius: '6px', marginBottom: '12px' }
+  dropdownMenu: { position: 'absolute', top: 'calc(100% + 4px)', left: 0, width: '100%', background: 'var(--color-background-primary)', border: '1px solid var(--color-border-tertiary)', borderRadius: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.08)', zIndex: 100, padding: '4px' },
+  dropdownInput: { width: '100%', padding: '6px 10px', fontSize: '12px', border: 'none', borderBottom: '1px solid var(--color-border-tertiary)', outline: 'none', background: 'transparent', marginBottom: '4px' },
+  dropdownItem: { width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', borderRadius: '4px', fontSize: '12px', cursor: 'pointer', display: 'block' },
+  tabLink: { display: 'flex', alignItems: 'center', gap: '6px', padding: '12px 16px', background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '13px' },
+  docItemRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--color-background-secondary, #fafafa)', border: '1px solid var(--color-border-tertiary, #e4e4e7)', borderRadius: '6px' },
+  formInput: { width: '100%', padding: '8px 12px', fontSize: '13px', borderRadius: '6px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', background: 'transparent', outline: 'none', marginTop: '4px' },
+  errorBox: { display: 'flex', gap: '8px', alignItems: 'center', padding: '10px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', border: '1px solid #fee2e2', color: '#ef4444' },
+  presetChip: { background: '#f1f5f9', border: '1px solid #cbd5e1', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', color: '#334155', cursor: 'pointer', fontWeight: 500 }
 };

@@ -3,10 +3,14 @@ Core RAG service using pgvector.
 Handles: document ingestion → chunking → embedding → PostgreSQL storage → retrieval
 """
 import os
+import re
 import json
 import redis
+import pandas as pd
+import openpyxl
+from openpyxl.utils import range_boundaries
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -29,35 +33,39 @@ CHUNK_OVERLAP      = 100
 TOP_K              = 5
 EMBED_MODEL        = "all-MiniLM-L6-v2"
 MIN_SCORE_STANDARD = 0.45
-MIN_SCORE_TABULAR  = 0.25
+MIN_SCORE_TABULAR  = 0.0
 
 # ── Plan config ────────────────────────────────────────────────────────────────
 PLAN_CONFIG = {
     "free": {
-        "monthly_searches": 50,
-        "use_hyde":         True,
-        "use_multiquery":   True,
-        "rate_per_minute":  3,
-        "rate_per_hour":    20,
-        "price_monthly":    0,
-        "price_yearly":     0,
-        "display_name":     "Free",
-        "max_businesses":   1,
-        "max_users":        2,
-        "max_organizations": 1,
+        "monthly_searches":   50,
+        "use_hyde":           True,
+        "use_multiquery":     True,
+        "rate_per_minute":    3,
+        "rate_per_hour":      20,
+        "price_monthly":      0,
+        "price_yearly":       0,
+        "display_name":       "Free",
+        "max_businesses":     1,
+        "max_users":          2,
+        "max_organizations":  1,
+        "max_rows":           500,
+        "max_file_mb":        5,
     },
     "starter": {
-        "monthly_searches": 2000,
-        "use_hyde":         True,
-        "use_multiquery":   True,
-        "rate_per_minute":  10,
-        "rate_per_hour":    100,
-        "price_monthly":    49,
-        "price_yearly":     470,
-        "display_name":     "Starter",
-        "max_businesses":   3,
-        "max_users":        10,
-        "max_organizations": 1,
+        "monthly_searches":   2000,
+        "use_hyde":           True,
+        "use_multiquery":     True,
+        "rate_per_minute":    10,
+        "rate_per_hour":      100,
+        "price_monthly":      49,
+        "price_yearly":       470,
+        "display_name":       "Starter",
+        "max_businesses":     3,
+        "max_users":          10,
+        "max_organizations":  1,
+        "max_rows":           1000,
+        "max_file_mb":        10,
     },
 }
 
@@ -74,10 +82,377 @@ ACTIVE_QUERY_TTL_SECONDS = 60 * 60 * 6  # 6 hours
 # ── Singleton embedder ─────────────────────────────────────────────────────────
 _embedder = None
 
+def extract_spreadsheet_to_text(file_path: str) -> str:
+    sheet_texts = []
+    
+    try:
+        wb = openpyxl.load_workbook(file_path, data_only=True)
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            if ws._charts:
+                sheet_texts.append(f"=== SHEET: {sheet_name} (Charts) ===\n")
+                for i, chart in enumerate(ws._charts, 1):
+                    chart_type = type(chart).__name__
+                    title = getattr(chart, 'title', None)
+                    title_str = title.text if title and hasattr(title, 'text') else str(title or "Untitled")
+                    sheet_texts.append(f"- Chart {i}: Type={chart_type}, Title='{title_str}'\n")
+                sheet_texts.append("\n")
+    except Exception as e:
+        print(f"[Spreadsheet] Chart extraction warning: {e}")
+
+    excel_data = pd.ExcelFile(file_path)
+    for sheet_name in excel_data.sheet_names:
+        df = pd.read_excel(excel_data, sheet_name=sheet_name, header=None)
+        sheet_texts.append(f"--- Data Grid for {sheet_name} ---\n")
+        sheet_texts.append(df.to_string(na_rep="", index=True, header=True))
+        sheet_texts.append("\n\n")
+        
+    return "".join(sheet_texts)
+
+def chunk_table_deterministically(file_path: str, table_meta: dict) -> list[str]:
+    table_name  = table_meta.get("table_name", "Unknown Table")
+    cell_range  = table_meta.get("cell_range", "")
+    headers     = table_meta.get("column_headers", [])
+    description = table_meta.get("description", "")
+    
+    try:
+        excel_file = pd.ExcelFile(file_path)
+        df_full = pd.read_excel(excel_file, sheet_name=excel_file.sheet_names[0], header=None)
+    except Exception as e:
+        print(f"[Chunker] Error reading excel file for chunking: {e}")
+        return []
+    
+    df_slice = df_full
+    if cell_range:
+        try:
+            min_col, min_row, max_col, max_row = range_boundaries(cell_range)
+            df_slice = df_full.iloc[min_row-1:max_row, min_col-1:max_col]
+        except Exception:
+            pass
+            
+    context_prefix = f"[Table: {table_name}]\nDescription: {description}\nHeaders: {', '.join(headers)}\n---"
+    
+    row_chunks = []
+    header_set = {str(h).strip().lower() for h in headers if pd.notna(h)}
+
+    for _, row in df_slice.iterrows():
+        # Check if this row is actually just repeating the column headers
+        row_values = [str(val).strip().lower() for val in row.values if pd.notna(val)]
+        if header_set and row_values:
+            # If most values in this row match the header names, it's a header row — skip it!
+            matches = sum(1 for v in row_values if v in header_set)
+            if matches >= len(header_set) * 0.6:  # 60% match threshold
+                continue
+
+        row_str = " | ".join([
+            f"{headers[i]}: {val}" if i < len(headers) and pd.notna(val) else str(val) 
+            for i, val in enumerate(row.values) if pd.notna(val)
+        ])
+        
+        if row_str.strip():
+            chunk_text = f"{context_prefix}\nRow Data: {row_str}"
+            row_chunks.append(chunk_text)
+            
+    return row_chunks
+
+def analyze_spreadsheet_with_llm(file_path: str, client: OpenAI = None) -> dict:
+    if client is None:
+        client = OpenAI()
+
+    spreadsheet_text = extract_spreadsheet_to_text(file_path)
+
+    prompt = f"""
+You are an expert data extraction and spreadsheet analysis assistant. Your task is to analyze the provided spreadsheet data (sheet names, cell contents, or structural text dumps) and identify the logical structure of the workbook.
+
+Your goal is to detect:
+- All distinct tables (even if they are not formatted as Excel Tables).
+- The cell range occupied by each table.
+- The column headers for each table.
+- Any charts or visualizations.
+- Important summary metrics or findings.
+
+Return your response as a single, valid JSON object and nothing else. Do not include markdown code blocks (such as json), explanations, or conversational text.
+
+The JSON object must strictly conform to the following schema:
+{{
+  "spreadsheet_summary": "A brief overview of the workbook contents.",
+  "tables": [
+    {{
+      "table_name": "Name or inferred title of the table",
+      "cell_range": "e.g., A1:D15",
+      "column_headers": ["Header1", "Header2"],
+      "description": "Brief description of the table contents"
+    }}
+  ],
+  "charts": [
+    {{
+      "chart_name": "Name or inferred title of the chart",
+      "chart_type": "e.g., Bar, Line, Pie",
+      "location_or_range": "Cell location if identifiable",
+      "description": "Brief description of what the chart visualizes"
+    }}
+  ],
+  "key_findings": [
+    "Notable data insight or summary total"
+  ]
+}}
+
+Analyze the following spreadsheet content:
+{spreadsheet_text}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a precise data extraction assistant that outputs strictly valid JSON objects."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.0
+    )
+
+    raw_content = response.choices[0].message.content
+
+    try:
+        parsed_data = json.loads(raw_content)
+        return parsed_data
+    except Exception as e:
+        print(f"[Spreadsheet LLM] JSON parse error: {e}. Raw content was: {raw_content}")
+        return {"tables": [], "charts": [], "key_findings": [], "spreadsheet_summary": ""}
+    
+def analyze_sheet_structure(
+    raw_rows: list,
+    sheet_name: str,
+    filename: str,
+    user_context: Optional[str] = None,
+) -> dict:
+    """
+    Sends raw rows (as CSV text) to the LLM and asks it to identify:
+      - Where the real header row is
+      - Whether there are multiple tables
+      - What each table represents
+      - Which columns are IDs vs dollar amounts vs dates
+ 
+    Returns a dict the ingestion code uses to read the file correctly.
+    """
+    # Convert raw rows to readable CSV-ish text (max 30 rows to stay within tokens)
+    row_lines = []
+    for i, row in enumerate(raw_rows[:30]):
+        vals = [str(v) if pd.notna(v) else "" for v in row]
+        row_lines.append(f"Row {i}: {' | '.join(vals)}")
+    raw_sample = "\n".join(row_lines)
+ 
+    prompt = f"""You are analyzing a raw Excel sheet to prepare it for ingestion into a vector search database.
+ 
+Filename: {filename}
+Sheet: {sheet_name}
+User context: {user_context or 'None provided'}
+ 
+Raw sheet content (first 30 rows, zero-indexed):
+{raw_sample}
+ 
+Analyze this sheet and respond with ONLY valid JSON — no markdown, no explanation.
+ 
+Return this exact structure:
+{{
+  "tables": [
+    {{
+      "sheet_name": "Name of the Excel tab/sheet",
+      "table_name": "descriptive name for this table",
+      "header_row": 0,
+      "data_start_row": 1,
+      "data_end_row": null,
+      "description": "what each row represents in plain english",
+      "column_notes": {{
+        "ColumnName": "what this column contains — flag if it is an ID/reference not a dollar amount"
+      }},
+      "disambiguation": "any important notes to prevent the LLM from confusing columns e.g. Statement Number is a bill ID not a dollar amount"
+    }}
+  ],
+  "skip_rows": [],
+  "structural_notes": "any other important layout notes"
+}}
+ 
+Rules:
+- header_row is the zero-based row index where the REAL column headers are
+- data_start_row is the first row of actual data (usually header_row + 1)
+- data_end_row is null if data goes to the end, otherwise the last data row index
+- skip_rows lists row indices that are metadata/totals/blank — NOT real data
+- If there are multiple separate tables on the same sheet, list each one
+- If all columns are unnamed, set header_row to the row with the most descriptive text
+- IMPORTANT: Identify columns that look like amounts/money vs ID numbers"""
+ 
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,  # low temp — we want structured reliable output
+            max_tokens=800,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        result = json.loads(raw)
+        return result
+    except Exception as e:
+        print(f"[LLM Structure] Failed for {sheet_name}: {e} — using fallback detection")
+        return None
+ 
+ 
+def fallback_detect_header(df_raw: pd.DataFrame) -> int:
+    """Score-based header detection when LLM fails."""
+    best_score = 0
+    best_row   = 0
+    for i in range(min(20, len(df_raw))):
+        row_vals = df_raw.iloc[i].tolist()
+        score = sum(
+            1 for v in row_vals
+            if isinstance(v, str)
+            and len(v.strip()) > 1
+            and not v.strip().replace(".", "").replace(",", "").replace("-", "").isnumeric()
+        )
+        # Penalize if first cell looks like a date
+        first = str(row_vals[0]) if row_vals else ""
+        if any(yr in first for yr in ["2020", "2021", "2022", "2023", "2024", "2025", "2026"]):
+            score -= 3
+        if score > best_score:
+            best_score = score
+            best_row   = i
+    return best_row
+ 
+def chunk_text_small_to_big(text: str) -> List[dict]:
+    """
+    Returns list of {child, parent} dicts.
+    Child = small sentence-level chunk for embedding.
+    Parent = surrounding paragraph for LLM context.
+    """
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    # Step 1: Split into large parent chunks (paragraphs)
+    parent_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=0,        # no overlap at parent level
+        separators=["\n\n\n", "\n\n", "\n"],
+    )
+    parents = parent_splitter.split_text(text)
+
+    # Step 2: Split each parent into small child chunks
+    child_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=150,
+        chunk_overlap=0,        # no overlap at child level either
+        separators=[".\n", ". ", "! ", "? ", "\n", " "],
+    )
+
+    result = []
+    for parent in parents:
+        children = child_splitter.split_text(parent)
+        for child in children:
+            if child.strip():
+                result.append({
+                    "child":  child.strip(),
+                    "parent": parent.strip(),
+                })
+
+    return result
+
+def normalize_parent_key(text: str) -> str:
+    """
+    Normalizes text by removing section/appendix headers and taking a middle-sample 
+    fingerprint so identical repeated blocks match without false positives.
+    """
+    # Remove dynamic headers
+    cleaned = re.sub(r'Appendix\s+\d+', '', text, flags=re.IGNORECASE)
+    cleaned = re.sub(r'Section\s+\d+', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\W+', '', cleaned).lower()
+    
+    # Use a longer fingerprint (first 300 chars) to prevent false-positive collisions
+    return cleaned[:300]
+
+def extract_table_from_structure(
+    df_raw: pd.DataFrame,
+    table_spec: dict,
+    sheet_name: str,
+) -> tuple[str, pd.DataFrame, str, str]:
+    """
+    Uses the LLM-provided table spec to correctly slice and header the DataFrame.
+    Returns (table_name, clean_df, description, disambiguation).
+    """
+    header_row     = table_spec.get("header_row", 0)
+    data_start     = table_spec.get("data_start_row", header_row + 1)
+    data_end       = table_spec.get("data_end_row", None)
+    table_name     = table_spec.get("table_name", sheet_name)
+    description    = table_spec.get("description", "")
+    disambiguation = table_spec.get("disambiguation", "")
+    skip_rows      = table_spec.get("skip_rows", [])
+ 
+    # Extract header from the identified row
+    headers = df_raw.iloc[header_row].tolist()
+    headers = [
+        str(h).replace("\n", " ").strip() if pd.notna(h) else f"Column_{i}"
+        for i, h in enumerate(headers)
+    ]
+ 
+    # Slice data rows
+    if data_end is not None:
+        df_data = df_raw.iloc[data_start:data_end + 1].copy()
+    else:
+        df_data = df_raw.iloc[data_start:].copy()
+ 
+    df_data.columns = headers
+ 
+    # Drop skip rows (adjust index since we sliced)
+    adjusted_skips = [r - data_start for r in skip_rows if data_start <= r < (data_end or len(df_raw))]
+    if adjusted_skips:
+        df_data = df_data.drop(index=adjusted_skips, errors="ignore")
+ 
+    # Drop unnamed columns
+    df_data = df_data[[c for c in df_data.columns if not str(c).startswith("Unnamed:") and str(c).strip() not in ("", "nan")]]
+ 
+    # Drop fully empty rows
+    df_data = df_data.dropna(how="all").reset_index(drop=True)
+ 
+    return table_name, df_data, description, disambiguation
+ 
+ 
+def build_schema_chunk(
+    table_name: str,
+    df: pd.DataFrame,
+    filename: str,
+    description: str,
+    disambiguation: str,
+    user_context: Optional[str],
+    column_notes: dict,
+) -> str:
+    """Builds the schema header chunk (chunk_index=0 for this table)."""
+    sample_lines = []
+    for col in df.columns:
+        samples = (
+            df[col].dropna().astype(str).str.strip()
+            .loc[lambda s: s != ""].unique()[:3].tolist()
+        )
+        note = column_notes.get(col, "")
+        flag = f" [{note}]" if note else ""
+        sample_lines.append(
+            f"  - {col}{flag}: e.g. {', '.join(samples)}" if samples else f"  - {col}{flag}"
+        )
+ 
+    parts = [
+        f"[Table: {table_name}]",
+        f"Source file: {filename}",
+    ]
+    if description:
+        parts.append(f"Description: {description}")
+    if user_context:
+        parts.append(f"User notes: {user_context}")
+    parts.append(f"Rows: {len(df)} | Columns: {len(df.columns)}")
+    parts.append("Columns and sample values:\n" + "\n".join(sample_lines))
+    if disambiguation:
+        parts.append(f"\nIMPORTANT — Column disambiguation:\n{disambiguation}")
+ 
+    return "\n".join(parts)
+
 def get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
-        print("Loading embedding model... (first time only)")
         _embedder = SentenceTransformer(EMBED_MODEL)
     return _embedder
 
@@ -198,7 +573,6 @@ Passage:"""
             max_tokens=150,
         )
         hypothetical = response.choices[0].message.content.strip()
-        print(f"\n[HyDE] Generated: {hypothetical}")
         return hypothetical
     except Exception as e:
         print(f"[HyDE] Failed, falling back to raw query: {e}")
@@ -242,7 +616,6 @@ User question: {query}
         raw      = raw.replace("```json", "").replace("```", "").strip()
         variants = json.loads(raw)
         if isinstance(variants, list):
-            print(f"\n[MultiQuery] Variants: {variants}")
             return [query] + variants
     except Exception as e:
         print(f"[MultiQuery] Failed, using original query only: {e}")
@@ -257,10 +630,8 @@ def build_multi_hyde_vectors(query: str, embedder: SentenceTransformer) -> List[
         try:
             vectors.append(build_hyde_vector(variant, embedder))
         except Exception as e:
-            print(f"[MultiQuery] Skipping variant '{variant}': {e}")
             vectors.append(embedder.encode([variant], normalize_embeddings=True).tolist()[0])
     return vectors
-
 
 def retrieve_chunks_multi(
     db: Session,
@@ -269,118 +640,356 @@ def retrieve_chunks_multi(
     get_k: int,
     offset: int = 0,
     document_ids: List[int] | None = None,
+    vectors: list | None = None,
 ) -> dict:
+
     embedder = get_embedder()
-    vectors  = build_multi_hyde_vectors(query, embedder)
+
+    if vectors is None:
+        vectors = build_multi_hyde_vectors(
+            query,
+            embedder,
+        )
 
     doc_filter_sql = ""
-    base_params    = {
-        "business_id":  business_id,
+
+    base_params = {
+        "business_id": business_id,
         "min_standard": MIN_SCORE_STANDARD,
-        "min_tabular":  MIN_SCORE_TABULAR,
+        "min_tabular": MIN_SCORE_TABULAR,
     }
+
     if document_ids:
-        doc_filter_sql         = "AND c.document_id = ANY(:doc_ids)"
+
+        doc_filter_sql = (
+            "AND c.document_id = ANY(:doc_ids)"
+        )
+
         base_params["doc_ids"] = document_ids
 
-    rrf_scores: dict = {}
-    RRF_K            = 60
+    rrf_scores = {}
+
+    RRF_K = 60
+
+    # Retrieve enough candidates before deduplication.
+    candidate_limit = max(
+        (offset + get_k) * 5,
+        get_k * 5,
+        20,
+    )
 
     for query_vector in vectors:
+
         params = {
             **base_params,
-            "query_vec":      query_vector,
-            "limit_plus_one": get_k * 3 + 1,
-            "offset":         0,
+            "query_vec": query_vector,
+            "limit": candidate_limit,
         }
 
         sql = f"""
             WITH scored AS (
+
                 SELECT
-                    c.id, c.text, c.chunk_index, c.document_id, d.filename,
-                    1 - (c.embedding <=> CAST(:query_vec AS vector)) AS score,
-                    (c.text LIKE '[Table:%%') AS is_tabular
+                    c.id,
+                    c.text,
+                    c.parent_text,
+                    c.chunk_index,
+                    c.chunk_type,
+                    c.content_type,
+                    c.document_id,
+                    d.filename,
+
+                    1 - (
+                        c.embedding
+                        <=> CAST(:query_vec AS vector)
+                    ) AS score
+
                 FROM chunks c
-                JOIN documents d ON d.id = c.document_id
-                WHERE c.business_id = :business_id
-                {doc_filter_sql}
-            ),
-            tabular_headers AS (
-                SELECT DISTINCT ON (c.document_id)
-                    c.id, c.text, c.chunk_index, c.document_id, d.filename,
-                    1.0 AS score, TRUE AS is_tabular
-                FROM chunks c
-                JOIN documents d ON d.id = c.document_id
-                WHERE c.business_id = :business_id
-                  AND c.chunk_index = 0
-                  AND c.text LIKE '[Table:%%'
-                  {doc_filter_sql}
-                  AND c.document_id IN (
-                      SELECT document_id FROM scored
-                      WHERE is_tabular AND score >= :min_tabular
-                  )
+
+                JOIN documents d
+                    ON d.id = c.document_id
+
+                WHERE
+                    c.business_id = :business_id
+
+                    {doc_filter_sql}
             )
-            SELECT id, text, chunk_index, document_id, filename, score
-            FROM (
-                SELECT id, text, chunk_index, document_id, filename, score
-                FROM scored
-                WHERE (is_tabular     AND score >= :min_tabular)
-                   OR (NOT is_tabular AND score >= :min_standard)
-                UNION
-                SELECT id, text, chunk_index, document_id, filename, score
-                FROM tabular_headers
-            ) combined
+
+            SELECT
+                id,
+                text,
+                parent_text,
+                chunk_index,
+                chunk_type,
+                content_type,
+                document_id,
+                filename,
+                score
+
+            FROM scored
+
+            WHERE
+
+                (
+                    content_type = 'tabular'
+                    AND score >= :min_tabular
+                )
+
+                OR
+
+                (
+                    content_type = 'metadata'
+                    AND score >= :min_tabular
+                )
+
+                OR
+
+                (
+                    content_type = 'text'
+                    AND score >= :min_standard
+                )
+
             ORDER BY score DESC
-            LIMIT :limit_plus_one
-            OFFSET :offset
+
+            LIMIT :limit
         """
 
-        rows = db.execute(text(sql), params).fetchall()
+        rows = db.execute(
+            text(sql),
+            params,
+        ).fetchall()
+
+        print(
+            f"[Retrieval] vector returned "
+            f"{len(rows)} candidate chunks"
+        )
+
         for rank, row in enumerate(rows):
+
             chunk_id = row.id
-            rrf_contribution = 1.0 / (rank + 1 + RRF_K)
+
+            contribution = (
+                1.0 /
+                (rank + 1 + RRF_K)
+            )
+
             if chunk_id not in rrf_scores:
+
                 rrf_scores[chunk_id] = {
-                    "text":        row.text,
-                    "filename":    row.filename,
+                    "id": row.id,
+                    "text": row.text,
+                    "parent_text": row.parent_text,
+                    "chunk_index": row.chunk_index,
+                    "chunk_type": row.chunk_type,
+                    "content_type": row.content_type,
+                    "filename": row.filename,
                     "document_id": row.document_id,
-                    "score":       row.score,
-                    "rrf_score":   0.0,
+                    "score": float(row.score),
+                    "rrf_score": 0.0,
                 }
-            rrf_scores[chunk_id]["rrf_score"] += rrf_contribution
 
-    merged = sorted(rrf_scores.values(), key=lambda x: x["rrf_score"], reverse=True)
+            rrf_scores[
+                chunk_id
+            ]["rrf_score"] += contribution
 
-    print(f"\n[MultiQuery] {len(vectors)} variants → {len(merged)} unique chunks after RRF")
-    for r in merged[:8]:
-        print(f"  rrf={r['rrf_score']:.4f} score={r['score']:.4f} | {r['filename']} | {r['text'][:100]}")
+    # ================================================================
+    # RRF SORT
+    # ================================================================
 
-    has_more = len(merged) > (offset + get_k)
-    page     = merged[offset: offset + get_k]
+    merged = sorted(
+    rrf_scores.values(),
+    key=lambda x: x["rrf_score"],
+    reverse=True,
+)
+
+# ------------------------------------------------------------------
+# DEBUG: How many spreadsheet rows survived retrieval?
+# ------------------------------------------------------------------
+
+    structured = [
+        r for r in merged
+        if r.get("content_type") == "tabular"
+    ]
+
+    print(
+        f"[Retrieval] "
+        f"structured candidates={len(structured)} "
+        f"total merged={len(merged)}"
+    )
+
+    for r in structured:
+        print(
+            f"  statement/chunk={r['chunk_index']} "
+            f"score={r['score']:.4f} "
+            f"{r['text'][:150]}"
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Deduplicate
+    # ------------------------------------------------------------------
+
+    seen_parents = set()
+    seen_structured = set()
+
+    deduped = []
+
+
+
+    # ================================================================
+    # DEDUPLICATION
+    # ================================================================
+
+    deduped = []
+
+    seen_text_parents = set()
+
+    for result in merged:
+
+        content_type = result[
+            "content_type"
+        ]
+
+        # ------------------------------------------------------------
+        # Spreadsheet rows
+        # ------------------------------------------------------------
+
+        if content_type == "tabular":
+
+            # A database chunk is already one logical spreadsheet
+            # record. If multiple HyDE searches find it, RRF has
+            # already merged them by chunk ID.
+            #
+            # Therefore DO NOT deduplicate spreadsheet records
+            # based on their text.
+            deduped.append({
+                "id": result["id"],
+                "text": result["text"],
+                "child_text": result["text"],
+                "filename": result["filename"],
+                "document_id": result["document_id"],
+                "chunk_index": result["chunk_index"],
+                "chunk_type": result["chunk_type"],
+                "content_type": content_type,
+                "score": round(
+                    result["score"],
+                    4,
+                ),
+                "rrf_score": result["rrf_score"],
+            })
+
+            continue
+
+        # ------------------------------------------------------------
+        # Metadata
+        # ------------------------------------------------------------
+
+        if content_type == "metadata":
+
+            deduped.append({
+                "id": result["id"],
+                "text": result["text"],
+                "child_text": result["text"],
+                "filename": result["filename"],
+                "document_id": result["document_id"],
+                "chunk_index": result["chunk_index"],
+                "chunk_type": result["chunk_type"],
+                "content_type": content_type,
+                "score": round(
+                    result["score"],
+                    4,
+                ),
+                "rrf_score": result["rrf_score"],
+            })
+
+            continue
+
+        # ------------------------------------------------------------
+        # PDF / text
+        # ------------------------------------------------------------
+
+        parent = (
+            result["parent_text"]
+            or result["text"]
+        )
+
+        parent_key = (
+            result["document_id"],
+            parent.strip(),
+        )
+
+        if parent_key in seen_text_parents:
+            continue
+
+        seen_text_parents.add(
+            parent_key,
+        )
+
+        deduped.append({
+            "id": result["id"],
+            "text": parent,
+            "child_text": result["text"],
+            "filename": result["filename"],
+            "document_id": result["document_id"],
+            "chunk_index": result["chunk_index"],
+            "chunk_type": result["chunk_type"],
+            "content_type": content_type,
+            "score": round(
+                result["score"],
+                4,
+            ),
+            "rrf_score": result["rrf_score"],
+        })
+
+    # ================================================================
+    # DEBUG
+    # ================================================================
+
+    print(
+        f"\n[MultiQuery] "
+        f"{len(vectors)} variants "
+        f"→ {len(merged)} candidates "
+        f"→ {len(deduped)} after dedup"
+    )
+
+    for result in deduped[:20]:
+
+        print(
+            f"  score={result['score']:.4f}"
+            f" | rrf={result['rrf_score']:.4f}"
+            f" | content={result['content_type']}"
+            f" | type={result['chunk_type']}"
+            f" | index={result['chunk_index']}"
+            f" | {result['filename']}"
+            f" | {result['text'][:100]}"
+        )
+
+    # ================================================================
+    # PAGINATION
+    # ================================================================
+
+    total_results = len(deduped)
+
+    page_end = offset + get_k
+
+    page = deduped[
+        offset:page_end
+    ]
+
+    has_more = page_end < total_results
+
+    next_offset = (
+        page_end
+        if has_more
+        else None
+    )
 
     return {
-        "results": [
-            {
-                "text":        r["text"],
-                "filename":    r["filename"],
-                "document_id": r["document_id"],
-                "score":       float(round(r["score"], 4)),
-            }
-            for r in page
-        ],
-        "allResults": [
-            {
-                "text":        r["text"],
-                "filename":    r["filename"],
-                "document_id": r["document_id"],
-                "score":       float(round(r["score"], 4)),
-            }
-            for r in merged
-        ],
-        "hasMore":    has_more,
-        "nextOffset": offset + get_k if has_more else None,
+        "results": page,
+        "allResults": deduped,
+        "hasMore": has_more,
+        "nextOffset": next_offset,
+        "totalResults": total_results,
     }
-
 
 # ── Text extraction ────────────────────────────────────────────────────────────
 def extract_text(file_path: str, mime_type: str) -> str:
@@ -443,89 +1052,378 @@ def ingest_document(
     file_path: str,
     mime_type: str,
     filename: str,
+    file_context: Optional[str] = None,
 ) -> int:
+
     from app.models import Chunk
-    import pandas as pd
 
-    ext      = Path(file_path).suffix.lower()
+    ext = Path(file_path).suffix.lower()
     embedder = get_embedder()
-    chunks   = []
 
-    if ext in [".csv", ".xlsx", ".xls"]:
+    chunks_to_add = []
+
+    # ==================================================================
+    # 1. EXCEL SPREADSHEETS
+    # ==================================================================
+
+    if ext in {".xlsx", ".xls"}:
+
         try:
-            df = pd.read_csv(file_path) if ext == ".csv" else pd.read_excel(file_path)
-
-            df.columns = [str(c).strip() for c in df.columns]
-            col_list   = ", ".join(df.columns.tolist())
-            num_rows   = len(df)
-            table_name = Path(filename).stem.replace("_", " ").replace("-", " ").title()
-
-            sample_lines = []
-            for col in df.columns:
-                samples = (
-                    df[col].dropna().astype(str).str.strip()
-                    .loc[lambda s: s != ""].unique()[:3].tolist()
-                )
-                sample_lines.append(
-                    f"  - {col}: e.g. {', '.join(samples)}" if samples else f"  - {col}"
-                )
-
-            chunks.append(
-                f"[Table: {table_name}]\n"
-                f"This table has {num_rows} rows and {len(df.columns)} columns.\n"
-                f"Columns and sample values:\n" + "\n".join(sample_lines) + "\n"
-                f"Source file: {filename}"
+            spreadsheet_meta = analyze_spreadsheet_with_llm(
+                file_path
             )
 
-            WINDOW_SIZE = 10
-            OVERLAP     = 2
-            step        = WINDOW_SIZE - OVERLAP
+        except Exception as e:
+            print(
+                f"[Ingest] Spreadsheet analysis failed "
+                f"for {filename}: {e}"
+            )
 
-            for start in range(0, num_rows, step):
-                end    = min(start + WINDOW_SIZE, num_rows)
-                window = df.iloc[start:end]
-                lines  = [
-                    f"[Table: {table_name} | Columns: {col_list} | "
-                    f"Rows {start + 1}–{end} of {num_rows}]"
-                ]
-                for row_idx, (_, row) in enumerate(window.iterrows(), start=start + 1):
-                    pairs = [
-                        f"{col}: {val}"
-                        for col, val in row.items()
-                        if pd.notna(val) and str(val).strip() != ""
-                    ]
-                    lines.append(f"  Row {row_idx}: " + " | ".join(pairs))
-                chunks.append("\n".join(lines))
+            spreadsheet_meta = {
+                "tables": [],
+                "charts": [],
+                "key_findings": [],
+                "spreadsheet_summary": "",
+            }
+
+        tables = spreadsheet_meta.get(
+            "tables",
+            [],
+        )
+
+        # --------------------------------------------------------------
+        # Table records
+        # --------------------------------------------------------------
+
+        for table in tables:
+
+            table_chunks = chunk_table_deterministically(
+                file_path,
+                table,
+            )
+
+            for chunk_text in table_chunks:
+
+                if not chunk_text.strip():
+                    continue
+
+                chunks_to_add.append({
+                    "text": chunk_text,
+                    "parent": chunk_text,
+
+                    # Specific chunk role
+                    "chunk_type": "tabular_record",
+
+                    # Broad pipeline type
+                    "content_type": "tabular",
+                })
+
+        # --------------------------------------------------------------
+        # Fallback if LLM detected no tables
+        # --------------------------------------------------------------
+
+        if not tables:
+
+            print(
+                f"[Ingest] Warning: no tables detected for "
+                f"{filename}; using raw spreadsheet fallback."
+            )
+
+            try:
+
+                excel_file = pd.ExcelFile(
+                    file_path
+                )
+
+                for sheet_name in excel_file.sheet_names:
+
+                    df = pd.read_excel(
+                        excel_file,
+                        sheet_name=sheet_name,
+                        header=None,
+                    )
+
+                    for row_index, row in df.iterrows():
+
+                        values = [
+                            str(value)
+                            for value in row.values
+                            if pd.notna(value)
+                        ]
+
+                        if not values:
+                            continue
+
+                        row_text = (
+                            f"Sheet: {sheet_name}\n"
+                            f"Row: {row_index + 1}\n"
+                            + " | ".join(values)
+                        )
+
+                        chunks_to_add.append({
+                            "text": row_text,
+                            "parent": row_text,
+                            "chunk_type": "tabular_record",
+                            "content_type": "tabular",
+                        })
+
+            except Exception as e:
+
+                print(
+                    f"[Ingest] Spreadsheet fallback failed "
+                    f"for {filename}: {e}"
+                )
+
+        # --------------------------------------------------------------
+        # Workbook summary
+        # --------------------------------------------------------------
+
+        summary = spreadsheet_meta.get(
+            "spreadsheet_summary",
+            "",
+        )
+
+        if summary:
+
+            summary_text = (
+                f"Workbook Summary:\n"
+                f"{summary}"
+            )
+
+            chunks_to_add.append({
+                "text": summary_text,
+                "parent": summary_text,
+                "chunk_type": "workbook_metadata",
+                "content_type": "metadata",
+            })
+
+        # --------------------------------------------------------------
+        # Charts
+        # --------------------------------------------------------------
+
+        charts = spreadsheet_meta.get(
+            "charts",
+            [],
+        )
+
+        for chart in charts:
+
+            chart_text = (
+                f"[Chart]\n"
+                f"Name: {chart.get('chart_name', 'Untitled')}\n"
+                f"Type: {chart.get('chart_type', 'Unknown')}\n"
+                f"Location: {chart.get('location_or_range', 'Unknown')}\n"
+                f"Description: {chart.get('description', '')}"
+            )
+
+            chunks_to_add.append({
+                "text": chart_text,
+                "parent": chart_text,
+                "chunk_type": "chart_metadata",
+                "content_type": "metadata",
+            })
+
+        # --------------------------------------------------------------
+        # Key findings
+        # --------------------------------------------------------------
+
+        findings = spreadsheet_meta.get(
+            "key_findings",
+            [],
+        )
+
+        for finding in findings:
+
+            if not finding:
+                continue
+
+            finding_text = (
+                f"Workbook Finding:\n"
+                f"{finding}"
+            )
+
+            chunks_to_add.append({
+                "text": finding_text,
+                "parent": finding_text,
+                "chunk_type": "workbook_metadata",
+                "content_type": "metadata",
+            })
+
+    # ==================================================================
+    # 2. CSV
+    # ==================================================================
+
+    elif ext == ".csv":
+
+        try:
+
+            df = pd.read_csv(
+                file_path,
+            )
+
+            # For now, keep the existing CSV behavior.
+            csv_text = df.to_string(
+                index=False,
+            )
+
+            if csv_text.strip():
+
+                chunks_to_add.append({
+                    "text": csv_text,
+                    "parent": csv_text,
+                    "chunk_type": "tabular_record",
+                    "content_type": "tabular",
+                })
 
         except Exception as e:
-            print(f"Tabular extraction failed: {e}")
-            return 0
-    else:
-        raw_text = extract_text(file_path, mime_type)
-        raw_text = clean_text(raw_text)
-        if not raw_text:
-            return 0
-        chunks = chunk_text(raw_text)
 
-    if not chunks:
+            print(
+                f"[Ingest] CSV processing failed "
+                f"for {filename}: {e}"
+            )
+
+            return 0
+
+    # ==================================================================
+    # 3. SPREADSHEET / CSV EMBEDDING
+    # ==================================================================
+
+    if ext in {".csv", ".xlsx", ".xls"}:
+
+        print(
+            f"[Ingest] Total spreadsheet/CSV chunks ready "
+            f"to embed and save: {len(chunks_to_add)}"
+        )
+
+        if not chunks_to_add:
+
+            print(
+                f"[Ingest] Error: no chunks generated "
+                f"for {filename}"
+            )
+
+            return 0
+
+        texts = [
+            chunk["text"]
+            for chunk in chunks_to_add
+        ]
+
+        embeddings = embedder.encode(
+            texts,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        ).tolist()
+
+        db_chunks = []
+
+        for index, (
+            chunk,
+            embedding,
+        ) in enumerate(
+            zip(
+                chunks_to_add,
+                embeddings,
+            )
+        ):
+
+            db_chunks.append(
+                Chunk(
+                    business_id=business_id,
+                    document_id=document_id,
+                    chunk_index=index,
+
+                    text=chunk["text"],
+                    parent_text=chunk["parent"],
+
+                    chunk_type=chunk["chunk_type"],
+                    content_type=chunk["content_type"],
+
+                    embedding=embedding,
+                )
+            )
+
+        db.add_all(db_chunks)
+        db.commit()
+
+        print(
+            f"[Ingest] Successfully committed "
+            f"{len(db_chunks)} chunks for {filename}"
+        )
+
+        return len(db_chunks)
+
+    # ==================================================================
+    # 4. PDF / NORMAL TEXT
+    # ==================================================================
+
+    raw_text = extract_text(
+        file_path,
+        mime_type,
+    )
+
+    raw_text = clean_text(
+        raw_text,
+    )
+
+    if not raw_text:
         return 0
 
+    pairs = chunk_text_small_to_big(
+        raw_text,
+    )
+
+    if not pairs:
+        return 0
+
+    child_texts = [
+        pair["child"]
+        for pair in pairs
+    ]
+
     embeddings = embedder.encode(
-        chunks, show_progress_bar=False, normalize_embeddings=True
+        child_texts,
+        show_progress_bar=False,
+        normalize_embeddings=True,
     ).tolist()
 
-    db.add_all([
-        Chunk(
-            business_id=business_id,
-            document_id=document_id,
-            chunk_index=i,
-            text=chunk_text_item,
-            embedding=embedding,
+    db_chunks = []
+
+    for index, (
+        pair,
+        embedding,
+    ) in enumerate(
+        zip(
+            pairs,
+            embeddings,
         )
-        for i, (chunk_text_item, embedding) in enumerate(zip(chunks, embeddings))
-    ])
+    ):
+
+        db_chunks.append(
+            Chunk(
+                business_id=business_id,
+                document_id=document_id,
+                chunk_index=index,
+
+                text=pair["child"],
+                parent_text=pair["parent"],
+
+                chunk_type="child",
+                content_type="text",
+
+                embedding=embedding,
+            )
+        )
+
+    db.add_all(db_chunks)
     db.commit()
-    return len(chunks)
+
+    print(
+        f"[Ingest] Successfully committed "
+        f"{len(db_chunks)} text chunks for {filename}"
+    )
+
+    return len(db_chunks)
 
 
 # ── Retrieval (single HyDE) ────────────────────────────────────────────────────
@@ -560,45 +1458,53 @@ def retrieve_chunks(
         params["doc_ids"] = document_ids
 
     sql = f"""
-        WITH scored AS (
-            SELECT
-                c.id, c.text, c.chunk_index, c.document_id, d.filename,
-                1 - (c.embedding <=> CAST(:query_vec AS vector)) AS score,
-                (c.text LIKE '[Table:%%') AS is_tabular
-            FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE c.business_id = :business_id
-            {doc_filter_sql}
-        ),
-        tabular_headers AS (
-            SELECT DISTINCT ON (c.document_id)
-                c.id, c.text, c.chunk_index, c.document_id, d.filename,
-                1.0 AS score, TRUE AS is_tabular
-            FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE c.business_id = :business_id
-              AND c.chunk_index = 0
-              AND c.text LIKE '[Table:%%'
-              {doc_filter_sql}
-              AND c.document_id IN (
-                  SELECT document_id FROM scored
-                  WHERE is_tabular AND score >= :min_tabular
-              )
-        )
-        SELECT id, text, chunk_index, document_id, filename, score
-        FROM (
-            SELECT id, text, chunk_index, document_id, filename, score
-            FROM scored
-            WHERE (is_tabular     AND score >= :min_tabular)
-               OR (NOT is_tabular AND score >= :min_standard)
-            UNION
-            SELECT id, text, chunk_index, document_id, filename, score
-            FROM tabular_headers
-        ) combined
-        ORDER BY score DESC
-        LIMIT :limit_plus_one
-        OFFSET :offset
-    """
+            WITH scored AS (
+                SELECT
+                    c.id, c.text, c.parent_text, c.chunk_index, c.document_id, d.filename,
+                    1 - (c.embedding <=> CAST(:query_vec AS vector)) AS score,
+                    (c.text LIKE '[Table:%%')
+                FROM chunks c
+                JOIN documents d ON d.id = c.document_id
+                WHERE c.business_id = :business_id
+                {doc_filter_sql}
+            ),
+            tabular_headers AS (
+                SELECT DISTINCT ON (c.document_id)
+                    c.id, c.text, c.parent_text, c.chunk_index, c.document_id, d.filename,
+                    1.0 AS score, TRUE
+                FROM chunks c
+                JOIN documents d ON d.id = c.document_id
+                WHERE c.business_id = :business_id
+                  AND c.chunk_index = 0
+                  AND c.chunk_type = 'tabular'
+                  {doc_filter_sql}
+                  AND c.document_id IN (
+                      SELECT document_id FROM scored
+                      WHERE chunk_type = 'tabular' AND score >= :min_tabular
+                  )
+            )
+            SELECT id, text, parent_text, chunk_index, document_id, filename, score
+            FROM (
+                SELECT id, text, parent_text, chunk_index, document_id, filename, score
+                FROM scored
+                WHERE
+                    (
+                        chunk_type = 'tabular'
+                        AND score >= :min_tabular
+                    )
+                    OR
+                    (
+                        chunk_type <> 'tabular'
+                        AND score >= :min_standard
+                    )
+                UNION
+                SELECT id, text, parent_text, chunk_index, document_id, filename, score
+                FROM tabular_headers
+            ) combined
+            ORDER BY score DESC
+            LIMIT :limit_plus_one
+            OFFSET :offset
+        """
 
     results  = db.execute(text(sql), params).fetchall()
     has_more = len(results) > get_k

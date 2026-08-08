@@ -1,7 +1,9 @@
 import uvicorn
+import json
 from fastapi import FastAPI, UploadFile, File, Depends, Query, HTTPException, Form, status
-from typing import List, Tuple
+from typing import List, Optional
 from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
 from app.database import get_db
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -69,11 +71,13 @@ class DocumentRequest(BaseModel):
     page:         int = 1
     page_size:    int = 50
 
+# If your Pydantic schema looks like this:
 class DocumentResponseItem(BaseModel):
-    id:     int
-    name:   str
-    type:   str
+    id: int
+    name: str
+    type: str
     status: str
+    description: Optional[str] = None  # 👈 Make sure this is Optional!
 
 class DocumentListResponse(BaseModel):
     documents: List[DocumentResponseItem]
@@ -300,10 +304,13 @@ async def get_comprehensive_usage_metrics(
 @app.post("/upload-multiple")
 async def upload_documents(
     business_id:     int              = Form(...),
+    file_contexts:   Optional[str]    = Form(None),
     current_context: User             = Depends(get_current_user),
     files:           List[UploadFile] = File(...),
     db:              Session          = Depends(get_db),
 ):
+    import pandas as pd
+
     user, _      = current_context
     user_org_ids = get_user_org_ids(db, user.id)
 
@@ -315,23 +322,107 @@ async def upload_documents(
     if not business:
         raise HTTPException(status_code=403, detail="Business not found or access denied.")
 
+    # ── Plan limits ────────────────────────────────────────────────────────────
+    user_plan = user.plan if hasattr(user, "plan") else "free"
+    config    = PLAN_CONFIG.get(user_plan, PLAN_CONFIG["free"])
+    max_rows  = config["max_rows"]
+    max_mb    = config["max_file_mb"]
+
+    # Parse optional JSON map: {"filename.xlsx": "context note"}
+    contexts_map = {}
+    if file_contexts:
+        try:
+            contexts_map = json.loads(file_contexts)
+        except Exception as e:
+            print(f"Failed to parse file_contexts payload: {e}")
+
     uploaded = []
     for file in files:
-        temp_path = f"/tmp/{uuid.uuid4()}_{file.filename}"
+        safe_filename    = Path(file.filename).name
+        specific_context = contexts_map.get(safe_filename, "").strip() or None
+        ext              = Path(safe_filename).suffix.lower()
+        temp_path        = f"/tmp/{uuid.uuid4()}_{safe_filename}"
+
+        # Save to disk
+        contents = await file.read()
         with open(temp_path, "wb") as f:
-            f.write(await file.read())
+            f.write(contents)
 
-        doc = Document(business_id=business.id, filename=file.filename, content="", status="ready")
-        db.add(doc)
-        db.commit()
-        db.refresh(doc)
+        try:
+            # ── File size check ────────────────────────────────────────────────
+            file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+            if file_size_mb > max_mb:
+                raise HTTPException(status_code=400, detail={
+                    "message":     f"{safe_filename} exceeds the {max_mb}MB limit for your {config['display_name']} plan.",
+                    "size_mb":     round(file_size_mb, 1),
+                    "limit_mb":    max_mb,
+                    "upgrade_url": "/pricing",
+                })
 
-        chunks_count = ingest_document(
-            db=db, business_id=business.id, document_id=doc.id,
-            file_path=temp_path, mime_type=file.content_type, filename=file.filename,
-        )
-        uploaded.append({"filename": file.filename, "document_id": doc.id, "chunks": chunks_count})
-        os.remove(temp_path)
+            # ── Row count check (spreadsheets only) ───────────────────────────
+            if ext in [".csv", ".xlsx", ".xls"]:
+                try:
+                    if ext == ".csv":
+                        with open(temp_path) as f:
+                            row_count = sum(1 for _ in f) - 1
+                    else:
+                        xl        = pd.ExcelFile(temp_path)
+                        row_count = sum(
+                            len(pd.read_excel(temp_path, sheet_name=s, header=None))
+                            for s in xl.sheet_names
+                        )
+
+                    if row_count > max_rows:
+                        raise HTTPException(status_code=400, detail={
+                            "message":     f"{safe_filename} has {row_count} rows which exceeds your {config['display_name']} plan limit of {max_rows}.",
+                            "rows":        row_count,
+                            "limit":       max_rows,
+                            "upgrade_url": "/pricing",
+                        })
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    print(f"[Upload] Row count check failed for {safe_filename}: {e}")
+
+            # ── Create document record ─────────────────────────────────────────
+            doc = Document(
+                business_id=business.id,
+                filename=safe_filename,
+                content="",
+                description=specific_context,
+                status="ready",
+            )
+            db.add(doc)
+            db.commit()
+            db.refresh(doc)
+
+            # ── Ingest ─────────────────────────────────────────────────────────
+            chunks_count = ingest_document(
+                db=db,
+                business_id=business.id,
+                document_id=doc.id,
+                file_path=temp_path,
+                mime_type=file.content_type,
+                filename=safe_filename,
+                file_context=specific_context,
+            )
+            uploaded.append({
+                "filename":    safe_filename,
+                "document_id": doc.id,
+                "chunks":      chunks_count,
+            })
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[Upload] Failed for {safe_filename}: {e}")
+            uploaded.append({
+                "filename": safe_filename,
+                "error":    str(e),
+            })
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     clear_active_query(user.id)
     return {"uploaded": uploaded}
@@ -347,32 +438,48 @@ async def get_documents(
     user, _      = current_auth
     user_org_ids = get_user_org_ids(db, user.id)
 
+    # 1. Authorize requested business IDs
     allowed_business_ids = {
         b.id for b in db.query(Business.id).filter(Business.org_id.in_(user_org_ids)).all()
     }
+    
+    if not payload.business_ids:
+        return DocumentListResponse(documents=[], total=0)
+
     for requested_id in payload.business_ids:
         if requested_id not in allowed_business_ids:
             raise HTTPException(status_code=403, detail=f"Not authorized for business ID: {requested_id}")
 
-    offset        = (payload.page - 1) * payload.page_size
+    # 2. Compute safe pagination bounds
+    page = max(payload.page, 1)
+    page_size = max(payload.page_size, 1)
+    offset = (page - 1) * page_size
+
+    # 3. Query documents
+    query = db.query(Document).filter(Document.business_id.in_(payload.business_ids))
+    total_count = query.count()  # Optional: include if response schema requires total
+
     query_results = (
-        db.query(Document)
-        .filter(Document.business_id.in_(payload.business_ids))
+        query
         .order_by(Document.created_at.desc())
         .offset(offset)
-        .limit(payload.page_size)
+        .limit(page_size)
         .all()
     )
 
-    return DocumentListResponse(documents=[
+    # 4. Construct response items with description attached
+    documents = [
         DocumentResponseItem(
             id=doc.id,
             name=doc.filename,
-            type=doc.filename.split(".")[-1].upper() if "." in doc.filename else "FILE",
+            type=doc.filename.rsplit(".", 1)[-1].upper() if "." in doc.filename else "FILE",
             status=doc.status,
+            description=doc.description,  # Pass new field to Pydantic
         )
         for doc in query_results
-    ])
+    ]
+
+    return DocumentListResponse(documents=documents, total=total_count)
 
 
 # ── Get businesses (multi-org) ─────────────────────────────────────────────────
@@ -872,7 +979,6 @@ async def update_business_settings(
 ANSWER_PAGE_SIZE    = 10
 CHUNK_BATCH_SIZE    = 3
 RETRIEVAL_POOL_SIZE = 50
-MAX_LLM_CALLS       = 10
 
 
 @app.post("/ask")
@@ -896,17 +1002,17 @@ def ask_question(
     user_plan = user.plan if hasattr(user, "plan") else "free"
     config    = PLAN_CONFIG.get(user_plan, PLAN_CONFIG["free"])
 
-    if not check_rate_limit(user.id, user_plan):
-        raise HTTPException(status_code=429, detail="Too many requests. Slow down.")
+    # 1. Check search limit and calculate remaining calls for the plan
+    allowed, current, limit = check_search_limit(org.id, user_plan)
+    if not allowed:
+        raise HTTPException(status_code=402, detail={
+            "message": f"Monthly limit of {limit} searches reached.",
+            "current": current, "limit": limit, "upgrade_url": "/pricing",
+        })
+
+    remaining_plan_calls = max(0, limit - current)
 
     answer_offset = body.offset or 0
-    if answer_offset == 0:
-        allowed, current, limit = check_search_limit(org.id, user_plan)
-        if not allowed:
-            raise HTTPException(status_code=402, detail={
-                "message": f"Monthly limit of {limit} searches reached.",
-                "current": current, "limit": limit, "upgrade_url": "/pricing",
-            })
 
     current_doc_state = get_business_doc_state(db, body.business_id)
     cached            = get_active_query(user.id)
@@ -936,19 +1042,27 @@ def ask_question(
 
         all_answers       = []
         next_chunk_offset = 0
+        
+        # Count initial search execution
         increment_search_count(org.id)
+        remaining_plan_calls -= 1
 
     target    = answer_offset + ANSWER_PAGE_SIZE
     llm_calls = 0
-    while len(all_answers) < target and next_chunk_offset is not None and llm_calls < MAX_LLM_CALLS:
+
+    # 2. Process chunks without a hardcoded MAX_LLM_CALLS limit
+    while len(all_answers) < target and next_chunk_offset is not None and llm_calls < remaining_plan_calls:
         chunks = retrieval_results[next_chunk_offset: next_chunk_offset + CHUNK_BATCH_SIZE]
         if not chunks:
             next_chunk_offset = None
             break
+
         new_answers = generate_answer(body.question, chunks).get("answers", [])
         all_answers.extend(new_answers)
+
         next_chunk_offset += CHUNK_BATCH_SIZE
         llm_calls         += 1
+
         if next_chunk_offset >= len(retrieval_results):
             next_chunk_offset = None
 

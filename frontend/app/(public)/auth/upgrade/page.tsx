@@ -5,7 +5,7 @@ export default function UpgradeGate() {
   return (
     <div className="screen">
       <div className="nav">
-        <div className="nav-logo"><FileText size={18} style={{ color: 'var(--color-text-info)' }} /> DocQuery</div>
+        <div className="nav-logo"><FileText size={18} style={{ color: 'var(--color-text-info)' }} /> HQLookup</div>
         <div className="nav-right"><div className="avatar">JD</div></div>
       </div>
       <div className="modal-overlay">
