@@ -110,7 +110,6 @@ export default function AdminDashboard() {
   useEffect(() => {
     const fetchUserDataAndWorkspaces = async () => {
       try {
-        // 1. Fetch Auth Profile containing the backend calculated allocations
         const userRes = await fetch("http://localhost:8000/auth/me", {
           method: "GET",
           credentials: "include",
@@ -120,7 +119,6 @@ export default function AdminDashboard() {
           setUserProfile(userData);
         }
 
-        // 2. Query multi-tenant Organization memberships
         const orgRes = await fetch("http://localhost:8000/organizations", {
           method: "GET",
           credentials: "include",
@@ -143,8 +141,6 @@ export default function AdminDashboard() {
   }, []);
 
   const activeOrg = organizations.find(o => o.id === currentOrgId);
-
-  // Read dynamic tier bounds directly from backend profile response payload
   const userPlanKey = userProfile?.plan?.toLowerCase() || 'free';
 
   const maxOrganizationsAllowed = userProfile?.max_organizations ?? 1;
@@ -220,11 +216,8 @@ export default function AdminDashboard() {
     }
   };
 
-  // Synchronizes context selection, then explicitly maps key references directly to URL parameters
   const handleManageBusinessRedirect = (biz: any) => {
     selectBusiness(biz);
-
-    // Explicitly structure routing context metrics straight into URL query strings
     if (currentOrgId) {
       router.push(`/businesses?orgId=${currentOrgId}&bizId=${biz.id}`);
     } else {
@@ -235,10 +228,10 @@ export default function AdminDashboard() {
   return (
     <div className="screen" style={{ position: 'relative', overflowX: 'hidden' }}>
       <Navbar />
-      <div style={{ padding: '24px' }}>
+      <div style={{ padding: '16px 20px', maxWidth: '1200px', margin: '0 auto' }}>
 
-        {/* Title Section */}
-        <div style={{ display: 'flex', alignItems: 'center', marginBottom: '20px', justifyContent: 'space-between' }}>
+        {/* Title & Action Buttons Header */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', marginBottom: '20px', justifyContent: 'space-between', gap: '12px' }}>
           <div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', position: 'relative' }}>
               {isLoadingOrgs ? (
@@ -273,9 +266,9 @@ export default function AdminDashboard() {
             </div>
           </div>
 
-          <div style={{ display: 'flex', gap: '8px' }}>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
             {/* New Org Button */}
-            <div style={{ position: 'relative', display: 'inline-block' }} className="group">
+            <div style={{ position: 'relative', display: 'inline-block' }}>
               <button
                 className="btn btn-secondary"
                 onClick={() => setIsOrgModalOpen(true)}
@@ -313,7 +306,7 @@ export default function AdminDashboard() {
               </button>
 
               {isBizLimitReached && (
-                <div style={s.tooltip}>
+                <div className="group-hover:block hidden" style={s.tooltip}>
                   Your current account profile tier ({userPlanKey.toUpperCase()}) is restricted to {maxBusinessesAllowed} connected database {maxBusinessesAllowed === 1 ? 'workspace' : 'workspaces'}.
                   <div style={s.tooltipArrow} />
                 </div>
@@ -322,13 +315,13 @@ export default function AdminDashboard() {
           </div>
         </div>
 
-        {/* Workspace Grid Cards */}
+        {/* Workspace Grid Cards (Responsive Auto-Fit) */}
         {isLoading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '160px' }}>
             <Loader2 className="animate-spin" size={18} />
           </div>
         ) : (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '20px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '12px', marginBottom: '20px' }}>
             {filteredBusinesses.map((biz) => {
               const match = metricsData?.businesses?.find((b: any) => b.id === biz.id);
               const bizUsage = match?.usage ?? 0;
@@ -338,8 +331,8 @@ export default function AdminDashboard() {
               return (
                 <div className="card" key={biz.id}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
-                    <div style={{ fontSize: '14px', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <Building2 size={14} style={{ color: 'var(--color-text-secondary)' }} />
+                    <div style={{ fontSize: '14px', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <Building2 size={14} style={{ color: 'var(--color-text-secondary)', flexShrink: 0 }} />
                       {biz.name}
                     </div>
                     <span className="badge badge-success">Active</span>
@@ -365,14 +358,17 @@ export default function AdminDashboard() {
 
                   {/* Action Buttons Layout */}
                   <div style={{ display: 'flex', flexDirection: 'row', gap: '6px', marginTop: '12px' }}>
-                    <Link
-                      href="/search"
+                    <button
                       className="btn btn-primary"
                       style={{ width: '100%', justifyContent: 'center', fontSize: '13px' }}
-                      onClick={() => selectBusiness(biz)}
+                      onClick={() => {
+                        selectBusiness(biz);
+                        const orgIdToUse = currentOrgId || biz.org_id;
+                        router.push(`/search?orgId=${orgIdToUse}&bizId=${biz.id}`);
+                      }}
                     >
                       Open Search
-                    </Link>
+                    </button>
 
                     <button
                       className="btn btn-secondary"
@@ -393,8 +389,8 @@ export default function AdminDashboard() {
           </div>
         )}
 
-        {/* Global Performance Metrics */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' }}>
+        {/* Global Performance Metrics (Responsive Auto-Fit) */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '12px' }}>
           {metricsData?.is_owner ? (
             <MetricCard
               label="Account usage this month"
@@ -553,12 +549,30 @@ const s: Record<string, React.CSSProperties> = {
   dropdownContainer: { position: 'relative', display: 'flex', alignItems: 'center' },
   orgSelect: { fontSize: '18px', fontWeight: 500, background: 'transparent', border: 'none', color: 'var(--color-text-primary, #18181b)', cursor: 'pointer', outline: 'none', paddingRight: '20px', appearance: 'none', WebkitAppearance: 'none' },
   dropdownIcon: { position: 'absolute', right: 0, pointerEvents: 'none', color: 'var(--color-text-secondary, #71717a)' },
-  modalOverlay: { position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', backgroundColor: 'rgba(0, 0, 0, 0.4)', backdropFilter: 'blur(2px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 },
-  modalContent: { background: 'var(--color-background-primary, #ffffff)', border: '1px solid var(--color-border-tertiary, #e4e4e7)', borderRadius: '12px', width: '400px', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)', display: 'flex', flexDirection: 'column' },
+  modalOverlay: { position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', backgroundColor: 'rgba(0, 0, 0, 0.4)', backdropFilter: 'blur(2px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000, padding: '16px' },
+  modalContent: { background: 'var(--color-background-primary, #ffffff)', border: '1px solid var(--color-border-tertiary, #e4e4e7)', borderRadius: '12px', width: '100%', maxWidth: '400px', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)', display: 'flex', flexDirection: 'column' },
   modalHeader: { padding: '16px', borderBottom: '1px solid var(--color-border-tertiary, #e4e4e7)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
   modalInput: { width: '100%', padding: '8px 12px', fontSize: '13px', borderRadius: '6px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', background: 'transparent', color: 'var(--color-text-primary, #18181b)', outline: 'none', marginTop: '4px' },
   errorAlert: { display: 'flex', gap: '8px', alignItems: 'flex-start', padding: '10px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', border: '1px solid #fee2e2', color: '#ef4444' },
   closeBtn: { background: 'none', border: 'none', color: 'var(--color-text-secondary, #71717a)', cursor: 'pointer', padding: '4px', display: 'flex', alignItems: 'center' },
-  tooltip: { position: 'absolute', bottom: '135%', left: '50%', transform: 'translateX(-50%)', backgroundColor: '#1f2937', color: '#ffffff', fontSize: '11px', lineHeight: '1.4', padding: '8px 12px', borderRadius: '6px', width: '220px', textAlign: 'center', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)', zIndex: 3000, pointerEvents: 'none', opacity: 0, transition: 'opacity 0.2s ease, transform 0.2s ease' },
+
+  // 💡 Tooltip styling updated with visibility control
+  tooltip: {
+    position: 'absolute',
+    bottom: '135%',
+    right: '0',
+    backgroundColor: '#1f2937',
+    color: '#ffffff',
+    fontSize: '11px',
+    lineHeight: '1.4',
+    padding: '8px 12px',
+    borderRadius: '6px',
+    width: '220px',
+    textAlign: 'center',
+    boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
+    zIndex: 3000,
+    pointerEvents: 'none',
+    display: 'none' // Hidden by default
+  },
   tooltipArrow: { position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)', borderWidth: '5px', borderStyle: 'solid', borderColor: '#1f2937 transparent transparent transparent' },
 };

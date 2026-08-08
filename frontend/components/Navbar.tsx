@@ -9,7 +9,6 @@ export default function Navbar({ avatarInitials = 'JD' }) {
       </Link>
       <div className="nav-right">
         <Link href="/billing" className="nav-link">Billing</Link>
-        <button className="nav-link">Settings</button>
         <div className="avatar" style={{ cursor: 'pointer' }}>{avatarInitials}</div>
       </div>
     </div>

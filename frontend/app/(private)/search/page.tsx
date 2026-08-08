@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
-import { Search, ChevronDown, History, Clock, Loader2, Building2, MessageSquare, ArrowRight, Plus, LayoutDashboard } from 'lucide-react';
+import { Search, ChevronDown, History, Clock, Loader2, Building2, MessageSquare, ArrowRight, Plus } from 'lucide-react';
 import { useBusiness } from '@/app/context/BusinessContext';
 import { DebounceContainer } from '@/components/Debounce';
 
@@ -31,11 +31,9 @@ export default function SearchHome() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [result, setResult] = useState<RagResponse | null>(null);
 
-  // 1. State for storing fetched recent queries
   const [recentQueries, setRecentQueries] = useState<RecentQuery[]>([]);
   const [loadingQueries, setLoadingQueries] = useState(false);
 
-  // 2. Fetch recent queries whenever the selected business changes
   useEffect(() => {
     if (!selectedBusiness) {
       setRecentQueries([]);
@@ -86,7 +84,6 @@ export default function SearchHome() {
       const data = await response.json();
       setResult(data);
 
-      // Refresh recent queries list after a new search is executed
       const updatedRes = await fetch(`http://localhost:8000/queries/recent?business_id=${selectedBusiness.id}&page=1&page_size=5`, {
         method: "GET",
         credentials: "include",
@@ -145,12 +142,15 @@ export default function SearchHome() {
     <div className="screen" style={{ position: 'relative' }}>
       <div className="nav" style={{ overflow: 'visible' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', position: 'relative' }}>
+          {/* Logo / Brand Name linking back to Dashboard */}
           <Link
             href="/dashboard"
-            className="nav-link"
-            style={{ display: 'flex', alignItems: 'center', gap: '5px', textDecoration: 'none', color: 'var(--color-text-primary)', fontSize: '13px', fontWeight: 500 }}
+            style={{ display: 'flex', alignItems: 'center', gap: '8px', textDecoration: 'none', color: 'var(--color-text-primary)' }}
           >
-            <LayoutDashboard size={14} /> Dashboard
+            <div style={{ width: '24px', height: '24px', borderRadius: '6px', background: 'var(--color-primary, #4f46e5)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: '11px', fontWeight: 700 }}>
+              AI
+            </div>
+            <span style={{ fontSize: '14px', fontWeight: 600, letterSpacing: '-0.2px' }}>AskAI</span>
           </Link>
 
           <div style={{ width: '1px', height: '14px', background: 'var(--color-border-secondary)' }} />
@@ -306,7 +306,6 @@ export default function SearchHome() {
           </div>
         )}
 
-        {/* Dynamic Recent Queries Section */}
         {!result && (
           <div style={{ width: '100%', maxWidth: '520px' }}>
             <div style={{ fontSize: '12px', color: 'var(--color-text-tertiary)', marginBottom: '8px', fontWeight: 500 }}>Recent queries</div>

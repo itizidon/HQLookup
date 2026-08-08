@@ -440,7 +440,11 @@ export default function EnterpriseBusinessDetail() {
         </div>
 
         {activeBizId && (
-          <Link href="/search" className="btn btn-primary" style={{ flexShrink: 0, fontSize: '13px' }}>
+          <Link 
+            href={`/search?orgId=${activeOrgId}&bizId=${activeBizId}`} 
+            className="btn btn-primary" 
+            style={{ flexShrink: '0', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px', textDecoration: 'none' }}
+          >
             <Search size={14} /> Open search
           </Link>
         )}
@@ -465,7 +469,6 @@ export default function EnterpriseBusinessDetail() {
                   {contextLoading && <Loader2 className="animate-spin" size={14} style={{ color: 'var(--color-text-info)' }} />}
                   {businessDetails ? businessDetails.name : "Loading Workspace details..."}
                 </h1>
-                <p style={{ fontSize: '11px', color: 'var(--color-text-secondary)', margin: '4px 0 0 0' }}>Instance Resource Key: #{activeBizId}</p>
               </div>
               <button 
                 className="btn btn-secondary" 
@@ -509,8 +512,8 @@ export default function EnterpriseBusinessDetail() {
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
                     <div>
-                      <h3 style={{ fontSize: '14px', fontWeight: 500, margin: 0 }}>Indexed Knowledge Corpora</h3>
-                      <p style={{ fontSize: '12px', color: 'var(--color-text-secondary)', margin: '2px 0 0 0' }}>Files ingested into the vector search embedding space.</p>
+                      <h3 style={{ fontSize: '14px', fontWeight: 500, margin: 0 }}>Document Library</h3>
+                      <p style={{ fontSize: '12px', color: 'var(--color-text-secondary)', margin: '2px 0 0 0' }}>Files ingested into the AI search index for this location.</p>
                     </div>
                     
                     <label className="btn btn-primary" style={{ fontSize: '12px', padding: '6px 12px', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
@@ -725,120 +728,61 @@ export default function EnterpriseBusinessDetail() {
                     </div>
                   </div>
 
-                  {/* Single Invite Form */}
-                  <form onSubmit={handleInlineInvite} style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxWidth: '480px', marginBottom: '24px' }}>
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                      <input
-                        type="email"
-                        placeholder="teammate@company.com"
-                        value={inviteEmail}
-                        onChange={(e) => setInviteEmail(e.target.value)}
-                        required
-                        disabled={isSendingInvite}
-                        style={{ ...s.formInput, flex: 1 }}
-                      />
-                      <button
-                        type="submit"
-                        className="btn btn-primary"
-                        disabled={isSendingInvite || !inviteEmail.trim()}
-                        style={{ fontSize: '12px', whiteSpace: 'nowrap', gap: '6px', display: 'flex', alignItems: 'center' }}
-                      >
-                        {isSendingInvite ? <Loader2 className="animate-spin" size={14} /> : <UserPlus size={14} />}
-                        {isSendingInvite ? "Adding..." : "Add User"}
-                      </button>
-                    </div>
-
-                    {inviteStatus && (
-                      <div style={{
-                        fontSize: '12px',
-                        padding: '6px 10px',
-                        borderRadius: '4px',
-                        marginTop: '4px',
-                        backgroundColor: inviteStatus.type === 'success' ? '#f0fdf4' : '#fef2f2',
-                        border: inviteStatus.type === 'success' ? '1px solid #bbf7d0' : '1px solid #fee2e2',
-                        color: inviteStatus.type === 'success' ? '#16a34a' : '#ef4444',
-                        display: 'flex',
-                        alignItems: 'center'
-                      }}>
-                        {inviteStatus.message}
-                      </div>
-                    )}
+                  {/* Inline Invite Form */}
+                  <form onSubmit={handleInlineInvite} style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
+                    <input 
+                      type="email" 
+                      placeholder="colleague@company.com" 
+                      value={inviteEmail}
+                      onChange={(e) => setInviteEmail(e.target.value)}
+                      style={{ ...s.formInput, flex: 1, marginTop: 0 }}
+                      required
+                    />
+                    <button type="submit" className="btn btn-primary" disabled={isSendingInvite || !inviteEmail.trim()} style={{ fontSize: '13px', whiteSpace: 'nowrap' }}>
+                      {isSendingInvite ? <Loader2 className="animate-spin" size={13} /> : <UserPlus size={13} />}
+                      Send Invite
+                    </button>
                   </form>
 
-                  {teamLoading ? (
-                    <div style={{ padding: '24px', display: 'flex', justifyContent: 'center' }}>
-                      <Loader2 className="animate-spin" size={20} />
+                  {inviteStatus && (
+                    <div style={{ ...s.errorBox, backgroundColor: inviteStatus.type === 'success' ? '#f0fdf4' : '#fef2f2', borderColor: inviteStatus.type === 'success' ? '#bbf7d0' : '#fee2e2', color: inviteStatus.type === 'success' ? '#166534' : '#ef4444', marginBottom: '16px' }}>
+                      <span style={{ fontSize: '12px' }}>{inviteStatus.message}</span>
                     </div>
-                  ) : (
-                    <>
-                      {/* Section 1: Active Team Members */}
-                      <div style={{ marginBottom: '24px' }}>
-                        <h4 style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: '8px', letterSpacing: '0.05em' }}>
-                          ACTIVE MEMBERS ({teamMembers.length})
-                        </h4>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                          {teamMembers.map((member) => (
-                            <div key={member.id} style={s.docItemRow}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                                <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: member.is_root ? 'var(--color-primary, #4f46e5)' : '#e4e4e7', color: member.is_root ? '#fff' : '#18181b', fontSize: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600 }}>
-                                  {member.email.slice(0, 2).toUpperCase()}
-                                </div>
-                                <div>
-                                  <div style={{ fontSize: '13px', fontWeight: 500 }}>{member.email}</div>
-                                  <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)' }}>Role context classification: {member.role}</div>
-                                </div>
-                              </div>
-                              <span style={{ fontSize: '10px', padding: '2px 6px', background: member.is_root ? '#e0e7ff' : '#f4f4f5', color: member.is_root ? '#4f46e5' : '#71717a', borderRadius: '4px', fontWeight: 600 }}>
-                                {member.is_root ? "Root Account" : "Active"}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-
-                      {/* Section 2: Pending Invitations */}
-                      <div>
-                        <h4 style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: '8px', letterSpacing: '0.05em' }}>
-                          PENDING INVITATIONS ({pendingInvites.length})
-                        </h4>
-                        {pendingInvites.length === 0 ? (
-                          <div style={{ fontSize: '12px', color: 'var(--color-text-tertiary)', padding: '16px 0', textAlign: 'center', border: '1px dashed var(--color-border-tertiary)', borderRadius: '8px' }}>
-                            No pending invitations active for this scope.
-                          </div>
-                        ) : (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                            {pendingInvites.map((invite) => (
-                              <div key={invite.id} style={s.docItemRow}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                                  <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: '#fafafa', color: '#a1a1aa', fontSize: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600, border: '1px dashed #e4e4e7' }}>
-                                    ?
-                                  </div>
-                                  <div>
-                                    <div style={{ fontSize: '13px', fontWeight: 500 }}>{invite.email}</div>
-                                    <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)' }}>
-                                      Sent {new Date(invite.created_at).toLocaleDateString()}
-                                    </div>
-                                  </div>
-                                </div>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                                  <span style={{ fontSize: '10px', padding: '2px 6px', background: '#fef3c7', color: '#d97706', borderRadius: '4px', fontWeight: 600 }}>
-                                    Pending Seat
-                                  </span>
-                                  <button
-                                    className="btn btn-secondary"
-                                    style={{ padding: '4px 8px', fontSize: '11px', color: '#ef4444', border: '1px solid #fee2e2' }}
-                                    onClick={() => handleRevokeInvite(invite.id)}
-                                  >
-                                    Revoke
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    </>
                   )}
+
+                  {/* Team Members List */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    {teamLoading ? (
+                      <div style={{ padding: '30px', display: 'flex', justifyContent: 'center' }}><Loader2 className="animate-spin" size={18} /></div>
+                    ) : teamMembers.length === 0 && pendingInvites.length === 0 ? (
+                      <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', padding: '24px 0', textAlign: 'center', border: '1px dashed var(--color-border-tertiary)', borderRadius: '8px' }}>
+                        No members assigned.
+                      </div>
+                    ) : (
+                      <>
+                        {teamMembers.map((m) => (
+                          <div key={m.id} style={s.docItemRow}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              <span style={{ fontSize: '13px', fontWeight: 500 }}>{m.email}</span>
+                              {m.is_root && <span style={{ fontSize: '10px', background: '#e0e7ff', color: '#4f46e5', padding: '1px 6px', borderRadius: '4px' }}>Owner</span>}
+                            </div>
+                            <span style={{ fontSize: '11px', color: 'var(--color-text-secondary)', textTransform: 'capitalize' }}>{m.role}</span>
+                          </div>
+                        ))}
+                        {pendingInvites.map((p) => (
+                          <div key={p.id} style={{ ...s.docItemRow, opacity: 0.75 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              <span style={{ fontSize: '13px' }}>{p.email}</span>
+                              <span style={{ fontSize: '10px', background: '#fef3c7', color: '#d97706', padding: '1px 6px', borderRadius: '4px' }}>Pending Invite</span>
+                            </div>
+                            <button className="btn btn-secondary" style={{ padding: '4px 8px', fontSize: '11px', color: '#ef4444' }} onClick={() => handleRevokeInvite(p.id)}>
+                              Revoke
+                            </button>
+                          </div>
+                        ))}
+                      </>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -851,12 +795,12 @@ export default function EnterpriseBusinessDetail() {
 }
 
 const s: Record<string, React.CSSProperties> = {
-  dropdownMenu: { position: 'absolute', top: 'calc(100% + 4px)', left: 0, width: '100%', background: 'var(--color-background-primary, #ffffff)', border: '1px solid var(--color-border-tertiary, #e4e4e7)', borderRadius: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.08)', zIndex: 100, padding: '4px' },
-  dropdownInput: { width: '100%', fontSize: '12px', padding: '6px 10px', marginBottom: '4px', borderRadius: '6px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', outline: 'none' },
-  dropdownItem: { width: '100%', textAlign: 'left', padding: '8px 10px', border: 'none', borderRadius: '6px', fontSize: '12px', cursor: 'pointer', display: 'block', color: 'var(--color-text-primary, #18181b)' },
-  tabLink: { display: 'flex', alignItems: 'center', gap: '6px', padding: '12px 16px', fontSize: '13px', background: 'transparent', border: 'none', cursor: 'pointer', outline: 'none', transition: 'all 0.15s ease' },
-  docItemRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', borderRadius: '8px', backgroundColor: '#ffffff' },
-  formInput: { width: '100%', padding: '8px 12px', fontSize: '13px', borderRadius: '6px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', outline: 'none', background: '#ffffff' },
-  errorBox: { display: 'flex', gap: '8px', alignItems: 'center', padding: '8px 12px', background: '#fef2f2', border: '1px solid #fee2e2', color: '#ef4444', borderRadius: '6px', marginBottom: '12px' },
-  presetChip: { fontSize: '10px', padding: '2px 8px', borderRadius: '12px', border: '1px solid #cbd5e1', background: '#ffffff', color: '#334155', cursor: 'pointer', outline: 'none' }
+  dropdownMenu: { position: 'absolute', top: 'calc(100% + 4px)', left: 0, width: '100%', background: 'var(--color-background-primary)', border: '1px solid var(--color-border-tertiary)', borderRadius: '8px', boxShadow: '0 4px 12px rgba(0,0,0,0.08)', zIndex: 100, padding: '4px' },
+  dropdownInput: { width: '100%', padding: '6px 10px', fontSize: '12px', border: 'none', borderBottom: '1px solid var(--color-border-tertiary)', outline: 'none', background: 'transparent', marginBottom: '4px' },
+  dropdownItem: { width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', borderRadius: '4px', fontSize: '12px', cursor: 'pointer', display: 'block' },
+  tabLink: { display: 'flex', alignItems: 'center', gap: '6px', padding: '12px 16px', background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '13px' },
+  docItemRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--color-background-secondary, #fafafa)', border: '1px solid var(--color-border-tertiary, #e4e4e7)', borderRadius: '6px' },
+  formInput: { width: '100%', padding: '8px 12px', fontSize: '13px', borderRadius: '6px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', background: 'transparent', outline: 'none', marginTop: '4px' },
+  errorBox: { display: 'flex', gap: '8px', alignItems: 'center', padding: '10px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', border: '1px solid #fee2e2', color: '#ef4444' },
+  presetChip: { background: '#f1f5f9', border: '1px solid #cbd5e1', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', color: '#334155', cursor: 'pointer', fontWeight: 500 }
 };
