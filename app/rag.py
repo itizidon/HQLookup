@@ -33,7 +33,7 @@ CHUNK_OVERLAP      = 100
 TOP_K              = 5
 EMBED_MODEL        = "all-MiniLM-L6-v2"
 MIN_SCORE_STANDARD = 0.45
-MIN_SCORE_TABULAR  = 0.25
+MIN_SCORE_TABULAR  = 0.0
 
 # ── Plan config ────────────────────────────────────────────────────────────────
 PLAN_CONFIG = {
