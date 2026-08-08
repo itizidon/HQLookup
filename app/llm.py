@@ -25,80 +25,130 @@ def clean_json_response(raw_text: str) -> str:
     return cleaned.strip()
 
 # ── Prompt builder ─────────────────────────────────────────────────────────────
-def build_prompt(question: str, chunks: List[dict]) -> str:
+def build_prompt(
+    question: str,
+    chunks: List[dict],
+) -> str:
+
     context_blocks = []
 
     for i, chunk in enumerate(chunks, 1):
+
         context_blocks.append(
             f"""[{i}]
-          FILE: {chunk['filename']}
-          SCORE: {chunk['score']}
-          {chunk['text']}
-          """
+FILE: {chunk['filename']}
+CHUNK ID: {chunk.get('id', i)}
+CONTENT TYPE: {chunk.get('content_type', 'unknown')}
+CHUNK TYPE: {chunk.get('chunk_type', 'unknown')}
+SCORE: {chunk['score']}
+
+{chunk['text']}
+"""
         )
 
-    context = "\n\n---\n\n".join(context_blocks)
+    context = "\n\n---\n\n".join(
+        context_blocks
+    )
 
     return f"""
-You are a retrieval assistant.
+You are a precise retrieval answer generator.
 
-Your task is to evaluate each retrieved context block independently.
+Answer the user's question using ONLY the provided context.
 
-Each context block is an independent candidate answer. Multiple context blocks may answer the user's question.
-
-Use ONLY the provided context.
+The context may contain spreadsheet rows, spreadsheet metadata,
+or normal document text.
 
 IMPORTANT RULES:
 
-* Return ONLY valid JSON.
-* Do NOT include markdown.
-* Do NOT include explanations outside the JSON.
-* Evaluate every context block independently.
-* If a context block answers the user's question, return one answer object for that context block.
-* NEVER merge multiple context blocks into one answer.
-* NEVER summarize multiple spreadsheet rows into one answer.
-* NEVER combine multiple matching records into one answer.
-* If three different rows answer the question, return three separate answer objects.
-* Preserve all values exactly as they appear in the context.
-* Ignore context blocks that do not answer the user's question.
-* Do not hallucinate.
-* If no context answers the question, return:
-  {{
+1. Return ONLY valid JSON.
+2. Do not return markdown.
+3. Do not hallucinate information.
+4. Preserve dates, dollar amounts, IDs, names, and other values
+   exactly as they appear.
+5. Every answer must be supported by the context.
+6. Ignore context blocks that do not contain information relevant
+   to the question.
+7. Confidence must be between 0.0 and 1.0.
+
+SPREADSHEET RULES:
+
+8. A tabular context block represents ONE spreadsheet record.
+9. Do not combine values from different spreadsheet records.
+10. Do not move a value from one row into another row.
+11. Keep fields from the same row together.
+12. If two rows have the same provider and date but different
+    statement/order numbers, they are still separate records.
+13. If two context blocks have the same unique identifier
+    (for example Statement Number, Invoice Number, Order Number,
+    Claim ID, or another explicit record identifier), treat them
+    as the same record.
+14. If duplicate context blocks describe the same record, return
+    only one answer for that record.
+15. If two records have different unique identifiers, return
+    separate answers.
+16. Never invent a unique identifier when one is missing.
+
+FIELD ASSOCIATION:
+
+When answering a spreadsheet question, use the values from the
+SAME Row Data block.
+
+For example, if a row contains:
+
+Statement Number: 1236
+Total Amount Billed: 200
+
+the answer must associate 200 with statement number 1236.
+
+Do not take the statement number from one context block and the
+amount from another context block.
+
+If the question asks for an amount, use the field that most
+directly represents the requested amount.
+
+For a question asking how much was charged, prefer:
+
+Total Amount Billed
+
+over:
+
+Amount Paid
+Amount Paid by Insurance
+Out-of-Pocket
+Amount Due
+
+unless the question explicitly asks for one of those fields.
+
+OUTPUT FORMAT:
+
+{{
+  "answers": [
+    {{
+      "answer": "Complete answer supported by one logical record.",
+      "confidence": 0.98,
+      "sources": [
+        {{
+          "chunk": 1,
+          "filename": "example.xlsx"
+        }}
+      ]
+    }}
+  ]
+}}
+
+If no context answers the question:
+
+{{
   "answers": []
-  }}
-
-Return JSON in exactly this format:
-
-{{
-"answers": [
-{{
-"answer": "Complete answer taken from this context block.",
-"confidence": 0.98,
-"sources": [
-{{
-"chunk": 1,
-"filename": "example.xlsx"
 }}
-]
-}}
-]
-}}
-
-Guidelines:
-
-* Each answer object should correspond to exactly ONE retrieved context block.
-* Do not combine answers from different chunks.
-* Multiple chunks may produce multiple answers.
-* It is acceptable for different answers to contain similar information if they originate from different rows or records.
-* Preserve dates, dollar amounts, IDs, names, and other values exactly as written.
-* Confidence should be between 0.0 and 1.0.
 
 CONTEXT:
+
 {context}
 
 QUESTION:
-{question}
 
+{question}
 """.strip()
 
 

@@ -190,7 +190,7 @@ export default function SearchHome() {
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', paddingLeft: '24px' }}>
                   {result.answer?.answers?.map((item: any, idx: number) => (
                     <div key={idx} style={{ fontSize: '13px', color: 'var(--color-text-primary)', lineHeight: '1.5' }}>
-                      • {item.fact}
+                      • {item.answer}
                     </div>
                   ))}
                 </div>
