@@ -175,10 +175,7 @@ export default function SearchHome() {
       <div className="nav" style={{ overflow: 'visible' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', position: 'relative' }}>
           {/* Logo / Brand Name linking back to Dashboard */}
-          <Link
-            href="/dashboard"
-            style={{ display: 'flex', alignItems: 'center', gap: '8px', textDecoration: 'none', color: 'var(--color-text-primary)' }}
-          >
+          <Link href="/dashboard" className="nav-logo" style={{ textDecoration: 'none' }}>
             <FileText size={18} style={{ color: 'var(--color-text-info)' }} /> HQLookup
           </Link>
 
@@ -223,8 +220,7 @@ export default function SearchHome() {
         <div className="nav-right" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           <button className="nav-link" style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'transparent', border: 'none', cursor: 'pointer' }}>
             <History size={13} /> History
-          </button>      
-          <Navbar avatarInitials={userInitial} />
+          </button>
         </div>
       </div>
 
@@ -338,7 +334,7 @@ export default function SearchHome() {
         {!result && (
           <div style={{ width: '100%', maxWidth: '520px' }}>
             <div style={{ fontSize: '12px', color: 'var(--color-text-tertiary)', marginBottom: '8px', fontWeight: 500 }}>Recent queries</div>
-            
+
             {loadingQueries ? (
               <div style={{ display: 'flex', justifyContent: 'center', padding: '16px' }}>
                 <Loader2 className="animate-spin" size={16} style={{ color: 'var(--color-text-tertiary)' }} />

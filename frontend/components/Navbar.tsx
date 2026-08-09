@@ -27,7 +27,7 @@ export default function Navbar({ avatarInitials = 'D' }) {
         method: 'POST',
         credentials: 'include',
       });
-      router.push('/login');
+      router.push('/');
     } catch (err) {
       console.error('Sign out failed:', err);
     }
