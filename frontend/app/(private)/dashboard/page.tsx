@@ -58,6 +58,18 @@ interface WorkspaceMetrics {
   businesses: BusinessMetric[];
 }
 
+// Helper function to extract initials from a full name (e.g., "Don Ng" -> "DN")
+const getInitials = (name: string) => {
+  if (!name) return 'DN';
+  const parts = name.trim().split(/\s+/);
+  
+  if (parts.length >= 2) {
+    return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+  }
+  
+  return parts[0][0].toUpperCase();
+};
+
 export default function AdminDashboard() {
   const router = useRouter();
   const { businesses, selectBusiness, isLoading, refreshBusinesses } = useBusiness();
@@ -142,6 +154,7 @@ export default function AdminDashboard() {
 
   const activeOrg = organizations.find(o => o.id === currentOrgId);
   const userPlanKey = userProfile?.plan?.toLowerCase() || 'free';
+  const userInitials = getInitials(userProfile?.name || '');
 
   const maxOrganizationsAllowed = userProfile?.max_organizations ?? 1;
   const isOrgLimitReached = organizations.length >= maxOrganizationsAllowed;
@@ -227,7 +240,7 @@ export default function AdminDashboard() {
 
   return (
     <div className="screen" style={{ position: 'relative', overflowX: 'hidden' }}>
-      <Navbar />
+      <Navbar avatarInitials={userInitials} />
       <div style={{ padding: '24px' }}>
 
         {/* Title & Action Buttons Header */}
