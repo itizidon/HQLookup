@@ -470,15 +470,6 @@ export default function EnterpriseBusinessDetail() {
                   {businessDetails ? businessDetails.name : "Loading Workspace details..."}
                 </h1>
               </div>
-              <button 
-                className="btn btn-secondary" 
-                style={{ fontSize: '12px', padding: '4px 10px', color: '#ef4444' }} 
-                onClick={() => {
-                  router.push(window.location.pathname);
-                }}
-              >
-                Unmount Context
-              </button>
             </div>
 
             {/* Segmented Workspace Navigation Tabs */}

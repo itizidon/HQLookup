@@ -15,29 +15,50 @@ interface BillingStatusData {
   has_billing_account: boolean;
 }
 
+// Helper function to extract initials from a full name (e.g., "Don Ng" -> "DN")
+const getInitials = (name: string) => {
+  if (!name) return 'DN';
+  const parts = name.trim().split(/\s+/);
+  
+  if (parts.length >= 2) {
+    return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+  }
+  
+  return parts[0][0].toUpperCase();
+};
+
 export default function BillingPlan() {
   const [billingInfo, setBillingInfo] = useState<BillingStatusData | null>(null);
+  const [userName, setUserName] = useState<string>('');
   const [isLoading, setIsLoading] = useState(true);
   const [isActionLoading, setIsActionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Fetch current live server constraints and plan definitions
+  // Fetch live server constraints, plan definitions, and user profile concurrently
   useEffect(() => {
-    async function fetchBillingStatus() {
+    async function fetchData() {
       try {
-        const res = await fetch('http://localhost:8000/billing/status', {
-          credentials: 'include', // Ensures session cookie headers pass through
-        });
-        if (!res.ok) throw new Error('Could not retrieve operational billing logs.');
-        const data = await res.json();
-        setBillingInfo(data);
+        const [billingRes, userRes] = await Promise.all([
+          fetch('http://localhost:8000/billing/status', { credentials: 'include' }),
+          fetch('http://localhost:8000/auth/me', { credentials: 'include' })
+        ]);
+
+        if (!billingRes.ok) throw new Error('Could not retrieve operational billing logs.');
+        
+        const billingData = await billingRes.json();
+        setBillingInfo(billingData);
+
+        if (userRes.ok) {
+          const userData = await userRes.json();
+          setUserName(userData.name || '');
+        }
       } catch (err: any) {
         setError(err.message || 'An error occurred fetching account context.');
       } finally {
         setIsLoading(false);
       }
     }
-    fetchBillingStatus();
+    fetchData();
   }, []);
 
   // Routes the user out to Stripe Checkout or Billing Portal automatically
@@ -47,20 +68,17 @@ export default function BillingPlan() {
     setError(null);
 
     try {
-      // Scenario A: Free plan tier -> Fire up Stripe Checkout workflow for default upgrade
       if (billingInfo.plan === 'free' || !billingInfo.has_billing_account) {
         const res = await fetch('http://localhost:8000/billing/checkout', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ plan: 'starter' }), // Default upgrade entry path
+          body: JSON.stringify({ plan: 'starter' }),
           credentials: 'include',
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || 'Failed to instantiate checkout process.');
         if (data.checkout_url) window.location.href = data.checkout_url;
-      } 
-      // Scenario B: Has paying plan -> Push directly to Stripe Self-Service Billing Portal
-      else {
+      } else {
         const res = await fetch('http://localhost:8000/billing/portal', {
           method: 'POST',
           credentials: 'include',
@@ -75,10 +93,12 @@ export default function BillingPlan() {
     }
   };
 
+  const userInitials = getInitials(userName);
+
   if (isLoading) {
     return (
       <div className="screen" style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
-        <Navbar />
+        <Navbar avatarInitials={userInitials} />
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <Loader2 className="animate-spin" style={{ color: 'var(--color-text-secondary)' }} />
         </div>
@@ -91,7 +111,7 @@ export default function BillingPlan() {
 
   return (
     <div className="screen">
-      <Navbar />
+      <Navbar avatarInitials={userInitials} />
       <div style={{ padding: '24px', maxWidth: '800px', margin: '0 auto' }}>
         <div style={{ fontSize: '18px', fontWeight: 500, marginBottom: '4px' }}>Billing</div>
         <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginBottom: '20px' }}>
@@ -129,7 +149,6 @@ export default function BillingPlan() {
           </button>
         </div>
         
-        {/* Metric Cards reflect exact schema allowances derived via your PLAN_CONFIG */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '20px' }}>
           <MetricCard 
             label="Searches Allowed" 
