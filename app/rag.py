@@ -655,9 +655,18 @@ def retrieve_chunks_multi(
     embedder = get_embedder()
 
     if vectors is None:
+        print(
+            "[Retrieval] No cached vectors; "
+            "generating Multi-Query/HyDE vectors"
+        )
         vectors = build_multi_hyde_vectors(
             query,
             embedder,
+        )
+    else:
+        print(
+            f"[Retrieval] Reusing {len(vectors)} "
+            "cached Multi-Query/HyDE vectors"
         )
 
     doc_filter_sql = ""

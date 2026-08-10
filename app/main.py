@@ -1141,8 +1141,11 @@ def ask_question(
                 offset=0,
             )
 
+            # Use only the requested retrieval window here.
+            # `allResults` contains the entire post-RRF candidate pool and
+            # would bypass the 50 -> 100 -> ... expansion flow.
             retrieval_results = retrieval.get(
-                "allResults",
+                "results",
                 [],
             )
 
@@ -1303,10 +1306,17 @@ def ask_question(
                     query=body.question,
                     get_k=new_retrieval_limit,
                     offset=0,
+                    # Reuse the exact Multi-Query/HyDE search vectors
+                    # created for the original request. This prevents
+                    # Load More from regenerating query variants/HyDE.
+                    vectors=retrieval_vectors,
                 )
 
+                # `results` is the top `new_retrieval_limit` window.
+                # Existing chunk IDs are removed below, leaving only the
+                # newly exposed candidates from this expansion.
                 expanded_results = expanded.get(
-                    "allResults",
+                    "results",
                     [],
                 )
 
