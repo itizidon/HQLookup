@@ -8,14 +8,28 @@ import { useBusiness } from '@/app/context/BusinessContext';
 import { DebounceContainer } from '@/components/Debounce';
 import Navbar from '@/components/Navbar';
 
+interface RagAnswerSource {
+  chunk: number;
+  filename: string;
+}
+
+interface RagAnswer {
+  answer: string;
+  confidence: number;
+  sources: RagAnswerSource[];
+}
+
 interface RagResponse {
   answer: {
-    answers: Array<{ fact: string;[key: string]: any }>;
+    answers: RagAnswer[];
   };
   sources: string[];
   chunks_used: number;
   hasMore: boolean;
   nextOffset: number | null;
+  usage?: {
+    searches_limit: number;
+  };
 }
 
 interface RecentQuery {
@@ -113,7 +127,7 @@ export default function SearchHome() {
       });
 
       if (!response.ok) throw new Error("Search execution failed");
-      const data = await response.json();
+      const data: RagResponse = await response.json();
       setResult(data);
 
       const updatedRes = await fetch(`http://localhost:8000/queries/recent?business_id=${selectedBusiness.id}&page=1&page_size=5`, {
@@ -154,13 +168,24 @@ export default function SearchHome() {
 
       setResult((prev) => {
         if (!prev) return data;
+      
         return {
           ...data,
           answer: {
-            answers: [...prev.answer.answers, ...(data.answer?.answers || [])]
+            answers: [
+              ...(prev.answer?.answers ?? []),
+              ...(data.answer?.answers ?? []),
+            ],
           },
-          sources: Array.from(new Set([...prev.sources, ...data.sources])),
-          chunks_used: prev.chunks_used + data.chunks_used
+          sources: Array.from(
+            new Set([
+              ...(prev.sources ?? []),
+              ...(data.sources ?? []),
+            ])
+          ),
+          chunks_used:
+            (prev.chunks_used ?? 0) +
+            (data.chunks_used ?? 0),
         };
       });
     } catch (err) {
@@ -264,7 +289,7 @@ export default function SearchHome() {
                 </div>
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', paddingLeft: '24px' }}>
-                  {result.answer?.answers?.map((item: any, idx: number) => (
+                  {result.answer?.answers?.map((item, idx) => (
                     <div key={idx} style={{ fontSize: '13px', color: 'var(--color-text-primary)', lineHeight: '1.5' }}>
                       • {item.answer}
                     </div>

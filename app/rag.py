@@ -530,23 +530,32 @@ def set_active_query(
     doc_state: dict,
     answers: list,
     retrieval_results: list,
-    next_chunk_offset: int | None,
+    retrieval_cursor: int,
+    retrieval_limit: int,
+    retrieval_vectors: list | None,
+    retrieval_fully_exhausted: bool,
 ) -> None:
     try:
         redis_client.setex(
             get_active_query_key(user_id),
             ACTIVE_QUERY_TTL_SECONDS,
             json.dumps({
-                "question":          normalize_query(question),
-                "business_id":       business_id,
-                "doc_state":         doc_state,
-                "answers":           answers,
+                "question": normalize_query(question),
+                "business_id": business_id,
+                "doc_state": doc_state,
+                "answers": answers,
                 "retrieval_results": retrieval_results,
-                "next_chunk_offset": next_chunk_offset,
+                "retrieval_cursor": retrieval_cursor,
+                "retrieval_limit": retrieval_limit,
+                "retrieval_vectors": retrieval_vectors,
+                "retrieval_fully_exhausted": retrieval_fully_exhausted,
             }),
         )
+
     except Exception as e:
-        print(f"[Redis] Failed to cache active query: {e}")
+        print(
+            f"[Redis] Failed to cache active query: {e}"
+        )
 
 def clear_active_query(user_id: int) -> None:
     try:
@@ -989,6 +998,7 @@ def retrieve_chunks_multi(
         "hasMore": has_more,
         "nextOffset": next_offset,
         "totalResults": total_results,
+        "vectors": vectors,
     }
 
 # ── Text extraction ────────────────────────────────────────────────────────────

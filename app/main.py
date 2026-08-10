@@ -974,128 +974,1010 @@ async def update_business_settings(
     db.refresh(business)
     return {"message": "Settings updated.", "business_id": business.id, "query_allocation": business.query_allocation}
 
-
 # ── Ask ────────────────────────────────────────────────────────────────────────
-ANSWER_PAGE_SIZE    = 10
-CHUNK_BATCH_SIZE    = 3
-RETRIEVAL_POOL_SIZE = 50
+
+ANSWER_PAGE_SIZE = 10
+CHUNK_BATCH_SIZE = 5
+
+INITIAL_RETRIEVAL_SIZE = 50
+RETRIEVAL_EXPAND_SIZE = 50
+MAX_RETRIEVAL_SIZE = 500
+
+# Retry only tabular chunks for which the LLM returned NO decision.
+# Explicit matches=False chunks are considered complete and are not retried.
+MISSING_DECISION_RETRIES = 2
 
 
 @app.post("/ask")
 def ask_question(
-    body:            AskRequest,
-    db:              Session = Depends(get_db),
-    current_context          = Depends(get_current_user),
+    body: AskRequest,
+    db: Session = Depends(get_db),
+    current_context=Depends(get_current_user),
 ):
-    user, _      = current_context
-    user_org_ids = get_user_org_ids(db, user.id)
+    user, _ = current_context
+
+    user_org_ids = get_user_org_ids(
+        db,
+        user.id,
+    )
+
+    # ------------------------------------------------------------------
+    # 1. Validate business / organization access
+    # ------------------------------------------------------------------
 
     business = (
         db.query(Business)
-        .filter(Business.id == body.business_id, Business.org_id.in_(user_org_ids))
+        .filter(
+            Business.id == body.business_id,
+            Business.org_id.in_(user_org_ids),
+        )
         .first()
     )
+
     if not business or not business.organization:
-        raise HTTPException(status_code=403, detail="Access denied.")
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied.",
+        )
 
-    org       = business.organization
-    user_plan = user.plan if hasattr(user, "plan") else "free"
-    config    = PLAN_CONFIG.get(user_plan, PLAN_CONFIG["free"])
+    org = business.organization
 
-    # 1. Check search limit and calculate remaining calls for the plan
-    allowed, current, limit = check_search_limit(org.id, user_plan)
+    user_plan = (
+        user.plan
+        if hasattr(user, "plan")
+        else "free"
+    )
+
+    config = PLAN_CONFIG.get(
+        user_plan,
+        PLAN_CONFIG["free"],
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Check search limits
+    # ------------------------------------------------------------------
+
+    allowed, current, limit = check_search_limit(
+        org.id,
+        user_plan,
+    )
+
     if not allowed:
-        raise HTTPException(status_code=402, detail={
-            "message": f"Monthly limit of {limit} searches reached.",
-            "current": current, "limit": limit, "upgrade_url": "/pricing",
-        })
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "message": f"Monthly limit of {limit} searches reached.",
+                "current": current,
+                "limit": limit,
+                "upgrade_url": "/pricing",
+            },
+        )
 
-    remaining_plan_calls = max(0, limit - current)
+    remaining_plan_calls = max(
+        0,
+        limit - current,
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Requested answer page
+    # ------------------------------------------------------------------
 
     answer_offset = body.offset or 0
 
-    current_doc_state = get_business_doc_state(db, body.business_id)
-    cached            = get_active_query(user.id)
-    cache_is_valid    = (
+    normalized_question = normalize_query(
+        body.question
+    )
+
+    current_doc_state = get_business_doc_state(
+        db,
+        body.business_id,
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Load cached retrieval session
+    # ------------------------------------------------------------------
+
+    cached = get_active_query(
+        user.id
+    )
+
+    cache_is_valid = (
         cached
-        and cached.get("question")    == normalize_query(body.question)
+        and cached.get("question") == normalized_question
         and cached.get("business_id") == body.business_id
-        and cached.get("doc_state")   == current_doc_state
+        and cached.get("doc_state") == current_doc_state
     )
 
     if cache_is_valid:
         print("[Cache] HIT")
-        all_answers       = cached.get("answers", [])
-        retrieval_results = cached.get("retrieval_results", [])
-        next_chunk_offset = cached.get("next_chunk_offset", 0)
+
+        retrieval_results = cached.get(
+            "retrieval_results",
+            [],
+        )
+
+        all_answers = cached.get(
+            "answers",
+            [],
+        )
+
+        retrieval_cursor = cached.get(
+            "retrieval_cursor",
+            0,
+        )
+
+        retrieval_limit = cached.get(
+            "retrieval_limit",
+            INITIAL_RETRIEVAL_SIZE,
+        )
+
+        retrieval_vectors = cached.get(
+            "retrieval_vectors",
+            None,
+        )
+
+        retrieval_fully_exhausted = cached.get(
+            "retrieval_fully_exhausted",
+            False,
+        )
+
     else:
         print("[Cache] MISS")
-        if config["use_multiquery"]:
-            retrieval         = retrieve_chunks_multi(db=db, business_id=body.business_id, query=body.question, get_k=RETRIEVAL_POOL_SIZE, offset=0)
-            retrieval_results = retrieval["allResults"]
-        elif config["use_hyde"]:
-            retrieval         = retrieve_chunks(db=db, business_id=body.business_id, query=body.question, get_k=RETRIEVAL_POOL_SIZE, offset=0, use_hyde=True)
-            retrieval_results = retrieval["results"]
-        else:
-            retrieval         = retrieve_chunks(db=db, business_id=body.business_id, query=body.question, get_k=RETRIEVAL_POOL_SIZE, offset=0, use_hyde=False)
-            retrieval_results = retrieval["results"]
 
-        all_answers       = []
-        next_chunk_offset = 0
-        
-        # Count initial search execution
-        increment_search_count(org.id)
+        retrieval_limit = INITIAL_RETRIEVAL_SIZE
+        retrieval_vectors = None
+        retrieval_fully_exhausted = False
+
+        # --------------------------------------------------------------
+        # Initial retrieval
+        # --------------------------------------------------------------
+
+        if config["use_multiquery"]:
+            retrieval = retrieve_chunks_multi(
+                db=db,
+                business_id=body.business_id,
+                query=body.question,
+                get_k=retrieval_limit,
+                offset=0,
+            )
+
+            retrieval_results = retrieval.get(
+                "allResults",
+                [],
+            )
+
+            retrieval_vectors = retrieval.get(
+                "vectors",
+                None,
+            )
+
+        elif config["use_hyde"]:
+            retrieval = retrieve_chunks(
+                db=db,
+                business_id=body.business_id,
+                query=body.question,
+                get_k=retrieval_limit,
+                offset=0,
+                use_hyde=True,
+            )
+
+            retrieval_results = retrieval.get(
+                "results",
+                [],
+            )
+
+        else:
+            retrieval = retrieve_chunks(
+                db=db,
+                business_id=body.business_id,
+                query=body.question,
+                get_k=retrieval_limit,
+                offset=0,
+                use_hyde=False,
+            )
+
+            retrieval_results = retrieval.get(
+                "results",
+                [],
+            )
+
+        all_answers = []
+        retrieval_cursor = 0
+
+        retrieval_fully_exhausted = (
+            len(retrieval_results) == 0
+        )
+
+        print(
+            f"[Retrieval] Initial candidate pool: "
+            f"{len(retrieval_results)} chunks"
+        )
+
+        increment_search_count(
+            org.id
+        )
+
         remaining_plan_calls -= 1
 
-    target    = answer_offset + ANSWER_PAGE_SIZE
+    # ------------------------------------------------------------------
+    # Helper:
+    # Always make user-facing answers frontend-safe strings.
+    # ------------------------------------------------------------------
+
+    def normalize_answer_text(raw_answer):
+        if raw_answer is None:
+            return None
+
+        if isinstance(raw_answer, str):
+            normalized = raw_answer.strip()
+            return normalized or None
+
+        if isinstance(raw_answer, dict):
+            normalized = ", ".join(
+                f"{key}: {value}"
+                for key, value in raw_answer.items()
+                if value is not None
+            )
+
+            return normalized or None
+
+        if isinstance(raw_answer, list):
+            normalized = ", ".join(
+                str(value)
+                for value in raw_answer
+                if value is not None
+            )
+
+            return normalized or None
+
+        normalized = str(
+            raw_answer
+        ).strip()
+
+        return normalized or None
+
+    # ------------------------------------------------------------------
+    # 5. Generate enough answers for requested page
+    #
+    # retrieval_cursor:
+    #     how many retrieval candidates have been fully processed
+    #
+    # answer_offset:
+    #     which generated answer page the frontend requested
+    # ------------------------------------------------------------------
+
     llm_calls = 0
 
-    # 2. Process chunks without a hardcoded MAX_LLM_CALLS limit
-    while len(all_answers) < target and next_chunk_offset is not None and llm_calls < remaining_plan_calls:
-        chunks = retrieval_results[next_chunk_offset: next_chunk_offset + CHUNK_BATCH_SIZE]
-        if not chunks:
-            next_chunk_offset = None
-            break
-
-        new_answers = generate_answer(body.question, chunks).get("answers", [])
-        all_answers.extend(new_answers)
-
-        next_chunk_offset += CHUNK_BATCH_SIZE
-        llm_calls         += 1
-
-        if next_chunk_offset >= len(retrieval_results):
-            next_chunk_offset = None
-
-    set_active_query(
-        user_id=user.id, question=body.question, business_id=body.business_id,
-        doc_state=current_doc_state, answers=all_answers,
-        retrieval_results=retrieval_results, next_chunk_offset=next_chunk_offset,
+    target_answer_count = (
+        answer_offset
+        + ANSWER_PAGE_SIZE
     )
 
-    page_answers = all_answers[answer_offset: answer_offset + ANSWER_PAGE_SIZE]
-    has_more     = answer_offset + ANSWER_PAGE_SIZE < len(all_answers) or next_chunk_offset is not None
-    next_offset  = answer_offset + ANSWER_PAGE_SIZE if has_more else None
+    while (
+        len(all_answers) < target_answer_count
+        and llm_calls < remaining_plan_calls
+    ):
 
-    if answer_offset == 0:
-        db.add(QueryLog(
-            org_id=org.id, business_id=body.business_id, user_id=user.id,
-            query_text=body.question, answer={"answers": page_answers},
-            retrieval_plan="multiquery" if config["use_multiquery"] else "hyde" if config["use_hyde"] else "basic",
-        ))
+        # ==============================================================
+        # CURRENT RETRIEVAL POOL HAS BEEN PROCESSED
+        # ==============================================================
+
+        if retrieval_cursor >= len(retrieval_results):
+
+            if retrieval_fully_exhausted:
+                print(
+                    "[Retrieval Expansion] "
+                    "No more candidates available."
+                )
+                break
+
+            if retrieval_limit >= MAX_RETRIEVAL_SIZE:
+                print(
+                    "[Retrieval Expansion] "
+                    f"Reached maximum retrieval size "
+                    f"of {MAX_RETRIEVAL_SIZE}."
+                )
+
+                retrieval_fully_exhausted = True
+                break
+
+            new_retrieval_limit = min(
+                retrieval_limit + RETRIEVAL_EXPAND_SIZE,
+                MAX_RETRIEVAL_SIZE,
+            )
+
+            print(
+                "[Retrieval Expansion] "
+                f"Expanding search "
+                f"{retrieval_limit} -> {new_retrieval_limit}"
+            )
+
+            # ----------------------------------------------------------
+            # Retrieve again using a larger candidate window
+            # ----------------------------------------------------------
+
+            if config["use_multiquery"]:
+                expanded = retrieve_chunks_multi(
+                    db=db,
+                    business_id=body.business_id,
+                    query=body.question,
+                    get_k=new_retrieval_limit,
+                    offset=0,
+                )
+
+                expanded_results = expanded.get(
+                    "allResults",
+                    [],
+                )
+
+            elif config["use_hyde"]:
+                expanded = retrieve_chunks(
+                    db=db,
+                    business_id=body.business_id,
+                    query=body.question,
+                    get_k=new_retrieval_limit,
+                    offset=0,
+                    use_hyde=True,
+                )
+
+                expanded_results = expanded.get(
+                    "results",
+                    [],
+                )
+
+            else:
+                expanded = retrieve_chunks(
+                    db=db,
+                    business_id=body.business_id,
+                    query=body.question,
+                    get_k=new_retrieval_limit,
+                    offset=0,
+                    use_hyde=False,
+                )
+
+                expanded_results = expanded.get(
+                    "results",
+                    [],
+                )
+
+            existing_ids = {
+                result["id"]
+                for result in retrieval_results
+                if result.get("id") is not None
+            }
+
+            new_results = [
+                result
+                for result in expanded_results
+                if (
+                    result.get("id") is not None
+                    and result["id"] not in existing_ids
+                )
+            ]
+
+            print(
+                "[Retrieval Expansion] "
+                f"Expanded retrieval returned "
+                f"{len(expanded_results)} candidates; "
+                f"{len(new_results)} are new."
+            )
+
+            retrieval_limit = new_retrieval_limit
+
+            if not new_results:
+                retrieval_fully_exhausted = True
+
+                print(
+                    "[Retrieval Expansion] "
+                    "No new chunks found."
+                )
+
+                break
+
+            retrieval_results.extend(
+                new_results
+            )
+
+            print(
+                "[Retrieval Expansion] "
+                f"Candidate pool now contains "
+                f"{len(retrieval_results)} chunks."
+            )
+
+            continue
+
+        # ==============================================================
+        # PROCESS NEXT BATCH
+        # ==============================================================
+
+        batch_end = min(
+            retrieval_cursor + CHUNK_BATCH_SIZE,
+            len(retrieval_results),
+        )
+
+        chunks = retrieval_results[
+            retrieval_cursor:batch_end
+        ]
+
+        if not chunks:
+            break
+
+        print(
+            f"[LLM] Processing candidates "
+            f"{retrieval_cursor}:{batch_end} "
+            f"of {len(retrieval_results)}"
+        )
+
+        print(
+            "\n[LLM BATCH INPUT]"
+        )
+
+        for chunk in chunks:
+            print(
+                f"chunk_id={chunk.get('id')} | "
+                f"chunk_index={chunk.get('chunk_index')} | "
+                f"content_type={chunk.get('content_type')} | "
+                f"chunk_type={chunk.get('chunk_type')} | "
+                f"{chunk.get('text', '')}"
+            )
+
+        # --------------------------------------------------------------
+        # Main LLM call
+        # --------------------------------------------------------------
+
+        result = generate_answer(
+            body.question,
+            chunks,
+        )
+
+        llm_calls += 1
+
+        records = result.get(
+            "records",
+            [],
+        )
+
+        text_answers = result.get(
+            "answers",
+            [],
+        )
+
+        if not isinstance(records, list):
+            records = []
+
+        if not isinstance(text_answers, list):
+            text_answers = []
+
+        # --------------------------------------------------------------
+        # ONLY spreadsheet/tabular rows require a decision per chunk.
+        #
+        # Metadata / PDF / TXT / DOCX do NOT.
+        # --------------------------------------------------------------
+
+        tabular_chunks = [
+            chunk
+            for chunk in chunks
+            if (
+                chunk.get("content_type") == "tabular"
+                or chunk.get("chunk_type") == "tabular_record"
+            )
+        ]
+
+        tabular_chunks_by_id = {
+            int(chunk["id"]): chunk
+            for chunk in tabular_chunks
+            if chunk.get("id") is not None
+        }
+
+        input_tabular_ids = set(
+            tabular_chunks_by_id.keys()
+        )
+
+        returned_tabular_ids = set()
+
+        # --------------------------------------------------------------
+        # IMPORTANT:
+        #
+        # Keep answers for this batch isolated.
+        #
+        # We do NOT commit them to all_answers until every tabular row
+        # in this batch has an explicit decision.
+        # --------------------------------------------------------------
+
+        batch_answers = []
+
+        # --------------------------------------------------------------
+        # Helper:
+        # Process one spreadsheet decision.
+        # --------------------------------------------------------------
+
+        def process_tabular_record(
+            record,
+            expected_ids,
+            returned_ids,
+            destination_answers,
+        ):
+            if not isinstance(record, dict):
+                print(
+                    "[INVALID DECISION] "
+                    f"Expected object, received: {record}"
+                )
+                return
+
+            chunk_id = record.get(
+                "chunk_id"
+            )
+
+            if chunk_id is None:
+                print(
+                    "[INVALID DECISION] "
+                    "LLM returned a tabular decision "
+                    "without chunk_id"
+                )
+                return
+
+            try:
+                chunk_id = int(
+                    chunk_id
+                )
+
+            except (TypeError, ValueError):
+                print(
+                    "[INVALID DECISION] "
+                    f"Invalid chunk_id={chunk_id}"
+                )
+                return
+
+            # ----------------------------------------------------------
+            # Reject chunk IDs that were not actually sent.
+            # ----------------------------------------------------------
+
+            if chunk_id not in expected_ids:
+                print(
+                    "[INVALID DECISION] "
+                    f"Unexpected chunk_id={chunk_id}"
+                )
+                return
+
+            # ----------------------------------------------------------
+            # Only one decision per spreadsheet row.
+            # ----------------------------------------------------------
+
+            if chunk_id in returned_ids:
+                print(
+                    "[DUPLICATE DECISION] "
+                    f"chunk_id={chunk_id}"
+                )
+                return
+
+            original_chunk = tabular_chunks_by_id.get(
+                chunk_id
+            )
+
+            # ----------------------------------------------------------
+            # EXPLICIT NO MATCH
+            #
+            # This is a VALID completed decision.
+            #
+            # It is marked accounted-for and NEVER retried.
+            # ----------------------------------------------------------
+
+            if not record.get(
+                "matches",
+                False,
+            ):
+                returned_ids.add(
+                    chunk_id
+                )
+
+                print(
+                    f"[NO MATCH] "
+                    f"chunk_id={chunk_id} | "
+                    f"{original_chunk.get('text', '')[:300] if original_chunk else ''}"
+                )
+
+                return
+
+            # ----------------------------------------------------------
+            # MATCH
+            # ----------------------------------------------------------
+
+            answer_text = normalize_answer_text(
+                record.get("answer")
+            )
+
+            if not answer_text:
+                print(
+                    "[INVALID MATCH] "
+                    f"chunk_id={chunk_id} "
+                    "has matches=true but no usable answer"
+                )
+
+                # Do NOT add it to returned_ids.
+                #
+                # That makes this row eligible for retry.
+                return
+
+            returned_ids.add(
+                chunk_id
+            )
+
+            print(
+                f"[MATCH] "
+                f"chunk_id={chunk_id} | "
+                f"{answer_text}"
+            )
+
+            destination_answers.append({
+                "answer": answer_text,
+                "confidence": record.get(
+                    "confidence",
+                    0.0,
+                ),
+                "sources": record.get(
+                    "sources",
+                    [],
+                ),
+            })
+
+        # ==============================================================
+        # PROCESS INITIAL TABULAR DECISIONS
+        # ==============================================================
+
+        for record in records:
+            process_tabular_record(
+                record=record,
+                expected_ids=input_tabular_ids,
+                returned_ids=returned_tabular_ids,
+                destination_answers=batch_answers,
+            )
+
+        # ==============================================================
+        # PROCESS NORMAL TEXT / PDF / DOCX / METADATA ANSWERS
+        # ==============================================================
+
+        for text_answer in text_answers:
+
+            if not isinstance(text_answer, dict):
+                print(
+                    "[INVALID TEXT ANSWER] "
+                    f"Expected object, received: {text_answer}"
+                )
+                continue
+
+            answer_text = normalize_answer_text(
+                text_answer.get("answer")
+            )
+
+            if not answer_text:
+                continue
+
+            print(
+                f"[TEXT MATCH] "
+                f"{answer_text}"
+            )
+
+            batch_answers.append({
+                "answer": answer_text,
+                "confidence": text_answer.get(
+                    "confidence",
+                    0.0,
+                ),
+                "sources": text_answer.get(
+                    "sources",
+                    [],
+                ),
+            })
+
+        # ==============================================================
+        # DETECT MISSING SPREADSHEET DECISIONS
+        # ==============================================================
+
+        missing_tabular_ids = (
+            input_tabular_ids
+            - returned_tabular_ids
+        )
+
+        if missing_tabular_ids:
+            print(
+                "[MISSING DECISION] "
+                f"Initial batch failed to account for "
+                f"chunk IDs: {sorted(missing_tabular_ids)}"
+            )
+
+        # ==============================================================
+        # RETRY ONLY MISSING SPREADSHEET DECISIONS
+        #
+        # IMPORTANT:
+        #
+        # matches=False rows were already added to returned_tabular_ids.
+        #
+        # Therefore NO MATCH rows DO NOT enter this retry loop.
+        # ==============================================================
+
+        retry_round = 0
+
+        while (
+            missing_tabular_ids
+            and retry_round < MISSING_DECISION_RETRIES
+            and llm_calls < remaining_plan_calls
+        ):
+            retry_round += 1
+
+            print(
+                "[MISSING DECISION RETRY] "
+                f"Round {retry_round} | "
+                f"remaining={sorted(missing_tabular_ids)}"
+            )
+
+            ids_to_retry = sorted(
+                missing_tabular_ids
+            )
+
+            for missing_id in ids_to_retry:
+
+                if llm_calls >= remaining_plan_calls:
+                    break
+
+                missing_chunk = tabular_chunks_by_id.get(
+                    missing_id
+                )
+
+                if not missing_chunk:
+                    print(
+                        "[RETRY ERROR] "
+                        f"Could not locate "
+                        f"chunk_id={missing_id}"
+                    )
+                    continue
+
+                print(
+                    "[RETRY CHUNK] "
+                    f"chunk_id={missing_id} | "
+                    f"{missing_chunk.get('text', '')[:500]}"
+                )
+
+                # ------------------------------------------------------
+                # Retry ONE missing spreadsheet row.
+                # ------------------------------------------------------
+
+                retry_result = generate_answer(
+                    body.question,
+                    [missing_chunk],
+                )
+
+                llm_calls += 1
+
+                retry_records = retry_result.get(
+                    "records",
+                    [],
+                )
+
+                if not isinstance(
+                    retry_records,
+                    list,
+                ):
+                    retry_records = []
+
+                for retry_record in retry_records:
+                    process_tabular_record(
+                        record=retry_record,
+                        expected_ids={missing_id},
+                        returned_ids=returned_tabular_ids,
+                        destination_answers=batch_answers,
+                    )
+
+            # ----------------------------------------------------------
+            # Recalculate after retry round.
+            # ----------------------------------------------------------
+
+            missing_tabular_ids = (
+                input_tabular_ids
+                - returned_tabular_ids
+            )
+
+        # ==============================================================
+        # STILL MISSING AFTER RETRIES
+        #
+        # DO NOT ADVANCE THE CURSOR.
+        # ==============================================================
+
+        if missing_tabular_ids:
+            print(
+                "[UNRESOLVED MISSING DECISION] "
+                f"Could not safely account for "
+                f"chunk IDs: {sorted(missing_tabular_ids)}"
+            )
+
+            print(
+                "[BATCH NOT COMMITTED] "
+                "retrieval_cursor remains unchanged."
+            )
+
+            # ----------------------------------------------------------
+            # Do NOT:
+            #
+            # all_answers.extend(batch_answers)
+            #
+            # Do NOT:
+            #
+            # retrieval_cursor = batch_end
+            #
+            # Otherwise we would silently lose the unresolved row.
+            # ----------------------------------------------------------
+
+            break
+
+        # ==============================================================
+        # EVERY TABULAR ROW IS ACCOUNTED FOR
+        #
+        # Safe to commit the batch.
+        # ==============================================================
+
+        all_answers.extend(
+            batch_answers
+        )
+
+        retrieval_cursor = batch_end
+
+    # ------------------------------------------------------------------
+    # 6. Save stable retrieval session
+    # ------------------------------------------------------------------
+
+    set_active_query(
+        user_id=user.id,
+        question=body.question,
+        business_id=body.business_id,
+        doc_state=current_doc_state,
+        answers=all_answers,
+        retrieval_results=retrieval_results,
+        retrieval_cursor=retrieval_cursor,
+        retrieval_limit=retrieval_limit,
+        retrieval_vectors=retrieval_vectors,
+        retrieval_fully_exhausted=retrieval_fully_exhausted,
+    )
+
+    # ------------------------------------------------------------------
+    # 7. Paginate generated answers
+    # ------------------------------------------------------------------
+
+    page_answers = all_answers[
+        answer_offset:
+        answer_offset + ANSWER_PAGE_SIZE
+    ]
+
+    print(
+        "\n[PAGINATION DEBUG] "
+        f"answer_offset={answer_offset} "
+        f"total_all_answers={len(all_answers)} "
+        f"retrieval_cursor={retrieval_cursor} "
+        f"retrieval_results={len(retrieval_results)}"
+    )
+
+    for i, answer in enumerate(
+        all_answers
+    ):
+        print(
+            f"[ALL ANSWER {i}] "
+            f"{answer.get('answer')}"
+        )
+
+    # ------------------------------------------------------------------
+    # 8. Determine whether additional work/results remain
+    # ------------------------------------------------------------------
+
+    has_more_answers = (
+        answer_offset
+        + ANSWER_PAGE_SIZE
+        < len(all_answers)
+    )
+
+    # Retrieved candidates that have not yet been successfully committed.
+    has_more_candidates = (
+        retrieval_cursor
+        < len(retrieval_results)
+    )
+
+    # Current retrieval pool may still be expandable.
+    can_expand_retrieval = (
+        not retrieval_fully_exhausted
+        and retrieval_limit < MAX_RETRIEVAL_SIZE
+    )
+
+    has_more = (
+        has_more_answers
+        or has_more_candidates
+        or can_expand_retrieval
+    )
+
+    next_offset = (
+        answer_offset + ANSWER_PAGE_SIZE
+        if has_more
+        else None
+    )
+
+    # ------------------------------------------------------------------
+    # 9. Log initial query
+    # ------------------------------------------------------------------
+
+    if (
+        answer_offset == 0
+        and not cache_is_valid
+    ):
+        db.add(
+            QueryLog(
+                org_id=org.id,
+                business_id=body.business_id,
+                user_id=user.id,
+                query_text=body.question,
+                answer={
+                    "answers": page_answers,
+                },
+                retrieval_plan=(
+                    "multiquery"
+                    if config["use_multiquery"]
+                    else (
+                        "hyde"
+                        if config["use_hyde"]
+                        else "basic"
+                    )
+                ),
+            )
+        )
+
         db.commit()
 
+    # ------------------------------------------------------------------
+    # 10. Empty answer page
+    # ------------------------------------------------------------------
+
     if not page_answers:
-        return {"answer": {"answers": []}, "sources": [], "chunks_used": 0, "hasMore": False, "nextOffset": None}
+        return {
+            "answer": {
+                "answers": [],
+            },
+            "sources": [],
+            "chunks_used": 0,
+            "hasMore": has_more,
+            "nextOffset": next_offset,
+            "usage": {
+                "searches_limit": config["monthly_searches"],
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # 11. Collect source filenames
+    # ------------------------------------------------------------------
+
+    sources = list({
+        source["filename"]
+        for item in page_answers
+        for source in item.get(
+            "sources",
+            [],
+        )
+        if (
+            isinstance(source, dict)
+            and source.get("filename")
+        )
+    })
+
+    # ------------------------------------------------------------------
+    # 12. Return requested answer page
+    # ------------------------------------------------------------------
 
     return {
-        "answer":      {"answers": page_answers},
-        "sources":     list({s["filename"] for item in page_answers for s in item.get("sources", [])}),
+        "answer": {
+            "answers": page_answers,
+        },
+        "sources": sources,
         "chunks_used": len(page_answers),
-        "hasMore":     has_more,
-        "nextOffset":  next_offset,
-        "usage":       {"searches_limit": config["monthly_searches"]},
+        "hasMore": has_more,
+        "nextOffset": next_offset,
+        "usage": {
+            "searches_limit": config["monthly_searches"],
+        },
     }
-
 
 # ── Recent queries ─────────────────────────────────────────────────────────────
 @app.get("/queries/recent")
