@@ -6,7 +6,6 @@ import { FileText } from 'lucide-react';
 import { Search, ChevronDown, History, Clock, Loader2, Building2, MessageSquare, ArrowRight, Plus } from 'lucide-react';
 import { useBusiness } from '@/app/context/BusinessContext';
 import { DebounceContainer } from '@/components/Debounce';
-import Navbar from '@/components/Navbar';
 
 interface RagAnswerSource {
   chunk: number;
@@ -38,13 +37,6 @@ interface RecentQuery {
   answer: string;
 }
 
-// Helper function to extract only the first letter
-const getInitial = (name: string) => {
-  if (!name) return 'D';
-  const parts = name.trim().split(/\s+/);
-  return parts[0][0].toUpperCase();
-};
-
 export default function SearchHome() {
   const { selectedBusiness, businesses, selectBusiness } = useBusiness();
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
@@ -56,30 +48,6 @@ export default function SearchHome() {
 
   const [recentQueries, setRecentQueries] = useState<RecentQuery[]>([]);
   const [loadingQueries, setLoadingQueries] = useState(false);
-  const [userInitial, setUserInitial] = useState<string>('D');
-
-  // Fetch recent queries and user profile concurrently on mount
-  useEffect(() => {
-    async function fetchUserData() {
-      try {
-        const userRes = await fetch("http://localhost:8000/auth/me", {
-          method: "GET",
-          credentials: "include",
-        });
-        if (userRes.ok) {
-          const userData = await userRes.json();
-          if (userData.name) {
-            setUserInitial(getInitial(userData.name));
-          }
-        }
-      } catch (err) {
-        console.error("Failed to fetch user profile:", err);
-      }
-    }
-
-    fetchUserData();
-  }, []);
-
   useEffect(() => {
     if (!selectedBusiness) {
       setRecentQueries([]);

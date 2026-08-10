@@ -15,7 +15,6 @@ from app.rag import (
     retrieve_chunks_multi,
     check_search_limit,
     increment_search_count,
-    check_rate_limit,
     clear_active_query,
     get_active_query,
     set_active_query,
@@ -28,7 +27,6 @@ from app.auth import get_current_user
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from math import ceil
 from app.routes.billing import router as billing_router
 
 import jwt
