@@ -15,7 +15,6 @@ from app.rag import (
     retrieve_chunks_multi,
     check_search_limit,
     increment_search_count,
-    check_rate_limit,
     clear_active_query,
     get_active_query,
     set_active_query,
@@ -402,9 +401,7 @@ async def upload_documents(
                 business_id=business.id,
                 document_id=doc.id,
                 file_path=temp_path,
-                mime_type=file.content_type,
                 filename=safe_filename,
-                file_context=specific_context,
             )
             uploaded.append({
                 "filename":    safe_filename,

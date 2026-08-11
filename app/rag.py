@@ -3,14 +3,13 @@ Core RAG service using pgvector.
 Handles: document ingestion → chunking → embedding → PostgreSQL storage → retrieval
 """
 import os
-import re
 import json
 import redis
 import pandas as pd
 import openpyxl
 from openpyxl.utils import range_boundaries
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -28,8 +27,6 @@ client = OpenAI(
 LLM_MODEL = os.getenv("LLM_MODEL", "mistral:7b")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-CHUNK_SIZE         = 500
-CHUNK_OVERLAP      = 100
 TOP_K              = 5
 EMBED_MODEL        = "all-MiniLM-L6-v2"
 MIN_SCORE_STANDARD = 0.45
@@ -41,10 +38,6 @@ PLAN_CONFIG = {
         "monthly_searches":   50,
         "use_hyde":           True,
         "use_multiquery":     True,
-        "rate_per_minute":    3,
-        "rate_per_hour":      20,
-        "price_monthly":      0,
-        "price_yearly":       0,
         "display_name":       "Free",
         "max_businesses":     1,
         "max_users":          2,
@@ -56,10 +49,6 @@ PLAN_CONFIG = {
         "monthly_searches":   2000,
         "use_hyde":           True,
         "use_multiquery":     True,
-        "rate_per_minute":    10,
-        "rate_per_hour":      100,
-        "price_monthly":      49,
-        "price_yearly":       470,
         "display_name":       "Starter",
         "max_businesses":     3,
         "max_users":          10,
@@ -219,114 +208,13 @@ Analyze the following spreadsheet content:
     except Exception as e:
         print(f"[Spreadsheet LLM] JSON parse error: {e}. Raw content was: {raw_content}")
         return {"tables": [], "charts": [], "key_findings": [], "spreadsheet_summary": ""}
-    
-def analyze_sheet_structure(
-    raw_rows: list,
-    sheet_name: str,
-    filename: str,
-    user_context: Optional[str] = None,
-) -> dict:
-    """
-    Sends raw rows (as CSV text) to the LLM and asks it to identify:
-      - Where the real header row is
-      - Whether there are multiple tables
-      - What each table represents
-      - Which columns are IDs vs dollar amounts vs dates
- 
-    Returns a dict the ingestion code uses to read the file correctly.
-    """
-    # Convert raw rows to readable CSV-ish text (max 30 rows to stay within tokens)
-    row_lines = []
-    for i, row in enumerate(raw_rows[:30]):
-        vals = [str(v) if pd.notna(v) else "" for v in row]
-        row_lines.append(f"Row {i}: {' | '.join(vals)}")
-    raw_sample = "\n".join(row_lines)
- 
-    prompt = f"""You are analyzing a raw Excel sheet to prepare it for ingestion into a vector search database.
- 
-Filename: {filename}
-Sheet: {sheet_name}
-User context: {user_context or 'None provided'}
- 
-Raw sheet content (first 30 rows, zero-indexed):
-{raw_sample}
- 
-Analyze this sheet and respond with ONLY valid JSON — no markdown, no explanation.
- 
-Return this exact structure:
-{{
-  "tables": [
-    {{
-      "sheet_name": "Name of the Excel tab/sheet",
-      "table_name": "descriptive name for this table",
-      "header_row": 0,
-      "data_start_row": 1,
-      "data_end_row": null,
-      "description": "what each row represents in plain english",
-      "column_notes": {{
-        "ColumnName": "what this column contains — flag if it is an ID/reference not a dollar amount"
-      }},
-      "disambiguation": "any important notes to prevent the LLM from confusing columns e.g. Statement Number is a bill ID not a dollar amount"
-    }}
-  ],
-  "skip_rows": [],
-  "structural_notes": "any other important layout notes"
-}}
- 
-Rules:
-- header_row is the zero-based row index where the REAL column headers are
-- data_start_row is the first row of actual data (usually header_row + 1)
-- data_end_row is null if data goes to the end, otherwise the last data row index
-- skip_rows lists row indices that are metadata/totals/blank — NOT real data
-- If there are multiple separate tables on the same sheet, list each one
-- If all columns are unnamed, set header_row to the row with the most descriptive text
-- IMPORTANT: Identify columns that look like amounts/money vs ID numbers"""
- 
-    try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,  # low temp — we want structured reliable output
-            max_tokens=800,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        result = json.loads(raw)
-        return result
-    except Exception as e:
-        print(f"[LLM Structure] Failed for {sheet_name}: {e} — using fallback detection")
-        return None
- 
- 
-def fallback_detect_header(df_raw: pd.DataFrame) -> int:
-    """Score-based header detection when LLM fails."""
-    best_score = 0
-    best_row   = 0
-    for i in range(min(20, len(df_raw))):
-        row_vals = df_raw.iloc[i].tolist()
-        score = sum(
-            1 for v in row_vals
-            if isinstance(v, str)
-            and len(v.strip()) > 1
-            and not v.strip().replace(".", "").replace(",", "").replace("-", "").isnumeric()
-        )
-        # Penalize if first cell looks like a date
-        first = str(row_vals[0]) if row_vals else ""
-        if any(yr in first for yr in ["2020", "2021", "2022", "2023", "2024", "2025", "2026"]):
-            score -= 3
-        if score > best_score:
-            best_score = score
-            best_row   = i
-    return best_row
- 
+
 def chunk_text_small_to_big(text: str) -> List[dict]:
     """
     Returns list of {child, parent} dicts.
     Child = small sentence-level chunk for embedding.
     Parent = surrounding paragraph for LLM context.
     """
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-
     # Step 1: Split into large parent chunks (paragraphs)
     parent_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
@@ -353,102 +241,6 @@ def chunk_text_small_to_big(text: str) -> List[dict]:
                 })
 
     return result
-
-def normalize_parent_key(text: str) -> str:
-    """
-    Normalizes text by removing section/appendix headers and taking a middle-sample 
-    fingerprint so identical repeated blocks match without false positives.
-    """
-    # Remove dynamic headers
-    cleaned = re.sub(r'Appendix\s+\d+', '', text, flags=re.IGNORECASE)
-    cleaned = re.sub(r'Section\s+\d+', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\W+', '', cleaned).lower()
-    
-    # Use a longer fingerprint (first 300 chars) to prevent false-positive collisions
-    return cleaned[:300]
-
-def extract_table_from_structure(
-    df_raw: pd.DataFrame,
-    table_spec: dict,
-    sheet_name: str,
-) -> tuple[str, pd.DataFrame, str, str]:
-    """
-    Uses the LLM-provided table spec to correctly slice and header the DataFrame.
-    Returns (table_name, clean_df, description, disambiguation).
-    """
-    header_row     = table_spec.get("header_row", 0)
-    data_start     = table_spec.get("data_start_row", header_row + 1)
-    data_end       = table_spec.get("data_end_row", None)
-    table_name     = table_spec.get("table_name", sheet_name)
-    description    = table_spec.get("description", "")
-    disambiguation = table_spec.get("disambiguation", "")
-    skip_rows      = table_spec.get("skip_rows", [])
- 
-    # Extract header from the identified row
-    headers = df_raw.iloc[header_row].tolist()
-    headers = [
-        str(h).replace("\n", " ").strip() if pd.notna(h) else f"Column_{i}"
-        for i, h in enumerate(headers)
-    ]
- 
-    # Slice data rows
-    if data_end is not None:
-        df_data = df_raw.iloc[data_start:data_end + 1].copy()
-    else:
-        df_data = df_raw.iloc[data_start:].copy()
- 
-    df_data.columns = headers
- 
-    # Drop skip rows (adjust index since we sliced)
-    adjusted_skips = [r - data_start for r in skip_rows if data_start <= r < (data_end or len(df_raw))]
-    if adjusted_skips:
-        df_data = df_data.drop(index=adjusted_skips, errors="ignore")
- 
-    # Drop unnamed columns
-    df_data = df_data[[c for c in df_data.columns if not str(c).startswith("Unnamed:") and str(c).strip() not in ("", "nan")]]
- 
-    # Drop fully empty rows
-    df_data = df_data.dropna(how="all").reset_index(drop=True)
- 
-    return table_name, df_data, description, disambiguation
- 
- 
-def build_schema_chunk(
-    table_name: str,
-    df: pd.DataFrame,
-    filename: str,
-    description: str,
-    disambiguation: str,
-    user_context: Optional[str],
-    column_notes: dict,
-) -> str:
-    """Builds the schema header chunk (chunk_index=0 for this table)."""
-    sample_lines = []
-    for col in df.columns:
-        samples = (
-            df[col].dropna().astype(str).str.strip()
-            .loc[lambda s: s != ""].unique()[:3].tolist()
-        )
-        note = column_notes.get(col, "")
-        flag = f" [{note}]" if note else ""
-        sample_lines.append(
-            f"  - {col}{flag}: e.g. {', '.join(samples)}" if samples else f"  - {col}{flag}"
-        )
- 
-    parts = [
-        f"[Table: {table_name}]",
-        f"Source file: {filename}",
-    ]
-    if description:
-        parts.append(f"Description: {description}")
-    if user_context:
-        parts.append(f"User notes: {user_context}")
-    parts.append(f"Rows: {len(df)} | Columns: {len(df.columns)}")
-    parts.append("Columns and sample values:\n" + "\n".join(sample_lines))
-    if disambiguation:
-        parts.append(f"\nIMPORTANT — Column disambiguation:\n{disambiguation}")
- 
-    return "\n".join(parts)
 
 def get_embedder() -> SentenceTransformer:
     global _embedder
@@ -483,28 +275,6 @@ def check_search_limit(org_id: int, plan: str) -> tuple[bool, int, int]:
     limit   = config["monthly_searches"]
     current = get_monthly_search_count(org_id)
     return current < limit, current, limit
-
-
-# ── Rate limiting ──────────────────────────────────────────────────────────────
-def check_rate_limit(user_id: int, plan: str) -> bool:
-    """Returns True if allowed, False if rate limited."""
-    config      = PLAN_CONFIG.get(plan, PLAN_CONFIG["free"])
-    minute_key  = f"rate:{user_id}:minute"
-    hour_key    = f"rate:{user_id}:hour"
-    try:
-        pipe = redis_client.pipeline()
-        pipe.incr(minute_key)
-        pipe.expire(minute_key, 60)
-        pipe.incr(hour_key)
-        pipe.expire(hour_key, 3600)
-        minute_count, _, hour_count, _ = pipe.execute()
-        if minute_count > config["rate_per_minute"]:
-            return False
-        if hour_count > config["rate_per_hour"]:
-            return False
-        return True
-    except Exception:
-        return True  # fail open if Redis is down
 
 
 # ── Active query cache (per user) ──────────────────────────────────────────────
@@ -846,13 +616,6 @@ def retrieve_chunks_multi(
     # 3. Deduplicate
     # ------------------------------------------------------------------
 
-    seen_parents = set()
-    seen_structured = set()
-
-    deduped = []
-
-
-
     # ================================================================
     # DEDUPLICATION
     # ================================================================
@@ -1011,7 +774,7 @@ def retrieve_chunks_multi(
     }
 
 # ── Text extraction ────────────────────────────────────────────────────────────
-def extract_text(file_path: str, mime_type: str) -> str:
+def extract_text(file_path: str) -> str:
     path = Path(file_path)
     ext  = path.suffix.lower()
 
@@ -1050,15 +813,6 @@ def extract_text(file_path: str, mime_type: str) -> str:
     return ""
 
 
-# ── Chunking ───────────────────────────────────────────────────────────────────
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=overlap,
-        separators=["\n\n", "\n", " ", ""]
-    )
-    return splitter.split_text(text)
-
 def clean_text(text: str) -> str:
     return text.replace("\x00", "")
 
@@ -1069,9 +823,7 @@ def ingest_document(
     business_id: int,
     document_id: int,
     file_path: str,
-    mime_type: str,
     filename: str,
-    file_context: Optional[str] = None,
 ) -> int:
 
     from app.models import Chunk
@@ -1376,10 +1128,7 @@ def ingest_document(
     # 4. PDF / NORMAL TEXT
     # ==================================================================
 
-    raw_text = extract_text(
-        file_path,
-        mime_type,
-    )
+    raw_text = extract_text(file_path)
 
     raw_text = clean_text(
         raw_text,
@@ -1542,10 +1291,3 @@ def retrieve_chunks(
         "hasMore":    has_more,
         "nextOffset": offset + get_k if has_more else None,
     }
-
-
-# ── Delete ─────────────────────────────────────────────────────────────────────
-def delete_document_chunks(db: Session, document_id: int) -> None:
-    from app.models import Chunk
-    db.query(Chunk).filter(Chunk.document_id == document_id).delete()
-    db.commit()
