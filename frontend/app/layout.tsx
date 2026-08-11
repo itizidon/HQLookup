@@ -1,8 +1,6 @@
 import type { Metadata } from "next";
-import { cookies } from "next/headers";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
-import { redirect } from "next/navigation";
 import Providers from "./providers"
 
 const geistSans = Geist({

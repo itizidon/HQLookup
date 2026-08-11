@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
-import { FileText, LogOut, CreditCard } from 'lucide-react';
+import { FileText, LogOut } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 
 export default function Navbar({ avatarInitials = 'D' }) {

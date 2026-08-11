@@ -10,14 +10,14 @@ Requires:
 import os
 import json
 import stripe
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from datetime import datetime, timezone
 
 from app.database import get_db
 from app.auth import get_current_user
-from app.models import User, Organization, Business
+from app.models import User
 from app.rag import PLAN_CONFIG
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -56,11 +56,6 @@ def _get_or_create_stripe_customer(user: User) -> str:
         metadata={"user_id": str(user.id)},
     )
     return customer.id
-
-
-def _get_active_subscription(customer_id: str) -> stripe.Subscription | None:
-    subs = stripe.Subscription.list(customer=customer_id, status="active", limit=1)
-    return subs.data[0] if subs.data else None
 
 
 def _sync_user_from_subscription(
@@ -187,7 +182,6 @@ async def change_plan(
 # ── POST /billing/cancel ───────────────────────────────────────────────────────
 @router.post("/cancel")
 async def cancel_subscription(
-    db:          Session = Depends(get_db),
     current_auth         = Depends(get_current_user),
 ):
     """

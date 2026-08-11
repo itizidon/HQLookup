@@ -2,14 +2,12 @@
 
 import { useEffect, useState, useRef } from "react";
 import { useBusiness } from "@/app/context/BusinessContext";
-import { useRouter, usePathname } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 
 export default function BusinessGate({ children }: { children: React.ReactNode }) {
   const { refreshBusinesses, selectedBusiness, businesses, isLoading: isContextLoading } = useBusiness();
   const router   = useRouter();
-  const pathname = usePathname();
-
   const [isInitializing, setIsInitializing]   = useState(true);
   const [error, setError]                     = useState<string | null>(null);
 

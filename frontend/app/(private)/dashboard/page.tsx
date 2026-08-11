@@ -1,32 +1,11 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import Link from 'next/link';
-import { Plus, Users, File, Loader2, Building2, Upload, X, Trash2, ShieldAlert, ChevronDown } from 'lucide-react';
+import { Plus, Loader2, Building2, X, ShieldAlert, ChevronDown } from 'lucide-react';
 import Navbar from '@/components/Navbar';
 import MetricCard from '@/components/MetricCard';
 import { useRouter } from 'next/navigation';
 import { useBusiness } from '@/app/context/BusinessContext';
-
-const ACCEPTED_TYPES = ".pdf,.txt,.md,.docx,.csv,.xlsx,.xls";
-
-const badgeColor: Record<string, { bg: string; color: string }> = {
-  PDF: { bg: '#fee2e2', color: '#ef4444' },
-  TXT: { bg: '#fef3c7', color: '#d97706' },
-  MD: { bg: '#e0f2fe', color: '#0284c7' },
-  DOCX: { bg: '#e0e7ff', color: '#4f46e5' },
-  CSV: { bg: '#dcfce7', color: '#16a34a' },
-  XLSX: { bg: '#f3e8ff', color: '#9333ea' },
-  XLS: { bg: '#f3e8ff', color: '#9333ea' },
-};
-
-interface Doc {
-  id: string;
-  backendId?: string;
-  name: string;
-  type: string;
-  status: "processing" | "ready" | "failed";
-}
 
 interface Org {
   id: number;
@@ -92,14 +71,11 @@ export default function AdminDashboard() {
   const [bizError, setBizError] = useState<string | null>(null);
 
   const [metricsData, setMetricsData] = useState<WorkspaceMetrics | null>(null);
-  const [isLoadingMetrics, setIsLoadingMetrics] = useState(false);
-
   // Fetch granular metrics whenever the user switches organizations
   useEffect(() => {
     if (!currentOrgId) return;
 
     const fetchWorkspaceMetrics = async () => {
-      setIsLoadingMetrics(true);
       try {
         const res = await fetch(`http://localhost:8000/auth/usage-metrics?org_id=${currentOrgId}`, {
           method: "GET",
@@ -111,8 +87,6 @@ export default function AdminDashboard() {
         }
       } catch (err) {
         console.error("Failed to fetch location usage bounds:", err);
-      } finally {
-        setIsLoadingMetrics(false);
       }
     };
 
@@ -152,7 +126,6 @@ export default function AdminDashboard() {
     setIsMounted(true);
   }, []);
 
-  const activeOrg = organizations.find(o => o.id === currentOrgId);
   const userPlanKey = userProfile?.plan?.toLowerCase() || 'free';
   const userInitials = getInitials(userProfile?.name || '');
 

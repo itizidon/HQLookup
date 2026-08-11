@@ -27,7 +27,6 @@ from app.auth import get_current_user
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from math import ceil
 from app.routes.billing import router as billing_router
 
 import jwt
@@ -41,11 +40,6 @@ FRONTEND_URL   = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
-class DocumentsRequest(BaseModel):
-    business_ids: List[int]
-    page:         int = 1
-    page_size:    int = 10
-
 class BusinessSettingsUpdate(BaseModel):
     business_id:      int = Field(..., description="The unique ID of the business being updated")
     query_allocation: int = Field(..., ge=0, description="The maximum number of allowed searches")
