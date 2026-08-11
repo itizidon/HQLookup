@@ -1,31 +1,47 @@
 import os
 import sys
 from logging.config import fileConfig
-
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
+from pathlib import Path
 
 from alembic import context
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, pool
 
-# ── 1. ADD YOUR PROJECT ROOT TO THE PYTHON PATH ──
-# This ensures Python can see the 'app' folder when running from the terminal
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# ── 2. IMPORT YOUR TARGET METADATA AND EXPLICIT MODELS ──
-from app.database import Base  # Adjust import path if your file structure differs
-from app.models import User, Organization, Business, OrgMember, Invitation  # Ensures all tables are registered
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
-# This is the Alembic Config object, which provides
-# access to the values within the .ini file in use.
+# Local development may use .env. Deployment platforms should inject the same
+# variable directly into the migration/release process.
+load_dotenv(PROJECT_ROOT / ".env")
+
+database_url = os.getenv("DATABASE_URL")
+if not database_url:
+    raise RuntimeError(
+        "DATABASE_URL is required to run Alembic migrations. "
+        "Copy .env.example to .env for local development or configure it "
+        "in the deployment environment."
+    )
+
+# Importing the model module registers every mapped table on Base.metadata.
+from app import models  # noqa: E402,F401
+from app.database import Base  # noqa: E402
+
+
 config = context.config
-
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# ── 3. WIRE THE TARGET METADATA HOOK ──
 target_metadata = Base.metadata
+
+
+def migration_options() -> dict:
+    """Options shared by online and offline migration execution."""
+    return {
+        "target_metadata": target_metadata,
+        "compare_type": True,
+        "compare_server_default": True,
+    }
 
 
 def run_migrations_offline() -> None:
@@ -40,12 +56,11 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
-        target_metadata=target_metadata,
+        url=database_url,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        **migration_options(),
     )
 
     with context.begin_transaction():
@@ -59,16 +74,13 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    connectable = create_engine(
+        database_url,
         poolclass=pool.NullPool,
     )
 
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection, target_metadata=target_metadata
-        )
+        context.configure(connection=connection, **migration_options())
 
         with context.begin_transaction():
             context.run_migrations()

@@ -1,106 +1,114 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
-import { useBusiness } from "@/app/context/BusinessContext";
-import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
+import { useBusiness } from "@/app/context/BusinessContext";
+import {
+  apiRequest,
+  getErrorMessage,
+  isAbortError,
+} from "@/lib/api";
 
-export default function BusinessGate({ children }: { children: React.ReactNode }) {
-  const { refreshBusinesses, selectedBusiness, businesses, isLoading: isContextLoading } = useBusiness();
-  const router   = useRouter();
+type Organization = {
+  id: number;
+  name: string;
+  is_active: boolean;
+};
 
-  const [isInitializing, setIsInitializing]   = useState(true);
-  const [error, setError]                     = useState<string | null>(null);
+type InitializationState = "loading" | "ready" | "error";
 
-  // ── Guard: prevent fetch running more than once ────────────────────────────
-  const hasFetched  = useRef(false);
-  // ── Guard: prevent routing from firing more than once per state ────────────
-  const hasRouted   = useRef(false);
+const ROUTES_WITHOUT_A_BUSINESS = new Set(["/dashboard", "/billing"]);
 
-  // ── Effect 1: Bootstrap — runs exactly once ────────────────────────────────
+export default function BusinessGate({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const { businesses, isLoading, refreshBusinesses } = useBusiness();
+  const pathname = usePathname();
+  const router = useRouter();
+  const [initializationState, setInitializationState] =
+    useState<InitializationState>("loading");
+  const [error, setError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
+
   useEffect(() => {
-    if (hasFetched.current) return;
-    hasFetched.current = true;
+    const controller = new AbortController();
 
-    const initWorkspace = async () => {
+    async function initializeWorkspace() {
       try {
-        const orgRes = await fetch("http://localhost:8000/organizations", {
-          method: "GET",
-          credentials: "include",
-        });
+        const organizations = await apiRequest<Organization[]>(
+          "/organizations",
+          { signal: controller.signal },
+        );
+        await refreshBusinesses(
+          organizations
+            .filter((organization) => organization.is_active)
+            .map((organization) => organization.id),
+          { signal: controller.signal },
+        );
 
-        if (!orgRes.ok) throw new Error("Failed to retrieve your organization setup.");
-
-        const orgData  = await orgRes.json();
-        const activeOrg = Array.isArray(orgData) ? orgData[0] : orgData;
-
-        if (activeOrg?.id) {
-          await refreshBusinesses([activeOrg.id]);
-        } else {
-          await refreshBusinesses([]);
+        if (!controller.signal.aborted) {
+          setInitializationState("ready");
         }
-      } catch (err: any) {
-        console.error("[BusinessGate] Bootstrap error:", err);
-        setError(err.message || "Unexpected error.");
-      } finally {
-        setIsInitializing(false);
+      } catch (caughtError) {
+        if (isAbortError(caughtError)) return;
+        setError(
+          getErrorMessage(
+            caughtError,
+            "We could not load your workspace. Please try again.",
+          ),
+        );
+        setInitializationState("error");
       }
-    };
-
-    initWorkspace();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Effect 2: Route guard — pathname intentionally NOT in deps ─────────────
-  useEffect(() => {
-    if (isInitializing || isContextLoading) return;
-
-    // Reset route guard whenever meaningful state changes
-    hasRouted.current = false;
-  }, [businesses.length, selectedBusiness?.id, isInitializing, isContextLoading]);
-
-  useEffect(() => {
-    if (isInitializing || isContextLoading) return;
-    if (hasRouted.current) return; // Already routed for this state — stop
-
-    const currentPath = window.location.pathname; // Read directly, not from deps
-
-    if (businesses.length === 0) {
-      if (currentPath !== "/dashboard") {
-        hasRouted.current = true;
-        router.push("/dashboard");
-      }
-      return;
     }
 
-    if (businesses.length > 0 && !selectedBusiness) return; // Wait for auto-select
+    void initializeWorkspace();
+    return () => controller.abort();
+  }, [refreshBusinesses, retryCount]);
 
-    if (currentPath === "/" && selectedBusiness) {
-      hasRouted.current = true;
-      router.push("/search");
+  useEffect(() => {
+    if (initializationState !== "ready" || isLoading) return;
+    if (
+      businesses.length === 0 &&
+      !ROUTES_WITHOUT_A_BUSINESS.has(pathname)
+    ) {
+      router.replace("/dashboard");
     }
-  }, [isInitializing, isContextLoading, businesses.length, selectedBusiness?.id]);
-  // ↑ pathname deliberately excluded — we read window.location.pathname directly
-  //   to avoid the push → pathname change → re-run → push loop
+  }, [businesses.length, initializationState, isLoading, pathname, router]);
 
-  if (isInitializing || (isContextLoading && businesses.length === 0)) {
+  if (initializationState === "loading" || isLoading) {
     return (
-      <div style={s.fallbackScreen}>
-        <Loader2 className="animate-spin" size={24} style={{ color: "var(--color-primary, #4f46e5)" }} />
-        <span style={{ fontSize: "13px", color: "var(--color-text-secondary, #71717a)", fontWeight: 500 }}>
-          Loading workspace...
-        </span>
+      <div style={styles.fallbackScreen} role="status" aria-live="polite">
+        <Loader2
+          className="animate-spin"
+          size={24}
+          aria-hidden="true"
+          style={{ color: "var(--color-text-info)" }}
+        />
+        <span style={styles.fallbackText}>Loading workspace…</span>
       </div>
     );
   }
 
-  if (error) {
+  if (initializationState === "error") {
     return (
-      <div style={s.fallbackScreen}>
-        <div style={s.errorBox}>
-          <h3 style={{ fontSize: "14px", margin: "0 0 4px 0", fontWeight: 600 }}>
-            Initialization Error
-          </h3>
-          <p style={{ fontSize: "12px", margin: 0 }}>{error}</p>
+      <div style={styles.fallbackScreen}>
+        <div style={styles.errorBox} role="alert">
+          <h1 style={styles.errorTitle}>Workspace unavailable</h1>
+          <p style={styles.errorMessage}>{error}</p>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => {
+              setError(null);
+              setInitializationState("loading");
+              setRetryCount((count) => count + 1);
+            }}
+          >
+            Try again
+          </button>
         </div>
       </div>
     );
@@ -109,14 +117,35 @@ export default function BusinessGate({ children }: { children: React.ReactNode }
   return <>{children}</>;
 }
 
-const s: Record<string, React.CSSProperties> = {
+const styles: Record<string, React.CSSProperties> = {
   fallbackScreen: {
-    display: "flex", flexDirection: "column", alignItems: "center",
-    justifyContent: "center", height: "100vh", width: "100vw",
-    gap: "12px", backgroundColor: "var(--color-background-primary, #ffffff)",
+    alignItems: "center",
+    backgroundColor: "var(--color-background-primary)",
+    display: "flex",
+    flexDirection: "column",
+    gap: "12px",
+    height: "100vh",
+    justifyContent: "center",
+    width: "100%",
+  },
+  fallbackText: {
+    color: "var(--color-text-secondary)",
+    fontSize: "13px",
+    fontWeight: 500,
   },
   errorBox: {
-    padding: "16px", borderRadius: "6px", border: "1px solid #fecaca",
-    backgroundColor: "#fef2f2", color: "#dc2626", maxWidth: "360px", textAlign: "center",
+    alignItems: "center",
+    backgroundColor: "var(--color-background-danger)",
+    border: "1px solid var(--color-border-danger)",
+    borderRadius: "var(--border-radius-md)",
+    color: "var(--color-text-danger)",
+    display: "flex",
+    flexDirection: "column",
+    gap: "12px",
+    maxWidth: "380px",
+    padding: "20px",
+    textAlign: "center",
   },
+  errorTitle: { fontSize: "15px", fontWeight: 600, margin: 0 },
+  errorMessage: { fontSize: "13px", lineHeight: 1.5, margin: 0 },
 };

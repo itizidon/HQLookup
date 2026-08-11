@@ -2,8 +2,8 @@
 Core RAG service using pgvector.
 Handles: document ingestion → chunking → embedding → PostgreSQL storage → retrieval
 """
-import os
 import json
+import logging
 import redis
 import pandas as pd
 import openpyxl
@@ -16,21 +16,25 @@ from sqlalchemy import text
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import OpenAI
-from dotenv import load_dotenv
-load_dotenv()
+from app.settings import settings
+
+logger = logging.getLogger(__name__)
 
 # ── Client ─────────────────────────────────────────────────────────────────────
 client = OpenAI(
-    base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
-    api_key=os.getenv("OPENAI_API_KEY", "ollama"),
+    base_url=settings.llm_base_url,
+    api_key=settings.openai_api_key.get_secret_value(),
+    timeout=settings.llm_timeout_seconds,
+    max_retries=2,
 )
-LLM_MODEL = os.getenv("LLM_MODEL", "mistral:7b")
+LLM_MODEL = settings.llm_model
+SPREADSHEET_LLM_MODEL = settings.spreadsheet_model
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 CHUNK_SIZE         = 500
 CHUNK_OVERLAP      = 100
 TOP_K              = 5
-EMBED_MODEL        = "all-MiniLM-L6-v2"
+EMBED_MODEL        = settings.embedding_model
 MIN_SCORE_STANDARD = 0.45
 MIN_SCORE_TABULAR  = 0.0
 
@@ -69,11 +73,12 @@ PLAN_CONFIG = {
 }
 
 # ── Redis ──────────────────────────────────────────────────────────────────────
-redis_client = redis.Redis(
-    host=os.getenv("REDIS_HOST", "localhost"),
-    port=int(os.getenv("REDIS_PORT", 6379)),
-    db=0,
+redis_client = redis.Redis.from_url(
+    settings.redis_url.get_secret_value(),
     decode_responses=True,
+    socket_connect_timeout=3,
+    socket_timeout=3,
+    health_check_interval=30,
 )
 
 ACTIVE_QUERY_TTL_SECONDS = 60 * 60 * 6  # 6 hours
@@ -96,8 +101,8 @@ def extract_spreadsheet_to_text(file_path: str) -> str:
                     title_str = title.text if title and hasattr(title, 'text') else str(title or "Untitled")
                     sheet_texts.append(f"- Chart {i}: Type={chart_type}, Title='{title_str}'\n")
                 sheet_texts.append("\n")
-    except Exception as e:
-        print(f"[Spreadsheet] Chart extraction warning: {e}")
+    except Exception:
+        logger.warning("Spreadsheet chart extraction failed")
 
     excel_data = pd.ExcelFile(file_path)
     for sheet_name in excel_data.sheet_names:
@@ -117,8 +122,8 @@ def chunk_table_deterministically(file_path: str, table_meta: dict) -> list[str]
     try:
         excel_file = pd.ExcelFile(file_path)
         df_full = pd.read_excel(excel_file, sheet_name=excel_file.sheet_names[0], header=None)
-    except Exception as e:
-        print(f"[Chunker] Error reading excel file for chunking: {e}")
+    except Exception:
+        logger.warning("Spreadsheet table could not be read for chunking")
         return []
     
     df_slice = df_full
@@ -154,9 +159,8 @@ def chunk_table_deterministically(file_path: str, table_meta: dict) -> list[str]
             
     return row_chunks
 
-def analyze_spreadsheet_with_llm(file_path: str, client: OpenAI = None) -> dict:
-    if client is None:
-        client = OpenAI()
+def analyze_spreadsheet_with_llm(file_path: str, llm_client: OpenAI | None = None) -> dict:
+    llm_client = llm_client or client
 
     spreadsheet_text = extract_spreadsheet_to_text(file_path)
 
@@ -200,8 +204,8 @@ Analyze the following spreadsheet content:
 {spreadsheet_text}
 """
 
-    response = client.chat.completions.create(
-        model="gpt-4o",
+    response = llm_client.chat.completions.create(
+        model=SPREADSHEET_LLM_MODEL,
         messages=[
             {"role": "system", "content": "You are a precise data extraction assistant that outputs strictly valid JSON objects."},
             {"role": "user", "content": prompt}
@@ -215,8 +219,8 @@ Analyze the following spreadsheet content:
     try:
         parsed_data = json.loads(raw_content)
         return parsed_data
-    except Exception as e:
-        print(f"[Spreadsheet LLM] JSON parse error: {e}. Raw content was: {raw_content}")
+    except (TypeError, json.JSONDecodeError):
+        logger.warning("Spreadsheet LLM returned invalid JSON")
         return {"tables": [], "charts": [], "key_findings": [], "spreadsheet_summary": ""}
     
 def chunk_text_small_to_big(text: str) -> List[dict]:
@@ -262,24 +266,52 @@ def get_embedder() -> SentenceTransformer:
 
 
 # ── Search quota ───────────────────────────────────────────────────────────────
-def get_monthly_search_count(org_id: int) -> int:
-    key = f"searches:org:{org_id}:{datetime.now().strftime('%Y-%m')}"
-    try:
-        val = redis_client.get(key)
-        return int(val) if val else 0
-    except Exception:
-        return 0
+class QuotaBackendUnavailable(RuntimeError):
+    """Raised when quota state cannot be read safely."""
 
-def increment_search_count(org_id: int) -> int:
-    key = f"searches:org:{org_id}:{datetime.now().strftime('%Y-%m')}"
+
+def _quota_key(org_id: int) -> str:
+    return f"searches:org:{org_id}:{datetime.now().strftime('%Y-%m')}"
+
+
+def get_monthly_search_count(org_id: int) -> int:
     try:
-        pipe = redis_client.pipeline()
-        pipe.incr(key)
-        pipe.expire(key, 60 * 60 * 24 * 35)  # 35 days
-        count, _ = pipe.execute()
-        return count
-    except Exception:
-        return 0
+        val = redis_client.get(_quota_key(org_id))
+        return int(val) if val else 0
+    except redis.RedisError as exc:
+        logger.error("Redis quota backend unavailable")
+        raise QuotaBackendUnavailable from exc
+
+
+_CONSUME_QUOTA_SCRIPT = """
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local limit = tonumber(ARGV[1])
+if current >= limit then
+    return {0, current}
+end
+current = redis.call('INCR', KEYS[1])
+if current == 1 then
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+end
+return {1, current}
+"""
+
+
+def consume_search_quota(org_id: int, plan: str) -> tuple[bool, int, int]:
+    """Atomically reserve one monthly search and return allowed/count/limit."""
+    limit = PLAN_CONFIG.get(plan, PLAN_CONFIG["free"])["monthly_searches"]
+    try:
+        allowed, count = redis_client.eval(
+            _CONSUME_QUOTA_SCRIPT,
+            1,
+            _quota_key(org_id),
+            limit,
+            60 * 60 * 24 * 35,
+        )
+        return bool(allowed), int(count), limit
+    except redis.RedisError as exc:
+        logger.error("Redis quota backend unavailable")
+        raise QuotaBackendUnavailable from exc
 
 def check_search_limit(org_id: int, plan: str) -> tuple[bool, int, int]:
     """Returns (allowed, current_count, limit)"""
@@ -287,6 +319,13 @@ def check_search_limit(org_id: int, plan: str) -> tuple[bool, int, int]:
     limit   = config["monthly_searches"]
     current = get_monthly_search_count(org_id)
     return current < limit, current, limit
+
+
+def redis_is_ready() -> bool:
+    try:
+        return bool(redis_client.ping())
+    except redis.RedisError:
+        return False
 
 
 # ── Active query cache (per user) ──────────────────────────────────────────────
@@ -334,10 +373,8 @@ def set_active_query(
             }),
         )
 
-    except Exception as e:
-        print(
-            f"[Redis] Failed to cache active query: {e}"
-        )
+    except redis.RedisError:
+        logger.warning("Redis active-query cache write failed")
 
 def clear_active_query(user_id: int) -> None:
     try:
@@ -365,8 +402,8 @@ Passage:"""
         )
         hypothetical = response.choices[0].message.content.strip()
         return hypothetical
-    except Exception as e:
-        print(f"[HyDE] Failed, falling back to raw query: {e}")
+    except Exception:
+        logger.warning("HyDE generation failed; using the original query")
         return query
 
 
@@ -408,8 +445,8 @@ User question: {query}
         variants = json.loads(raw)
         if isinstance(variants, list):
             return [query] + variants
-    except Exception as e:
-        print(f"[MultiQuery] Failed, using original query only: {e}")
+    except Exception:
+        logger.warning("Multi-query generation failed; using the original query")
     return [query]
 
 
@@ -437,19 +474,13 @@ def retrieve_chunks_multi(
     embedder = get_embedder()
 
     if vectors is None:
-        print(
-            "[Retrieval] No cached vectors; "
-            "generating Multi-Query/HyDE vectors"
-        )
+        logger.debug("Generating retrieval vectors")
         vectors = build_multi_hyde_vectors(
             query,
             embedder,
         )
     else:
-        print(
-            f"[Retrieval] Reusing {len(vectors)} "
-            "cached Multi-Query/HyDE vectors"
-        )
+        logger.debug("Reusing %d cached retrieval vectors", len(vectors))
 
     doc_filter_sql = ""
 
@@ -559,10 +590,7 @@ def retrieve_chunks_multi(
             params,
         ).fetchall()
 
-        print(
-            f"[Retrieval] vector returned "
-            f"{len(rows)} candidate chunks"
-        )
+        logger.debug("Retrieval vector returned %d candidates", len(rows))
 
         for rank, row in enumerate(rows):
 
@@ -611,18 +639,11 @@ def retrieve_chunks_multi(
         if r.get("content_type") == "tabular"
     ]
 
-    print(
-        f"[Retrieval] "
-        f"structured candidates={len(structured)} "
-        f"total merged={len(merged)}"
+    logger.debug(
+        "Retrieval merged %d candidates (%d tabular)",
+        len(merged),
+        len(structured),
     )
-
-    for r in structured:
-        print(
-            f"  statement/chunk={r['chunk_index']} "
-            f"score={r['score']:.4f} "
-            f"{r['text'][:150]}"
-        )
 
     # ------------------------------------------------------------------
     # 3. Deduplicate
@@ -737,24 +758,12 @@ def retrieve_chunks_multi(
     # DEBUG
     # ================================================================
 
-    print(
-        f"\n[MultiQuery] "
-        f"{len(vectors)} variants "
-        f"→ {len(merged)} candidates "
-        f"→ {len(deduped)} after dedup"
+    logger.debug(
+        "Multi-query retrieval used %d vectors, merged %d candidates, and retained %d",
+        len(vectors),
+        len(merged),
+        len(deduped),
     )
-
-    for result in deduped[:20]:
-
-        print(
-            f"  score={result['score']:.4f}"
-            f" | rrf={result['rrf_score']:.4f}"
-            f" | content={result['content_type']}"
-            f" | type={result['chunk_type']}"
-            f" | index={result['chunk_index']}"
-            f" | {result['filename']}"
-            f" | {result['text'][:100]}"
-        )
 
     # ================================================================
     # PAGINATION
@@ -821,7 +830,7 @@ def extract_text(file_path: str, mime_type: str) -> str:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
 
-    print(f"Unsupported file extension: {ext}")
+    logger.warning("Unsupported file extension requested")
     return ""
 
 
@@ -867,11 +876,8 @@ def ingest_document(
                 file_path
             )
 
-        except Exception as e:
-            print(
-                f"[Ingest] Spreadsheet analysis failed "
-                f"for {filename}: {e}"
-            )
+        except Exception:
+            logger.warning("Spreadsheet analysis failed; using deterministic fallback")
 
             spreadsheet_meta = {
                 "tables": [],
@@ -918,10 +924,7 @@ def ingest_document(
 
         if not tables:
 
-            print(
-                f"[Ingest] Warning: no tables detected for "
-                f"{filename}; using raw spreadsheet fallback."
-            )
+            logger.info("No spreadsheet tables detected; using deterministic fallback")
 
             try:
 
@@ -961,12 +964,8 @@ def ingest_document(
                             "content_type": "tabular",
                         })
 
-            except Exception as e:
-
-                print(
-                    f"[Ingest] Spreadsheet fallback failed "
-                    f"for {filename}: {e}"
-                )
+            except Exception:
+                logger.warning("Deterministic spreadsheet fallback failed")
 
         # --------------------------------------------------------------
         # Workbook summary
@@ -1069,12 +1068,8 @@ def ingest_document(
                     "content_type": "tabular",
                 })
 
-        except Exception as e:
-
-            print(
-                f"[Ingest] CSV processing failed "
-                f"for {filename}: {e}"
-            )
+        except Exception:
+            logger.warning("CSV processing failed")
 
             return 0
 
@@ -1084,17 +1079,11 @@ def ingest_document(
 
     if ext in {".csv", ".xlsx", ".xls"}:
 
-        print(
-            f"[Ingest] Total spreadsheet/CSV chunks ready "
-            f"to embed and save: {len(chunks_to_add)}"
-        )
+        logger.debug("Prepared %d tabular chunks for embedding", len(chunks_to_add))
 
         if not chunks_to_add:
 
-            print(
-                f"[Ingest] Error: no chunks generated "
-                f"for {filename}"
-            )
+            logger.warning("No chunks were generated for a tabular upload")
 
             return 0
 
@@ -1140,10 +1129,7 @@ def ingest_document(
         db.add_all(db_chunks)
         db.commit()
 
-        print(
-            f"[Ingest] Successfully committed "
-            f"{len(db_chunks)} chunks for {filename}"
-        )
+        logger.info("Committed %d tabular chunks", len(db_chunks))
 
         return len(db_chunks)
 
@@ -1212,10 +1198,7 @@ def ingest_document(
     db.add_all(db_chunks)
     db.commit()
 
-    print(
-        f"[Ingest] Successfully committed "
-        f"{len(db_chunks)} text chunks for {filename}"
-    )
+    logger.info("Committed %d text chunks", len(db_chunks))
 
     return len(db_chunks)
 

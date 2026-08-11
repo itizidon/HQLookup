@@ -1,15 +1,31 @@
-'use client';
+"use client";
 
-import { useState, useEffect } from 'react';
-import { Plus, Loader2, Building2, X, ShieldAlert, ChevronDown } from 'lucide-react';
-import Navbar from '@/components/Navbar';
-import MetricCard from '@/components/MetricCard';
-import { useRouter } from 'next/navigation';
-import { useBusiness } from '@/app/context/BusinessContext';
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import {
+  Building2,
+  ChevronDown,
+  Loader2,
+  Plus,
+  ShieldAlert,
+  X,
+} from "lucide-react";
+import Navbar from "@/components/Navbar";
+import MetricCard from "@/components/MetricCard";
+import {
+  type Business,
+  useBusiness,
+} from "@/app/context/BusinessContext";
+import {
+  apiRequest,
+  getErrorMessage,
+  isAbortError,
+} from "@/lib/api";
 
-interface Org {
+interface Organization {
   id: number;
   name: string;
+  owner_id: number;
   is_active: boolean;
 }
 
@@ -37,453 +53,392 @@ interface WorkspaceMetrics {
   businesses: BusinessMetric[];
 }
 
-// Helper function to extract initials from a full name (e.g., "Don Ng" -> "DN")
-const getInitials = (name: string) => {
-  if (!name) return 'DN';
-  const parts = name.trim().split(/\s+/);
-  
-  if (parts.length >= 2) {
-    return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
-  }
-  
-  return parts[0][0].toUpperCase();
+type MetricsSnapshot = {
+  orgId: number;
+  data: WorkspaceMetrics;
 };
+
+function getInitials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "U";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0]}${parts.at(-1)?.[0] ?? ""}`.toUpperCase();
+}
+
+function percent(used: number, allowed: number): number {
+  if (allowed <= 0) return used > 0 ? 100 : 0;
+  return Math.min(Math.max(Math.round((used / allowed) * 100), 0), 100);
+}
 
 export default function AdminDashboard() {
   const router = useRouter();
-  const { businesses, selectBusiness, isLoading, refreshBusinesses } = useBusiness();
+  const {
+    businesses,
+    selectBusiness,
+    isLoading: isLoadingBusinesses,
+    refreshBusinesses,
+  } = useBusiness();
 
-  const [organizations, setOrganizations] = useState<Org[]>([]);
+  const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [currentOrgId, setCurrentOrgId] = useState<number | null>(null);
-  const [isLoadingOrgs, setIsLoadingOrgs] = useState(true);
-
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [isLoadingPage, setIsLoadingPage] = useState(true);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [metricsSnapshot, setMetricsSnapshot] =
+    useState<MetricsSnapshot | null>(null);
+
   const [isOrgModalOpen, setIsOrgModalOpen] = useState(false);
   const [orgName, setOrgName] = useState("");
   const [isCreatingOrg, setIsCreatingOrg] = useState(false);
   const [orgError, setOrgError] = useState<string | null>(null);
-
-  const [isMounted, setIsMounted] = useState(false);
 
   const [isBizModalOpen, setIsBizModalOpen] = useState(false);
   const [bizName, setBizName] = useState("");
   const [isCreatingBiz, setIsCreatingBiz] = useState(false);
   const [bizError, setBizError] = useState<string | null>(null);
 
-  const [metricsData, setMetricsData] = useState<WorkspaceMetrics | null>(null);
-  const [, setIsLoadingMetrics] = useState(false);
-
-  // Fetch granular metrics whenever the user switches organizations
   useEffect(() => {
-    if (!currentOrgId) return;
+    const controller = new AbortController();
 
-    const fetchWorkspaceMetrics = async () => {
-      setIsLoadingMetrics(true);
+    async function loadPage() {
       try {
-        const res = await fetch(`http://localhost:8000/auth/usage-metrics?org_id=${currentOrgId}`, {
-          method: "GET",
-          credentials: "include",
-        });
-        if (res.ok) {
-          const data = await res.json();
-          setMetricsData(data);
-        }
-      } catch (err) {
-        console.error("Failed to fetch location usage bounds:", err);
+        const [profile, organizationList] = await Promise.all([
+          apiRequest<UserProfile>("/auth/me", { signal: controller.signal }),
+          apiRequest<Organization[]>("/organizations", {
+            signal: controller.signal,
+          }),
+        ]);
+
+        if (controller.signal.aborted) return;
+        setUserProfile(profile);
+        setOrganizations(organizationList);
+        setCurrentOrgId(organizationList[0]?.id ?? null);
+      } catch (caughtError) {
+        if (isAbortError(caughtError)) return;
+        setPageError(
+          getErrorMessage(caughtError, "Could not load your dashboard."),
+        );
       } finally {
-        setIsLoadingMetrics(false);
+        if (!controller.signal.aborted) setIsLoadingPage(false);
       }
-    };
+    }
 
-    fetchWorkspaceMetrics();
-  }, [currentOrgId]);
-
-  useEffect(() => {
-    const fetchUserDataAndWorkspaces = async () => {
-      try {
-        const userRes = await fetch("http://localhost:8000/auth/me", {
-          method: "GET",
-          credentials: "include",
-        });
-        if (userRes.ok) {
-          const userData = await userRes.json();
-          setUserProfile(userData);
-        }
-
-        const orgRes = await fetch("http://localhost:8000/organizations", {
-          method: "GET",
-          credentials: "include",
-        });
-        if (!orgRes.ok) throw new Error();
-        const orgData = await orgRes.json();
-        setOrganizations(orgData);
-        if (orgData.length > 0) {
-          setCurrentOrgId(orgData[0].id);
-        }
-      } catch (err) {
-        console.error("Failed to retrieve organizational framework snapshot", err);
-      } finally {
-        setIsLoadingOrgs(false);
-      }
-    };
-
-    fetchUserDataAndWorkspaces();
-    setIsMounted(true);
+    void loadPage();
+    return () => controller.abort();
   }, []);
 
-  const userPlanKey = userProfile?.plan?.toLowerCase() || 'free';
-  const userInitials = getInitials(userProfile?.name || '');
+  useEffect(() => {
+    if (!currentOrgId) return;
+    const orgId = currentOrgId;
+    const controller = new AbortController();
 
-  const maxOrganizationsAllowed = userProfile?.max_organizations ?? 1;
-  const isOrgLimitReached = organizations.length >= maxOrganizationsAllowed;
+    async function loadMetrics() {
+      try {
+        const data = await apiRequest<WorkspaceMetrics>(
+          `/auth/usage-metrics?org_id=${orgId}`,
+          { signal: controller.signal },
+        );
+        if (!controller.signal.aborted) {
+          setMetricsSnapshot({ orgId, data });
+        }
+      } catch (caughtError) {
+        if (!isAbortError(caughtError)) {
+          setPageError(
+            getErrorMessage(caughtError, "Could not load workspace usage."),
+          );
+        }
+      }
+    }
 
-  const maxBusinessesAllowed = userProfile?.max_businesses ?? 1;
-  const filteredBusinesses = businesses.filter(
-    b => b.org_id?.toString() === currentOrgId?.toString()
+    void loadMetrics();
+    return () => controller.abort();
+  }, [currentOrgId]);
+
+  const currentOrganization = organizations.find(
+    (organization) => organization.id === currentOrgId,
   );
-  const isBizLimitReached = filteredBusinesses.length >= maxBusinessesAllowed;
+  const filteredBusinesses = useMemo(
+    () => businesses.filter((business) => business.org_id === currentOrgId),
+    [businesses, currentOrgId],
+  );
+  const metricsData =
+    metricsSnapshot?.orgId === currentOrgId ? metricsSnapshot.data : null;
+  const plan = userProfile?.plan?.toLowerCase() || "free";
+  const maxOrganizationsAllowed = userProfile?.max_organizations ?? 1;
+  const maxBusinessesAllowed = userProfile?.max_businesses ?? 1;
+  const isOrgLimitReached =
+    organizations.length >= maxOrganizationsAllowed;
+  const isBizLimitReached =
+    filteredBusinesses.length >= maxBusinessesAllowed;
 
-  const handleCreateOrganization = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!orgName.trim() || isOrgLimitReached) return;
+  async function handleCreateOrganization(event: React.FormEvent) {
+    event.preventDefault();
+    const name = orgName.trim();
+    if (!name || isOrgLimitReached) return;
+
     setIsCreatingOrg(true);
     setOrgError(null);
     try {
-      const res = await fetch("http://localhost:8000/organizations", {
+      const organization = await apiRequest<Organization>("/organizations", {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: orgName }),
+        body: JSON.stringify({ name }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Could not instantiate an organization.");
-      setOrganizations(prev => [...prev, data]);
-      setCurrentOrgId(data.id);
-      setIsOrgModalOpen(false);
+      setOrganizations((current) => [...current, organization]);
+      setCurrentOrgId(organization.id);
       setOrgName("");
-    } catch (err: any) {
-      setOrgError(err.message || "An unhandled server anomaly occurred.");
+      setIsOrgModalOpen(false);
+    } catch (caughtError) {
+      setOrgError(
+        getErrorMessage(caughtError, "Could not create the organization."),
+      );
     } finally {
       setIsCreatingOrg(false);
     }
-  };
+  }
 
-  const handleCreateBusiness = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!bizName.trim() || !currentOrgId || isBizLimitReached) return;
+  async function handleCreateBusiness(event: React.FormEvent) {
+    event.preventDefault();
+    const name = bizName.trim();
+    if (!name || !currentOrgId || isBizLimitReached) return;
 
     setIsCreatingBiz(true);
     setBizError(null);
-
     try {
-      const res = await fetch("http://localhost:8000/businesses", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: bizName,
-          org_id: currentOrgId
-        }),
-      });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.detail || "Could not spin up a new business asset.");
-      }
-
-      if (refreshBusinesses && currentOrgId) {
-        await refreshBusinesses([currentOrgId]);
-      } else {
-        window.location.reload();
-      }
-
-      setIsBizModalOpen(false);
+      const created = await apiRequest<{ id: number; name: string }>(
+        "/businesses",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, org_id: currentOrgId }),
+        },
+      );
+      const refreshed = await refreshBusinesses(
+        organizations.map((organization) => organization.id),
+      );
+      const createdBusiness =
+        refreshed.find((business) => business.id === created.id) ?? {
+          ...created,
+          org_id: currentOrgId,
+        };
+      selectBusiness(createdBusiness);
       setBizName("");
-    } catch (err: any) {
-      setBizError(err.message || "An error occurred while creating the business.");
+      setIsBizModalOpen(false);
+    } catch (caughtError) {
+      setBizError(
+        getErrorMessage(caughtError, "Could not create the business."),
+      );
     } finally {
       setIsCreatingBiz(false);
     }
-  };
+  }
 
-  const handleManageBusinessRedirect = (biz: any) => {
-    selectBusiness(biz);
-    if (currentOrgId) {
-      router.push(`/businesses?orgId=${currentOrgId}&bizId=${biz.id}`);
-    } else {
-      router.push(`/businesses?orgId=${biz.org_id}&bizId=${biz.id}`);
-    }
-  };
+  function openSearch(business: Business) {
+    selectBusiness(business);
+    router.push(`/search?orgId=${business.org_id}&bizId=${business.id}`);
+  }
+
+  function manageBusiness(business: Business) {
+    selectBusiness(business);
+    router.push(`/businesses?orgId=${business.org_id}&bizId=${business.id}`);
+  }
 
   return (
-    <div className="screen" style={{ position: 'relative', overflowX: 'hidden' }}>
-      <Navbar avatarInitials={userInitials} />
-      <div style={{ padding: '24px' }}>
+    <div className="screen" style={{ overflowX: "hidden", position: "relative" }}>
+      <Navbar avatarInitials={getInitials(userProfile?.name ?? "")} />
+      <main style={{ padding: "24px" }}>
+        {pageError && (
+          <div role="alert" style={styles.pageError}>
+            {pageError}
+          </div>
+        )}
 
-        {/* Title & Action Buttons Header */}
-        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', marginBottom: '20px', justifyContent: 'space-between', gap: '12px' }}>
+        <div style={styles.header}>
           <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', position: 'relative' }}>
-              {isLoadingOrgs ? (
-                <div style={{ height: '24px', display: 'flex', alignItems: 'center' }}>
-                  <Loader2 className="animate-spin" size={14} style={{ color: 'var(--color-text-secondary)' }} />
-                </div>
-              ) : (
-                <div style={s.dropdownContainer}>
-                  <select
-                    value={currentOrgId ?? ""}
-                    onChange={(e) => {
-                      const newOrgId = Number(e.target.value);
-                      setCurrentOrgId(newOrgId);
-
-                      const alreadyLoaded = businesses.some(b => b.org_id === newOrgId);
-                      if (!alreadyLoaded && refreshBusinesses) {
-                        refreshBusinesses([newOrgId]);
-                      }
-                    }}
-                    style={s.orgSelect}
-                  >
-                    {organizations.map(org => (
-                      <option key={org.id} value={org.id}>{org.name}</option>
-                    ))}
-                  </select>
-                  <ChevronDown size={14} style={s.dropdownIcon} />
-                </div>
-              )}
-            </div>
-            <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)', marginTop: '4px' }}>
-              Manage locations, documents, and users
-            </div>
+            {isLoadingPage ? (
+              <Loader2 className="animate-spin" size={18} aria-label="Loading organizations" />
+            ) : organizations.length > 0 ? (
+              <div style={styles.dropdownContainer}>
+                <label htmlFor="organization" className="sr-only">
+                  Organization
+                </label>
+                <select
+                  id="organization"
+                  value={currentOrgId ?? ""}
+                  onChange={(event) => setCurrentOrgId(Number(event.target.value))}
+                  style={styles.orgSelect}
+                >
+                  {organizations.map((organization) => (
+                    <option key={organization.id} value={organization.id}>
+                      {organization.name}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown size={14} aria-hidden="true" style={styles.dropdownIcon} />
+              </div>
+            ) : (
+              <h1 style={{ fontSize: "18px", fontWeight: 500, margin: 0 }}>
+                Create your first organization
+              </h1>
+            )}
+            <p style={styles.subtitle}>Manage locations, documents, and users</p>
           </div>
 
-          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-            {/* New Org Button */}
-            <div style={{ position: 'relative', display: 'inline-block' }} className="group">
+          <div style={styles.actions}>
+            <div className="group" style={{ display: "inline-block", position: "relative" }}>
               <button
-                className="btn btn-secondary"
+                type="button"
+                className="btn"
                 onClick={() => setIsOrgModalOpen(true)}
-                disabled={isOrgLimitReached}
-                style={{
-                  fontSize: '13px',
-                  opacity: isOrgLimitReached ? 0.5 : 1,
-                  cursor: isOrgLimitReached ? 'not-allowed' : 'pointer'
-                }}
+                disabled={isOrgLimitReached || isLoadingPage}
+                title={isOrgLimitReached ? "Your plan organization limit has been reached." : undefined}
               >
-                <Plus size={14} /> New organization
+                <Plus size={14} aria-hidden="true" /> New organization
               </button>
-
-              {isOrgLimitReached && (
-                <div className="group-hover:block hidden" style={s.tooltip}>
-                  Your current account profile tier ({userPlanKey.toUpperCase()}) is restricted to {maxOrganizationsAllowed} organization workspace.
-                  <div style={s.tooltipArrow} />
-                </div>
-              )}
             </div>
-
-            {/* New Business Button */}
-            <div style={{ position: 'relative', display: 'inline-block' }} className="group">
-              <button
-                className="btn btn-primary"
-                style={{
-                  fontSize: '13px',
-                  opacity: (isMounted ? !currentOrgId : false) || isBizLimitReached ? 0.5 : 1,
-                  cursor: (isMounted ? !currentOrgId : false) || isBizLimitReached ? 'not-allowed' : 'pointer'
-                }}
-                onClick={() => setIsBizModalOpen(true)}
-                disabled={(isMounted ? !currentOrgId : false) || isBizLimitReached}
-              >
-                <Plus size={14} /> New business
-              </button>
-
-              {isBizLimitReached && (
-                <div className="group-hover:block hidden" style={s.tooltip}>
-                  Your current account profile tier ({userPlanKey.toUpperCase()}) is restricted to {maxBusinessesAllowed} connected database {maxBusinessesAllowed === 1 ? 'workspace' : 'workspaces'}.
-                  <div style={s.tooltipArrow} />
-                </div>
-              )}
-            </div>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => setIsBizModalOpen(true)}
+              disabled={!currentOrgId || isBizLimitReached || isLoadingPage}
+              title={
+                isBizLimitReached
+                  ? "Your plan business limit has been reached."
+                  : !currentOrgId
+                    ? "Create an organization first."
+                    : undefined
+              }
+            >
+              <Plus size={14} aria-hidden="true" /> New business
+            </button>
           </div>
         </div>
 
-        {/* Workspace Grid Cards (Fixed 3-Column Layout) */}
-        {isLoading ? (
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '160px' }}>
-            <Loader2 className="animate-spin" size={18} />
+        {isLoadingBusinesses ? (
+          <div style={styles.loadingArea} role="status">
+            <Loader2 className="animate-spin" size={18} aria-hidden="true" />
+            Loading businesses…
+          </div>
+        ) : filteredBusinesses.length === 0 ? (
+          <div style={styles.emptyState}>
+            <Building2 size={28} aria-hidden="true" />
+            <p style={{ margin: 0 }}>
+              {currentOrganization
+                ? `${currentOrganization.name} does not have any businesses yet.`
+                : "Create an organization, then add its first business."}
+            </p>
           </div>
         ) : (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '20px' }}>
-            {filteredBusinesses.map((biz) => {
-              const match = metricsData?.businesses?.find((b: any) => b.id === biz.id);
-              const bizUsage = match?.usage ?? 0;
-              const bizAlloc = match?.allocation ?? 25;
-              const bizPercent = Math.min(Math.round((bizUsage / bizAlloc) * 100), 100);
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3" style={{ marginBottom: "20px" }}>
+            {filteredBusinesses.map((business) => {
+              const businessMetrics = metricsData?.businesses.find(
+                (metric) => metric.id === business.id,
+              );
+              const used = businessMetrics?.usage ?? 0;
+              const allocated = businessMetrics?.allocation ?? 25;
+              const usagePercent = percent(used, allocated);
 
               return (
-                <div className="card" key={biz.id}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
-                    <div style={{ fontSize: '14px', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      <Building2 size={14} style={{ color: 'var(--color-text-secondary)', flexShrink: 0 }} />
-                      {biz.name}
+                <article className="card" key={business.id}>
+                  <div style={styles.cardHeader}>
+                    <div style={styles.businessName}>
+                      <Building2 size={14} aria-hidden="true" style={{ flexShrink: 0 }} />
+                      {business.name}
                     </div>
                     <span className="badge badge-success">Active</span>
                   </div>
-
-                  {/* Allocation Progress Bar */}
-                  <div style={{ margin: '12px 0 6px 0' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--color-text-secondary)', marginBottom: '4px' }}>
-                      <span>Branch Allocation</span>
-                      <span>{bizUsage} / {bizAlloc} queries</span>
+                  <div style={{ margin: "12px 0 6px" }}>
+                    <div style={styles.allocationLabel}>
+                      <span>Branch allocation</span>
+                      <span>{used} / {allocated} queries</span>
                     </div>
-                    <div style={{ width: '100%', height: '6px', background: 'var(--color-background-secondary, #e4e4e7)', borderRadius: '3px', overflow: 'hidden' }}>
+                    <div className="progress-bar">
                       <div
+                        className="progress-fill"
                         style={{
-                          width: `${bizPercent}%`,
-                          height: '100%',
-                          background: bizPercent > 85 ? '#ef4444' : 'var(--color-primary, #4f46e5)',
-                          transition: 'width 0.3s ease'
+                          background: usagePercent > 85 ? "var(--color-text-danger)" : undefined,
+                          width: `${usagePercent}%`,
                         }}
                       />
                     </div>
                   </div>
-
-                  {/* Action Buttons Layout */}
-                  <div style={{ display: 'flex', flexDirection: 'row', gap: '6px', marginTop: '12px' }}>
-                    <button
-                      className="btn btn-primary"
-                      style={{ width: '100%', justifyContent: 'center', fontSize: '13px' }}
-                      onClick={() => {
-                        selectBusiness(biz);
-                        const orgIdToUse = currentOrgId || biz.org_id;
-                        router.push(`/search?orgId=${orgIdToUse}&bizId=${biz.id}`);
-                      }}
-                    >
-                      Open Search
+                  <div className="mt-3 flex gap-2">
+                    <button type="button" className="btn btn-primary flex-1 justify-center" onClick={() => openSearch(business)}>
+                      Open search
                     </button>
-
-                    <button
-                      className="btn btn-secondary"
-                      style={{
-                        width: '100%',
-                        justifyContent: 'center',
-                        fontSize: '12px',
-                        borderStyle: 'dashed'
-                      }}
-                      onClick={() => handleManageBusinessRedirect(biz)}
-                    >
-                      Manage Business
+                    <button type="button" className="btn flex-1 justify-center" onClick={() => manageBusiness(business)}>
+                      Manage
                     </button>
                   </div>
-                </div>
+                </article>
               );
             })}
           </div>
         )}
 
-        {/* Global Performance Metrics (Fixed 3-Column Layout) */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' }}>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           {metricsData?.is_owner ? (
             <MetricCard
               label="Account usage this month"
-              value={String(metricsData.total_combined_usage)}
-              subtext={`${metricsData.total_combined_usage} / ${metricsData.max_queries_allowed} total pool queries · ${userPlanKey.toUpperCase()} plan`}
-              progressPercentage={Math.min(Math.round((metricsData.total_combined_usage / metricsData.max_queries_allowed) * 100), 100)}
+              value={metricsData.total_combined_usage}
+              subtext={`${metricsData.total_combined_usage} / ${metricsData.max_queries_allowed} total queries · ${plan.toUpperCase()} plan`}
+              progressPercentage={percent(metricsData.total_combined_usage, metricsData.max_queries_allowed)}
             />
           ) : (
             <MetricCard
               label="Your searches this month"
-              value={String(metricsData?.personal_user_usage ?? 0)}
-              subtext="Queries executed by your personal seat profile"
+              value={metricsData?.personal_user_usage ?? 0}
+              subtext="Queries executed by your account"
             />
           )}
-
           <MetricCard
-            label="Total active instances"
-            value={String(filteredBusinesses.length)}
-            subtext={`Connected locations (${filteredBusinesses.length} / ${maxBusinessesAllowed})`}
+            label="Active businesses"
+            value={filteredBusinesses.length}
+            subtext={`${filteredBusinesses.length} / ${maxBusinessesAllowed} allowed`}
           />
         </div>
-      </div>
+      </main>
 
-      {/* ── BUSINESS INLINE MODAL WINDOW ── */}
       {isBizModalOpen && (
-        <div style={s.modalOverlay}>
-          <div style={s.modalContent}>
-            <div style={s.modalHeader}>
-              <div style={{ fontSize: '15px', fontWeight: 600 }}>
-                Create New Business
-              </div>
-              <button onClick={() => { setIsBizModalOpen(false); setBizError(null); }} style={s.closeBtn}>
-                <X size={16} />
+        <div style={styles.modalOverlay} role="presentation">
+          <div role="dialog" aria-modal="true" aria-labelledby="business-modal-title" style={styles.modalContent}>
+            <div style={styles.modalHeader}>
+              <h2 id="business-modal-title" style={styles.modalTitle}>Create new business</h2>
+              <button type="button" aria-label="Close" onClick={() => { setIsBizModalOpen(false); setBizError(null); }} style={styles.closeButton}>
+                <X size={16} aria-hidden="true" />
               </button>
             </div>
-
-            <form onSubmit={handleCreateBusiness} style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              <div>
-                <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', display: 'block', marginBottom: '4px' }}>
-                  ASSIGN TO ORGANIZATION
-                </label>
-                <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
-                  <select
-                    value={currentOrgId ?? ""}
-                    onChange={(e) => setCurrentOrgId(Number(e.target.value))}
-                    disabled={isCreatingBiz}
-                    style={{
-                      ...s.modalInput,
-                      marginTop: 0,
-                      appearance: 'none',
-                      WebkitAppearance: 'none',
-                      paddingRight: '28px',
-                      backgroundColor: 'var(--color-background-secondary, #f4f4f5)',
-                      cursor: isCreatingBiz ? 'not-allowed' : 'pointer'
-                    }}
-                  >
-                    {organizations.map(org => (
-                      <option key={org.id} value={org.id}>{org.name}</option>
-                    ))}
-                  </select>
-                  <ChevronDown size={14} style={{ position: 'absolute', right: '10px', pointerEvents: 'none', color: 'var(--color-text-secondary)' }} />
-                </div>
-              </div>
-
-              <div>
-                <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', display: 'block', marginBottom: '4px' }}>
-                  BUSINESS LOCATION NAME
-                </label>
-                <input
-                  type="text"
-                  value={bizName}
-                  onChange={(e) => setBizName(e.target.value)}
-                  placeholder="e.g. Downtown Branch"
-                  required
-                  autoFocus
-                  disabled={isCreatingBiz}
-                  style={s.modalInput}
-                />
-              </div>
-
-              {bizError && (
-                <div style={s.errorAlert}>
-                  <ShieldAlert size={14} style={{ flexShrink: 0, marginTop: '1px' }} />
-                  <span style={{ fontSize: '11px', lineHeight: '1.4' }}>{bizError}</span>
-                </div>
-              )}
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '8px' }}>
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  onClick={() => { setIsBizModalOpen(false); setBizError(null); }}
-                  disabled={isCreatingBiz}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="btn btn-primary"
-                  disabled={isCreatingBiz || !bizName.trim()}
-                >
-                  {isCreatingBiz ? <Loader2 className="animate-spin" size={14} /> : "Create Business"}
+            <form onSubmit={handleCreateBusiness} style={styles.modalForm}>
+              <label htmlFor="business-organization" style={styles.label}>Organization</label>
+              <select
+                id="business-organization"
+                value={currentOrgId ?? ""}
+                onChange={(event) => setCurrentOrgId(Number(event.target.value))}
+                disabled={isCreatingBiz}
+                style={styles.modalInput}
+              >
+                {organizations.map((organization) => (
+                  <option key={organization.id} value={organization.id}>{organization.name}</option>
+                ))}
+              </select>
+              <label htmlFor="business-name" style={styles.label}>Business name</label>
+              <input
+                id="business-name"
+                type="text"
+                value={bizName}
+                onChange={(event) => setBizName(event.target.value)}
+                maxLength={120}
+                required
+                autoFocus
+                disabled={isCreatingBiz}
+                style={styles.modalInput}
+              />
+              {bizError && <ErrorAlert message={bizError} />}
+              <div style={styles.modalActions}>
+                <button type="button" className="btn" onClick={() => { setIsBizModalOpen(false); setBizError(null); }} disabled={isCreatingBiz}>Cancel</button>
+                <button type="submit" className="btn btn-primary" disabled={isCreatingBiz || !bizName.trim()}>
+                  {isCreatingBiz && <Loader2 className="animate-spin" size={14} aria-hidden="true" />}
+                  {isCreatingBiz ? "Creating…" : "Create business"}
                 </button>
               </div>
             </form>
@@ -491,41 +446,34 @@ export default function AdminDashboard() {
         </div>
       )}
 
-      {/* ── ORGANIZATION CREATION POPUP WINDOW ── */}
       {isOrgModalOpen && (
-        <div style={s.modalOverlay}>
-          <div style={s.modalContent}>
-            <div style={s.modalHeader}>
-              <div style={{ fontSize: '15px', fontWeight: 600 }}>Create New Organization</div>
-              <button onClick={() => { setIsOrgModalOpen(false); setOrgError(null); }} style={s.closeBtn}>
-                <X size={16} />
+        <div style={styles.modalOverlay} role="presentation">
+          <div role="dialog" aria-modal="true" aria-labelledby="organization-modal-title" style={styles.modalContent}>
+            <div style={styles.modalHeader}>
+              <h2 id="organization-modal-title" style={styles.modalTitle}>Create new organization</h2>
+              <button type="button" aria-label="Close" onClick={() => { setIsOrgModalOpen(false); setOrgError(null); }} style={styles.closeButton}>
+                <X size={16} aria-hidden="true" />
               </button>
             </div>
-            <form onSubmit={handleCreateOrganization} style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              <div>
-                <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', display: 'block', marginBottom: '4px' }}>
-                  ORGANIZATION WORKSPACE NAME
-                </label>
-                <input
-                  type="text"
-                  value={orgName}
-                  onChange={(e) => setOrgName(e.target.value)}
-                  placeholder="e.g. Acme Holdings LLC"
-                  required
-                  disabled={isCreatingOrg}
-                  style={s.modalInput}
-                />
-              </div>
-              {orgError && (
-                <div style={s.errorAlert}>
-                  <ShieldAlert size={14} style={{ flexShrink: 0, marginTop: '1px' }} />
-                  <span style={{ fontSize: '11px', lineHeight: '1.4' }}>{orgError}</span>
-                </div>
-              )}
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '8px' }}>
-                <button type="button" className="btn btn-secondary" onClick={() => { setIsOrgModalOpen(false); setOrgError(null); }} disabled={isCreatingOrg}>Cancel</button>
+            <form onSubmit={handleCreateOrganization} style={styles.modalForm}>
+              <label htmlFor="organization-name" style={styles.label}>Organization name</label>
+              <input
+                id="organization-name"
+                type="text"
+                value={orgName}
+                onChange={(event) => setOrgName(event.target.value)}
+                maxLength={120}
+                required
+                autoFocus
+                disabled={isCreatingOrg}
+                style={styles.modalInput}
+              />
+              {orgError && <ErrorAlert message={orgError} />}
+              <div style={styles.modalActions}>
+                <button type="button" className="btn" onClick={() => { setIsOrgModalOpen(false); setOrgError(null); }} disabled={isCreatingOrg}>Cancel</button>
                 <button type="submit" className="btn btn-primary" disabled={isCreatingOrg || !orgName.trim()}>
-                  {isCreatingOrg ? <Loader2 className="animate-spin" size={14} /> : "Create Workspace"}
+                  {isCreatingOrg && <Loader2 className="animate-spin" size={14} aria-hidden="true" />}
+                  {isCreatingOrg ? "Creating…" : "Create organization"}
                 </button>
               </div>
             </form>
@@ -536,32 +484,36 @@ export default function AdminDashboard() {
   );
 }
 
-const s: Record<string, React.CSSProperties> = {
-  dropdownContainer: { position: 'relative', display: 'flex', alignItems: 'center' },
-  orgSelect: { fontSize: '18px', fontWeight: 500, background: 'transparent', border: 'none', color: 'var(--color-text-primary, #18181b)', cursor: 'pointer', outline: 'none', paddingRight: '20px', appearance: 'none', WebkitAppearance: 'none' },
-  dropdownIcon: { position: 'absolute', right: 0, pointerEvents: 'none', color: 'var(--color-text-secondary, #71717a)' },
-  modalOverlay: { position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', backgroundColor: 'rgba(0, 0, 0, 0.4)', backdropFilter: 'blur(2px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000, padding: '16px' },
-  modalContent: { background: 'var(--color-background-primary, #ffffff)', border: '1px solid var(--color-border-tertiary, #e4e4e7)', borderRadius: '12px', width: '100%', maxWidth: '400px', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)', display: 'flex', flexDirection: 'column' },
-  modalHeader: { padding: '16px', borderBottom: '1px solid var(--color-border-tertiary, #e4e4e7)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
-  modalInput: { width: '100%', padding: '8px 12px', fontSize: '13px', borderRadius: '6px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', background: 'transparent', color: 'var(--color-text-primary, #18181b)', outline: 'none', marginTop: '4px' },
-  errorAlert: { display: 'flex', gap: '8px', alignItems: 'flex-start', padding: '10px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', border: '1px solid #fee2e2', color: '#ef4444' },
-  closeBtn: { background: 'none', border: 'none', color: 'var(--color-text-secondary, #71717a)', cursor: 'pointer', padding: '4px', display: 'flex', alignItems: 'center' },
-  tooltip: {
-    position: 'absolute',
-    bottom: '135%',
-    right: '0',
-    backgroundColor: '#1f2937',
-    color: '#ffffff',
-    fontSize: '11px',
-    lineHeight: '1.4',
-    padding: '8px 12px',
-    borderRadius: '6px',
-    width: '220px',
-    textAlign: 'center',
-    boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
-    zIndex: 3000,
-    pointerEvents: 'none',
-    display: 'none'
-  },
-  tooltipArrow: { position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)', borderWidth: '5px', borderStyle: 'solid', borderColor: '#1f2937 transparent transparent transparent' },
+function ErrorAlert({ message }: { message: string }) {
+  return (
+    <div role="alert" style={styles.errorAlert}>
+      <ShieldAlert size={14} aria-hidden="true" style={{ flexShrink: 0 }} />
+      <span>{message}</span>
+    </div>
+  );
+}
+
+const styles: Record<string, React.CSSProperties> = {
+  pageError: { background: "var(--color-background-danger)", border: "1px solid var(--color-border-danger)", borderRadius: "6px", color: "var(--color-text-danger)", fontSize: "13px", marginBottom: "16px", padding: "10px 12px" },
+  header: { alignItems: "center", display: "flex", flexWrap: "wrap", gap: "12px", justifyContent: "space-between", marginBottom: "20px" },
+  dropdownContainer: { alignItems: "center", display: "flex", position: "relative" },
+  orgSelect: { appearance: "none", background: "transparent", border: "none", color: "var(--color-text-primary)", cursor: "pointer", fontSize: "18px", fontWeight: 500, outline: "none", paddingRight: "22px" },
+  dropdownIcon: { color: "var(--color-text-secondary)", pointerEvents: "none", position: "absolute", right: 0 },
+  subtitle: { color: "var(--color-text-secondary)", fontSize: "13px", margin: "4px 0 0" },
+  actions: { display: "flex", flexWrap: "wrap", gap: "8px" },
+  loadingArea: { alignItems: "center", display: "flex", gap: "8px", height: "160px", justifyContent: "center" },
+  emptyState: { alignItems: "center", border: "1px dashed var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", color: "var(--color-text-secondary)", display: "flex", flexDirection: "column", gap: "10px", marginBottom: "20px", padding: "36px", textAlign: "center" },
+  cardHeader: { alignItems: "center", display: "flex", justifyContent: "space-between", marginBottom: "10px" },
+  businessName: { alignItems: "center", display: "flex", fontSize: "14px", fontWeight: 500, gap: "6px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  allocationLabel: { color: "var(--color-text-secondary)", display: "flex", fontSize: "11px", justifyContent: "space-between", marginBottom: "4px" },
+  modalOverlay: { alignItems: "center", backdropFilter: "blur(2px)", backgroundColor: "rgba(0,0,0,0.4)", display: "flex", height: "100vh", justifyContent: "center", left: 0, padding: "16px", position: "fixed", top: 0, width: "100vw", zIndex: 2000 },
+  modalContent: { background: "var(--color-background-primary)", border: "1px solid var(--color-border-tertiary)", borderRadius: "12px", boxShadow: "0 20px 25px -5px rgba(0,0,0,0.1)", display: "flex", flexDirection: "column", maxWidth: "400px", width: "100%" },
+  modalHeader: { alignItems: "center", borderBottom: "1px solid var(--color-border-tertiary)", display: "flex", justifyContent: "space-between", padding: "16px" },
+  modalTitle: { fontSize: "15px", fontWeight: 600, margin: 0 },
+  closeButton: { alignItems: "center", background: "none", border: "none", color: "var(--color-text-secondary)", cursor: "pointer", display: "flex", padding: "4px" },
+  modalForm: { display: "flex", flexDirection: "column", gap: "10px", padding: "16px" },
+  label: { color: "var(--color-text-secondary)", fontSize: "11px", fontWeight: 600, textTransform: "uppercase" },
+  modalInput: { background: "transparent", border: "1px solid var(--color-border-tertiary)", borderRadius: "6px", color: "var(--color-text-primary)", fontSize: "13px", outline: "none", padding: "8px 12px", width: "100%" },
+  modalActions: { display: "flex", gap: "8px", justifyContent: "flex-end", marginTop: "8px" },
+  errorAlert: { alignItems: "flex-start", backgroundColor: "var(--color-background-danger)", border: "1px solid var(--color-border-danger)", borderRadius: "6px", color: "var(--color-text-danger)", display: "flex", fontSize: "12px", gap: "8px", padding: "10px 12px" },
 };

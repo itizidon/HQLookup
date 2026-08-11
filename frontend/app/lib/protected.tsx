@@ -1,10 +1,14 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 
-export default async function PrivateLayout({ children }) {
-  const token = (await cookies()).get("token")?.value;
+export default async function ProtectedLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const hasSession = (await cookies()).has("token");
 
-  if (!token) redirect("/auth");
+  if (!hasSession) redirect("/auth");
 
   return <>{children}</>;
 }

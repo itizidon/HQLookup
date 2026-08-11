@@ -19,35 +19,27 @@ Supports:
 All user-facing answers are returned as strings.
 """
 
-import os
 import json
+import logging
 import re
 from typing import List
 
 from openai import OpenAI
-from dotenv import load_dotenv
+from app.settings import settings
 
-
-load_dotenv()
+logger = logging.getLogger(__name__)
 
 
 # ── Client configuration ──────────────────────────────────────────────────────
 
 client = OpenAI(
-    base_url=os.getenv(
-        "LLM_BASE_URL",
-        "http://localhost:11434/v1",
-    ),
-    api_key=os.getenv(
-        "OPENAI_API_KEY",
-        "ollama",
-    ),
+    base_url=settings.llm_base_url,
+    api_key=settings.openai_api_key.get_secret_value(),
+    timeout=settings.llm_timeout_seconds,
+    max_retries=2,
 )
 
-LLM_MODEL = os.getenv(
-    "LLM_MODEL",
-    "mistral:7b",
-)
+LLM_MODEL = settings.llm_model
 
 
 # ── JSON cleanup ──────────────────────────────────────────────────────────────
@@ -548,18 +540,6 @@ def call_openai(
         temperature=0.2,
     )
 
-    print(
-        "\n=== DEBUG: RAW LLM RESPONSE OBJECT ==="
-    )
-
-    print(
-        response
-    )
-
-    print(
-        "======================================\n"
-    )
-
     content = response.choices[0].message.content
 
     if content is None:
@@ -585,17 +565,7 @@ def parse_llm_json(
 
     except json.JSONDecodeError as exc:
 
-        print(
-            "[LLM WARNING] Failed to parse JSON."
-        )
-
-        print(
-            f"[LLM WARNING] Error: {exc}"
-        )
-
-        print(
-            f"[LLM WARNING] Raw output:\n{raw}"
-        )
+        logger.warning("LLM response was not valid JSON: %s", exc.__class__.__name__)
 
         return {}
 
@@ -603,10 +573,7 @@ def parse_llm_json(
         parsed,
         dict,
     ):
-        print(
-            "[LLM WARNING] "
-            "Parsed response is not a JSON object."
-        )
+        logger.warning("LLM response was not a JSON object")
 
         return {}
 
@@ -630,18 +597,6 @@ def generate_tabular_answer(
         chunks,
     )
 
-    print(
-        "\n=== DEBUG: TABULAR PROMPT SENT TO LLM ==="
-    )
-
-    print(
-        prompt
-    )
-
-    print(
-        "==========================================\n"
-    )
-
     raw = call_openai(
         prompt
     )
@@ -658,11 +613,7 @@ def generate_tabular_answer(
         records,
         list,
     ):
-        print(
-            "[LLM WARNING] "
-            'Tabular response does not contain '
-            'a valid "records" array.'
-        )
+        logger.warning("Tabular LLM response did not contain a valid records array")
 
         return {
             "records": [],
@@ -690,18 +641,6 @@ def generate_text_answer(
         chunks,
     )
 
-    print(
-        "\n=== DEBUG: TEXT PROMPT SENT TO LLM ==="
-    )
-
-    print(
-        prompt
-    )
-
-    print(
-        "=======================================\n"
-    )
-
     raw = call_openai(
         prompt
     )
@@ -718,11 +657,7 @@ def generate_text_answer(
         answers,
         list,
     ):
-        print(
-            "[LLM WARNING] "
-            'Text response does not contain '
-            'a valid "answers" array.'
-        )
+        logger.warning("Text LLM response did not contain a valid answers array")
 
         return {
             "answers": [],

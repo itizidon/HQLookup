@@ -1,97 +1,156 @@
-'use client';
+"use client";
 
-import { useState, useRef, useEffect } from 'react';
-import Link from 'next/link';
-import { FileText, LogOut } from 'lucide-react';
-import { useRouter } from 'next/navigation';
+import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { FileText, Loader2, LogOut } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useBusiness } from "@/app/context/BusinessContext";
+import { ApiError, apiRequest, getErrorMessage } from "@/lib/api";
 
-export default function Navbar({ avatarInitials = 'D' }) {
+export default function Navbar({ avatarInitials = "U" }: { avatarInitials?: string }) {
   const [isOpen, setIsOpen] = useState(false);
+  const [isSigningOut, setIsSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
+  const { resetBusinesses } = useBusiness();
 
-  // Close dropdown when clicking outside
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
-      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+      if (
+        dropdownRef.current &&
+        !dropdownRef.current.contains(event.target as Node)
+      ) {
         setIsOpen(false);
       }
     }
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
+
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") setIsOpen(false);
+    }
+
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleEscape);
+    };
   }, []);
 
-  const handleSignOut = async () => {
+  async function handleSignOut() {
+    setIsSigningOut(true);
+    setSignOutError(null);
+
     try {
-      await fetch('http://localhost:8000/api/auth/logout', {
-        method: 'POST',
-        credentials: 'include',
+      await apiRequest<{ message: string }>("/auth/logout", {
+        method: "POST",
+        redirectOnUnauthorized: false,
       });
-      router.push('/');
-    } catch (err) {
-      console.error('Sign out failed:', err);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        setSignOutError(getErrorMessage(error, "Sign out failed."));
+        setIsSigningOut(false);
+        return;
+      }
     }
-  };
+
+    resetBusinesses();
+    router.replace("/");
+    router.refresh();
+  }
 
   return (
-    <div className="nav" style={{ position: 'relative' }}>
-      <Link href="/dashboard" className="nav-logo" style={{ textDecoration: 'none' }}>
-        <FileText size={18} style={{ color: 'var(--color-text-info)' }} /> HQLookup
+    <nav className="nav" style={{ position: "relative" }} aria-label="Primary">
+      <Link href="/dashboard" className="nav-logo" style={{ textDecoration: "none" }}>
+        <FileText size={18} aria-hidden="true" style={{ color: "var(--color-text-info)" }} />
+        HQLookup
       </Link>
-      
-      <div className="nav-right" style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-        <Link href="/billing" className="nav-link">Billing</Link>
-        
-        {/* Avatar with Dropdown Container */}
-        <div style={{ position: 'relative' }} ref={dropdownRef}>
-          <div 
-            className="avatar" 
-            style={{ cursor: 'pointer', userSelect: 'none' }}
-            onClick={() => setIsOpen(!isOpen)}
+
+      <div className="nav-right" style={{ gap: "16px" }}>
+        <Link href="/billing" className="nav-link">
+          Billing
+        </Link>
+
+        <div style={{ position: "relative" }} ref={dropdownRef}>
+          <button
+            type="button"
+            className="avatar"
+            aria-label="Open account menu"
+            aria-expanded={isOpen}
+            aria-haspopup="menu"
+            onClick={() => {
+              setIsOpen((open) => !open);
+              setSignOutError(null);
+            }}
+            style={{ border: 0, cursor: "pointer", userSelect: "none" }}
           >
             {avatarInitials}
-          </div>
+          </button>
 
           {isOpen && (
-            <div style={{
-              position: 'absolute',
-              top: 'calc(100% + 8px)',
-              right: 0,
-              width: '160px',
-              background: 'var(--color-background-primary, #ffffff)',
-              border: '1px solid var(--color-border-tertiary, #e4e4e7)',
-              borderRadius: 'var(--border-radius-md, 8px)',
-              boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
-              zIndex: 1000,
-              padding: '4px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '2px'
-            }}>
+            <div role="menu" style={styles.menu}>
               <button
                 type="button"
-                onClick={handleSignOut}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '8px',
-                  width: '100%',
-                  textAlign: 'left',
-                  padding: '8px 10px',
-                  fontSize: '13px',
-                  color: '#ef4444',
-                  background: 'transparent',
-                  border: 'none',
-                  borderRadius: '4px',
-                  cursor: 'pointer'
-                }}
+                role="menuitem"
+                onClick={() => void handleSignOut()}
+                disabled={isSigningOut}
+                style={styles.signOutButton}
               >
-                <LogOut size={14} style={{ color: '#ef4444' }} /> Sign out
+                {isSigningOut ? (
+                  <Loader2 className="animate-spin" size={14} aria-hidden="true" />
+                ) : (
+                  <LogOut size={14} aria-hidden="true" />
+                )}
+                {isSigningOut ? "Signing out…" : "Sign out"}
               </button>
+              {signOutError && (
+                <p role="alert" style={styles.error}>
+                  {signOutError}
+                </p>
+              )}
             </div>
           )}
         </div>
       </div>
-    </div>
+    </nav>
   );
 }
+
+const styles: Record<string, React.CSSProperties> = {
+  menu: {
+    background: "var(--color-background-primary)",
+    border: "1px solid var(--color-border-tertiary)",
+    borderRadius: "var(--border-radius-md)",
+    boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
+    display: "flex",
+    flexDirection: "column",
+    gap: "2px",
+    padding: "4px",
+    position: "absolute",
+    right: 0,
+    top: "calc(100% + 8px)",
+    width: "180px",
+    zIndex: 1000,
+  },
+  signOutButton: {
+    alignItems: "center",
+    background: "transparent",
+    border: "none",
+    borderRadius: "4px",
+    color: "var(--color-text-danger)",
+    cursor: "pointer",
+    display: "flex",
+    fontSize: "13px",
+    gap: "8px",
+    padding: "8px 10px",
+    textAlign: "left",
+    width: "100%",
+  },
+  error: {
+    color: "var(--color-text-danger)",
+    fontSize: "11px",
+    lineHeight: 1.4,
+    margin: 0,
+    padding: "4px 10px 6px",
+  },
+};

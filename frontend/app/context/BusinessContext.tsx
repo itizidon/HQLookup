@@ -2,17 +2,19 @@
 
 import {
   createContext,
+  useCallback,
   useContext,
   useReducer,
-  useCallback, // 👈 Added useCallback
-  ReactNode,
+  useRef,
+  type ReactNode,
 } from "react";
+import { apiRequest } from "@/lib/api";
 
-// Update type definition to match your new multi-tenant organization structure
 export type Business = {
   id: number;
   name: string;
   org_id: number;
+  query_allocation?: number;
 };
 
 type State = {
@@ -23,9 +25,9 @@ type State = {
 
 type Action =
   | { type: "SET_BUSINESSES"; payload: Business[] }
-  | { type: "SELECT_BUSINESS"; payload: Business | null } // Allowed null here for clearSelection
-  | { type: "CLEAR_SELECTION" }
-  | { type: "SET_LOADING"; payload: boolean };
+  | { type: "SELECT_BUSINESS"; payload: Business }
+  | { type: "SET_LOADING"; payload: boolean }
+  | { type: "RESET" };
 
 const initialState: State = {
   businesses: [],
@@ -35,103 +37,105 @@ const initialState: State = {
 
 function businessReducer(state: State, action: Action): State {
   switch (action.type) {
-    case "SET_BUSINESSES":
+    case "SET_BUSINESSES": {
+      const selectedBusiness = state.selectedBusiness
+        ? action.payload.find(
+            (business) => business.id === state.selectedBusiness?.id,
+          ) ?? action.payload[0] ?? null
+        : action.payload[0] ?? null;
+
       return {
-        ...state,
         businesses: action.payload,
+        selectedBusiness,
         isLoading: false,
-        // Auto-select the first business if we don't have one selected yet
-        selectedBusiness: state.selectedBusiness || action.payload[0] || null,
       };
+    }
     case "SELECT_BUSINESS":
-      return { ...state, selectedBusiness: action.payload };
-    case "CLEAR_SELECTION":
-      return { ...state, selectedBusiness: null };
+      return state.businesses.some(
+        (business) => business.id === action.payload.id,
+      )
+        ? { ...state, selectedBusiness: action.payload }
+        : state;
     case "SET_LOADING":
       return { ...state, isLoading: action.payload };
-    default:
-      return state;
+    case "RESET":
+      return { ...initialState, isLoading: false };
   }
 }
 
-type BusinessContextType = {
-  businesses: Business[];
-  selectedBusiness: Business | null;
-  isLoading: boolean;
+type RefreshOptions = {
+  signal?: AbortSignal;
+};
+
+type BusinessContextType = State & {
   selectBusiness: (business: Business) => void;
-  clearSelection: () => void;
-  setBusinesses: (businesses: Business[]) => void; // 👈 Expose stable setter
-  setIsLoading: (loading: boolean) => void;        // 👈 Expose stable setter
-  refreshBusinesses: (orgIds: number[]) => Promise<Business[] | undefined>;
+  resetBusinesses: () => void;
+  refreshBusinesses: (
+    orgIds: number[],
+    options?: RefreshOptions,
+  ) => Promise<Business[]>;
 };
 
 const BusinessContext = createContext<BusinessContextType | undefined>(undefined);
 
 export function BusinessProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(businessReducer, initialState);
+  const latestRequest = useRef(0);
 
-  // ✅ Stable Setter 1: Wrapped in useCallback to prevent reference changes
-  const setBusinesses = useCallback((businesses: Business[]) => {
-    dispatch({ type: "SET_BUSINESSES", payload: businesses });
-  }, []);
+  const refreshBusinesses = useCallback(
+    async (orgIds: number[], options: RefreshOptions = {}) => {
+      const requestId = ++latestRequest.current;
+      const uniqueOrgIds = Array.from(new Set(orgIds)).filter(Number.isInteger);
 
-  // ✅ Stable Setter 2: Wrapped in useCallback
-  const setIsLoading = useCallback((loading: boolean) => {
-    dispatch({ type: "SET_LOADING", payload: loading });
-  }, []);
+      if (uniqueOrgIds.length === 0) {
+        dispatch({ type: "SET_BUSINESSES", payload: [] });
+        return [];
+      }
 
-  // ✅ FIX: Wrapped in useCallback with an empty dependency array.
-  // This guarantees its reference NEVER changes, breaking the infinite loop in your Gate's useEffect!
-  const refreshBusinesses = useCallback(async (orgIds: number[]) => {
-    if (!orgIds || orgIds.length === 0) {
-      dispatch({ type: "SET_BUSINESSES", payload: [] });
-      return [];
-    }
+      dispatch({ type: "SET_LOADING", payload: true });
+      try {
+        const data = await apiRequest<{ businesses?: Business[] }>(
+          "/me/businesses",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ org_ids: uniqueOrgIds }),
+            signal: options.signal,
+          },
+        );
+        const businesses = Array.isArray(data.businesses)
+          ? data.businesses
+          : [];
 
-    dispatch({ type: "SET_LOADING", payload: true });
-    try {
-      const res = await fetch("http://localhost:8000/me/businesses", {
-        method: "POST",
-        credentials: "include",
-        headers: { 
-          "Content-Type": "application/json" 
-        },
-        body: JSON.stringify({
-          org_ids: orgIds 
-        }),
-      });
-  
-      if (!res.ok) throw new Error("Could not reconcile business data.");
-      
-      const data = await res.json();
-      const businessesList = data.businesses || [];
-      
-      dispatch({ type: "SET_BUSINESSES", payload: businessesList });
-      return businessesList as Business[];
-    } catch (err) {
-      console.error("Multi-org fetch failed:", err);
-      dispatch({ type: "SET_LOADING", payload: false });
-    }
-  }, []); // 👈 Keeps this function reference static across all renders
+        if (requestId === latestRequest.current) {
+          dispatch({ type: "SET_BUSINESSES", payload: businesses });
+        }
+        return businesses;
+      } catch (error) {
+        if (requestId === latestRequest.current) {
+          dispatch({ type: "SET_LOADING", payload: false });
+        }
+        throw error;
+      }
+    },
+    [],
+  );
 
   const selectBusiness = useCallback((business: Business) => {
     dispatch({ type: "SELECT_BUSINESS", payload: business });
   }, []);
 
-  const clearSelection = useCallback(() => {
-    dispatch({ type: "CLEAR_SELECTION" });
+  const resetBusinesses = useCallback(() => {
+    latestRequest.current += 1;
+    dispatch({ type: "RESET" });
   }, []);
 
   return (
     <BusinessContext.Provider
       value={{
-        businesses: state.businesses,
-        selectedBusiness: state.selectedBusiness,
-        isLoading: state.isLoading,
+        ...state,
         selectBusiness,
-        clearSelection,
-        setBusinesses,
-        setIsLoading,
+        resetBusinesses,
         refreshBusinesses,
       }}
     >
@@ -140,7 +144,7 @@ export function BusinessProvider({ children }: { children: ReactNode }) {
   );
 }
 
-export function useBusiness() {
+export function useBusiness(): BusinessContextType {
   const context = useContext(BusinessContext);
   if (!context) {
     throw new Error("useBusiness must be used within BusinessProvider");

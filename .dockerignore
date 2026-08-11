@@ -1,0 +1,16 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.venv
+venv
+__pycache__
+*.py[cod]
+*.log
+.pytest_cache
+.mypy_cache
+.DS_Store
+chroma_db
+chromadb
+frontend

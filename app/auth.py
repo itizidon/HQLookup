@@ -1,6 +1,6 @@
 # app/auth.py
-from datetime import datetime, timedelta
-import os
+from datetime import datetime, timedelta, timezone
+import uuid
 
 from jose import jwt, JWTError
 from passlib.context import CryptContext
@@ -9,31 +9,51 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import User
+from app.settings import settings
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "CHANGE_THIS_TO_A_LONG_RANDOM_STRING_IN_PRODUCTION")
+SECRET_KEY = settings.jwt_secret_key.get_secret_value()
 ALGORITHM = "HS256"
-TOKEN_EXPIRE_H = 24 * 7  # 1 week
-JWT_COOKIE_SECURE = os.environ.get("JWT_COOKIE_SECURE", "false").lower() == "true"
+TOKEN_EXPIRE_H = settings.jwt_expire_hours
+TOKEN_ISSUER = "hqlookup-api"
+TOKEN_AUDIENCE = "hqlookup-web"
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 # ── UTILS ───────────────────────────────────────────────────────────────────────
 def hash_password(password: str) -> str:
-    password = password[:72]  # truncate
+    validate_password(password)
     return pwd_ctx.hash(password)
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_ctx.verify(plain, hashed)
+    if len(plain.encode("utf-8")) > 72:
+        return False
+    try:
+        return pwd_ctx.verify(plain, hashed)
+    except (TypeError, ValueError):
+        return False
+
+
+def validate_password(password: str) -> None:
+    if len(password) < 12:
+        raise ValueError("Password must be at least 12 characters long")
+    if len(password.encode("utf-8")) > 72:
+        raise ValueError("Password must be at most 72 UTF-8 bytes")
 
 
 def create_token(user_id: int, business_id: int | None = None, expire_hours: int = TOKEN_EXPIRE_H) -> str:
-    expire = datetime.utcnow() + timedelta(hours=expire_hours)
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(hours=expire_hours)
     payload = {
         "sub": str(user_id),
+        "iat": now,
         "exp": expire,
+        "iss": TOKEN_ISSUER,
+        "aud": TOKEN_AUDIENCE,
+        "jti": uuid.uuid4().hex,
+        "type": "access",
     }
     if business_id is not None:
         payload["business_id"] = str(business_id)
@@ -50,13 +70,22 @@ def set_jwt_cookie(response: Response, user_id: int, business_id: int | None = N
         key="token",
         value=token,
         httponly=True,
-        secure=JWT_COOKIE_SECURE,  # only True if using HTTPS in production
-        samesite="lax",
+        secure=settings.jwt_cookie_secure,
+        samesite=settings.jwt_cookie_samesite,
+        domain=settings.jwt_cookie_domain,
+        path="/",
         max_age=TOKEN_EXPIRE_H * 3600,
     )
 
 def remove_jwt_cookie(response: Response):
-    response.delete_cookie("token")
+    response.delete_cookie(
+        "token",
+        domain=settings.jwt_cookie_domain,
+        path="/",
+        secure=settings.jwt_cookie_secure,
+        samesite=settings.jwt_cookie_samesite,
+        httponly=True,
+    )
 
 
 # ── Get current user and optional business_id ─────────────────────
@@ -65,12 +94,19 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> tuple[U
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+            audience=TOKEN_AUDIENCE,
+            issuer=TOKEN_ISSUER,
+            options={"require_sub": True, "require_exp": True},
+        )
         user_id = payload.get("sub")
         business_id = payload.get("business_id")
-        if user_id is None:
+        if payload.get("type") != "access" or not str(user_id).isdigit():
             raise HTTPException(status_code=401, detail="Invalid token")
-    except JWTError:
+    except (JWTError, TypeError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid token")
 
     user = db.query(User).filter(User.id == int(user_id)).first()

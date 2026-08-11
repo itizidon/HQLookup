@@ -1,111 +1,70 @@
-import sys
+"""Explicitly destructive development-only database seed utility."""
+
 import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
-from app.models import Base, User, Business
-from app.auth import hash_password
+from sqlalchemy import text
 
-DATABASE_URL = "postgresql://don:jqh40ybn6P%21@localhost:5432/ragproject"
-engine       = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
+from app.auth import hash_password, validate_password
+from app.database import Base, SessionLocal, engine
+from app.models import Business, Organization, OrgMember, User
+from app.settings import settings
 
 
-def reset_schema():
-    """Drop all tables and extensions, then recreate from scratch."""
-    print("  Dropping all tables...")
-    with engine.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS query_logs    CASCADE;"))
-        conn.execute(text("DROP TABLE IF EXISTS chunks        CASCADE;"))
-        conn.execute(text("DROP TABLE IF EXISTS documents     CASCADE;"))
-        conn.execute(text("DROP TABLE IF EXISTS user_business CASCADE;"))
-        conn.execute(text("DROP TABLE IF EXISTS users         CASCADE;"))
-        conn.execute(text("DROP TABLE IF EXISTS businesses    CASCADE;"))
-    print("  All tables dropped.")
+def _require_development_confirmation() -> tuple[str, str]:
+    if settings.app_env not in {"development", "test"}:
+        raise RuntimeError("The seed utility is disabled outside development and test environments.")
+    if os.getenv("ALLOW_DESTRUCTIVE_DB_RESET") != "I_UNDERSTAND":
+        raise RuntimeError(
+            "Set ALLOW_DESTRUCTIVE_DB_RESET=I_UNDERSTAND to confirm the destructive reset."
+        )
 
-    print("  Enabling pgvector extension...")
-    with engine.begin() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
-    print("  pgvector ready.")
-
-
-def seed():
-    # ── Step 1: Wipe and recreate schema ────────────────────────────────────────
-    reset_schema()
-
-    print("  Creating tables from models...")
-    Base.metadata.create_all(bind=engine)
-    print("  Tables created.")
-
-    # ── Step 2: Seed data ────────────────────────────────────────────────────────
-    db = SessionLocal()
+    email = os.getenv("SEED_ADMIN_EMAIL", "").strip().lower()
+    password = os.getenv("SEED_ADMIN_PASSWORD", "")
+    if not email or "@" not in email:
+        raise RuntimeError("SEED_ADMIN_EMAIL must be configured.")
     try:
-        # ── Businesses ───────────────────────────────────────────────────────────
-        business_names = [
-            "Acme Inc",
-            "Globex Corp",
-            "Umbrella Co",
-            "Stark Industries",
-            "Wayne Enterprises",
-        ]
-        businesses = []
-        for name in business_names:
-            business = Business(name=name)
-            db.add(business)
-            businesses.append(business)
-        db.flush()
-        print(f"  Created {len(businesses)} businesses.")
+        validate_password(password)
+    except ValueError as exc:
+        raise RuntimeError("SEED_ADMIN_PASSWORD does not meet password requirements.") from exc
+    return email, password
 
-        # ── Super admin ──────────────────────────────────────────────────────────
-        super_admin = User(
-            email           = "admin@example.com",
-            name            = "Super Admin",
-            hashed_password = hash_password("supersecret123"),
-            role            = "admin",
+
+def seed() -> None:
+    email, password = _require_development_confirmation()
+
+    Base.metadata.drop_all(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+    Base.metadata.create_all(bind=engine)
+
+    with SessionLocal() as db:
+        admin = User(
+            email=email,
+            name=os.getenv("SEED_ADMIN_NAME", "Development Admin").strip() or "Development Admin",
+            hashed_password=hash_password(password),
+            role="superadmin",
+            plan="free",
         )
-        db.add(super_admin)
+        db.add(admin)
         db.flush()
-        print("  Created super admin: admin@example.com")
 
-        # ── Business owner ───────────────────────────────────────────────────────
-        owner = User(
-            email           = "owner@example.com",
-            name            = "Business Owner",
-            hashed_password = hash_password("ownerpass123"),
-            role            = "user",
+        organization = Organization(
+            name=os.getenv("SEED_ORGANIZATION_NAME", "Development Workspace").strip()
+            or "Development Workspace",
+            owner_id=admin.id,
+            is_active=True,
         )
-        db.add(owner)
+        db.add(organization)
         db.flush()
-        owner.businesses.append(businesses[0])  # Linked to Acme Inc
-        print(f"  Created business owner: owner@example.com → linked to {businesses[0].name}")
-
-        # ── Test user ────────────────────────────────────────────────────────────
-        test_user = User(
-            email           = "test@example.com",
-            name            = "Test User",
-            hashed_password = hash_password("testpass123"),
-            role            = "user",
-        )
-        db.add(test_user)
-        db.flush()
-        test_user.businesses.append(businesses[1])  # Linked to Globex Corp
-        print(f"  Created test user: test@example.com → linked to {businesses[1].name}")
-
+        db.add(OrgMember(org_id=organization.id, user_id=admin.id, role="admin"))
+        db.add(Business(
+            org_id=organization.id,
+            name=os.getenv("SEED_BUSINESS_NAME", "Development Location").strip()
+            or "Development Location",
+        ))
         db.commit()
 
-        print("\nSeed complete.")
-        print("\nTest credentials:")
-        print("  Super Admin    → admin@example.com / supersecret123")
-        print("  Business Owner → owner@example.com / ownerpass123")
-        print("  Test User      → test@example.com  / testpass123")
-
-    except Exception as e:
-        db.rollback()
-        print(f"\nSeed failed: {e}")
-        raise
-    finally:
-        db.close()
+    print("Development database reset and seeded successfully.")
 
 
 if __name__ == "__main__":

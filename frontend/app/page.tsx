@@ -3,19 +3,19 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 
 export default async function Home() {
-  const cookieStore = (await cookies()).get("token")?.value; // 👈 call it
-  console.log(cookieStore);
-  if (cookieStore) {
+  const hasSession = (await cookies()).has("token");
+  if (hasSession) {
     redirect("/search");
   }
   return (
     <div className="flex min-h-full flex-1 flex-col items-center justify-center bg-zinc-50 p-8 font-sans dark:bg-black">
       <main className="w-full max-w-lg rounded-xl border border-zinc-200 bg-white p-10 dark:border-zinc-800 dark:bg-zinc-950">
         <h1 className="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">
-          Business RAG Platform
+          HQLookup
         </h1>
         <p className="mt-3 text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-          Upload documents per business, then query with RAG. Start by signing in.
+          Search documents and spreadsheets across each of your business
+          workspaces. Start by signing in.
         </p>
         <div className="mt-8">
           <Link

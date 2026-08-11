@@ -7,8 +7,7 @@ Requires:
     STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET in .env
     STRIPE_PRICE_IDS map matching your PLAN_CONFIG keys
 """
-import os
-import json
+import logging
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
@@ -19,19 +18,29 @@ from app.database import get_db
 from app.auth import get_current_user
 from app.models import User
 from app.rag import PLAN_CONFIG
+from app.settings import settings
 
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-FRONTEND_URL   = os.getenv("FRONTEND_URL", "http://localhost:3000")
+logger = logging.getLogger(__name__)
+
+stripe.api_key = (
+    settings.stripe_secret_key.get_secret_value()
+    if settings.stripe_secret_key
+    else None
+)
+WEBHOOK_SECRET = (
+    settings.stripe_webhook_secret.get_secret_value()
+    if settings.stripe_webhook_secret
+    else None
+)
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
 # ── Stripe Price ID map ────────────────────────────────────────────────────────
 # Set these in your .env or replace with your actual Stripe price IDs.
 # Each key must match a key in PLAN_CONFIG.
-STRIPE_PRICE_IDS: dict[str, str] = {
-    "starter":  os.getenv("STRIPE_PRICE_STARTER",  "price_xxxxx_starter"),
-}
+STRIPE_PRICE_IDS: dict[str, str] = {}
+if settings.stripe_price_starter:
+    STRIPE_PRICE_IDS["starter"] = settings.stripe_price_starter
 
 PAID_PLANS = set(STRIPE_PRICE_IDS.keys())
 
@@ -50,7 +59,8 @@ def _get_or_create_stripe_customer(user: User) -> str:
     if user.stripe_customer_id:
         return user.stripe_customer_id
 
-    customer = stripe.Customer.create(
+    customer = _stripe_call(
+        stripe.Customer.create,
         email=user.email,
         name=user.name,
         metadata={"user_id": str(user.id)},
@@ -58,23 +68,46 @@ def _get_or_create_stripe_customer(user: User) -> str:
     return customer.id
 
 
-def _get_active_subscription(customer_id: str) -> stripe.Subscription | None:
-    subs = stripe.Subscription.list(customer=customer_id, status="active", limit=1)
-    return subs.data[0] if subs.data else None
+def _require_stripe(*, webhook: bool = False) -> None:
+    if not stripe.api_key or (webhook and not WEBHOOK_SECRET):
+        raise HTTPException(status_code=503, detail="Billing is not configured.")
+
+
+def _stripe_call(operation, *args, **kwargs):
+    try:
+        return operation(*args, **kwargs)
+    except stripe.error.StripeError as exc:
+        logger.warning("Stripe API operation failed: %s", exc.__class__.__name__)
+        raise HTTPException(status_code=502, detail="Billing provider is temporarily unavailable.") from exc
+
+
+def _subscription_plan(subscription) -> str | None:
+    items = subscription.get("items", {}).get("data", [])
+    if len(items) != 1:
+        return None
+    price = items[0].get("price")
+    price_id = price.get("id") if hasattr(price, "get") else price
+    return next((plan for plan, configured_id in STRIPE_PRICE_IDS.items() if configured_id == price_id), None)
+
+
+def _subscription_is_entitled(subscription) -> bool:
+    return subscription.get("status") in {"active", "trialing"}
 
 
 def _sync_user_from_subscription(
     db: Session,
     user: User,
     subscription: stripe.Subscription,
-    plan: str,
 ) -> None:
+    plan = _subscription_plan(subscription)
+    if not plan or not _subscription_is_entitled(subscription):
+        raise ValueError("Subscription does not provide a configured active entitlement")
     items = subscription.get("items", {}).get("data", [])
     raw_timestamp = items[0].get("current_period_start") if items else None
     if raw_timestamp:
-        period_start = datetime.fromtimestamp(raw_timestamp, tz=timezone.utc).replace(tzinfo=None)
+        period_start = datetime.fromtimestamp(raw_timestamp, tz=timezone.utc)
     else:
-        period_start = datetime.utcnow()
+        period_start = datetime.now(timezone.utc)
 
     user.plan                        = plan
     user.stripe_subscription_id      = subscription["id"]
@@ -96,6 +129,7 @@ async def create_checkout_session(
     Returns a redirect URL — the frontend should navigate the user there.
     """
     user, _ = current_auth
+    _require_stripe()
 
     if body.plan not in PAID_PLANS:
         raise HTTPException(status_code=400, detail=f"Invalid plan: '{body.plan}'. Choose from {list(PAID_PLANS)}.")
@@ -118,12 +152,13 @@ async def create_checkout_session(
         db.add(user)
         db.commit()
 
-    session = stripe.checkout.Session.create(
+    session = _stripe_call(
+        stripe.checkout.Session.create,
         customer=customer_id,
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_IDS[body.plan], "quantity": 1}],
-        success_url=f"{FRONTEND_URL}/dashboard?checkout=success&plan={body.plan}",
-        cancel_url=f"{FRONTEND_URL}/pricing?checkout=cancelled",
+        success_url=f"{settings.frontend_url}/dashboard?checkout=success&plan={body.plan}",
+        cancel_url=f"{settings.frontend_url}/billing?checkout=cancelled",
         metadata={"user_id": str(user.id), "plan": body.plan},
         subscription_data={
             "metadata": {"user_id": str(user.id), "plan": body.plan},
@@ -146,6 +181,7 @@ async def change_plan(
     Stripe prorates the difference automatically.
     """
     user, _ = current_auth
+    _require_stripe()
 
     if body.new_plan not in PAID_PLANS:
         raise HTTPException(status_code=400, detail=f"Invalid plan: '{body.new_plan}'.")
@@ -159,21 +195,28 @@ async def change_plan(
             detail="No active subscription found. Please subscribe first via /billing/checkout.",
         )
 
-    subscription = stripe.Subscription.retrieve(user.stripe_subscription_id)
+    subscription = _stripe_call(stripe.Subscription.retrieve, user.stripe_subscription_id)
     if subscription.status not in ("active", "trialing"):
         raise HTTPException(status_code=400, detail="Subscription is not active.")
 
     # Stripe requires the subscription item ID to modify the price.
     item_id = subscription["items"]["data"][0]["id"]
 
-    updated = stripe.Subscription.modify(
+    updated = _stripe_call(
+        stripe.Subscription.modify,
         user.stripe_subscription_id,
         items=[{"id": item_id, "price": STRIPE_PRICE_IDS[body.new_plan]}],
         proration_behavior="create_prorations",  # Charge/credit immediately
+        payment_behavior="error_if_incomplete",
         metadata={"plan": body.new_plan},
     )
 
-    _sync_user_from_subscription(db, user, updated, body.new_plan)
+    if _subscription_plan(updated) != body.new_plan:
+        raise HTTPException(status_code=502, detail="Stripe did not apply the requested price.")
+    try:
+        _sync_user_from_subscription(db, user, updated)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Stripe returned an invalid subscription entitlement.") from exc
 
     new_config = PLAN_CONFIG.get(body.new_plan, PLAN_CONFIG["free"])
     return {
@@ -195,11 +238,13 @@ async def cancel_subscription(
     Does NOT immediately revoke access — the webhook handles that on period end.
     """
     user, _ = current_auth
+    _require_stripe()
 
     if not user.stripe_subscription_id:
         raise HTTPException(status_code=400, detail="No active subscription to cancel.")
 
-    subscription = stripe.Subscription.modify(
+    subscription = _stripe_call(
+        stripe.Subscription.modify,
         user.stripe_subscription_id,
         cancel_at_period_end=True,
     )
@@ -226,13 +271,15 @@ async def billing_portal(
     payment method, view invoices, and update billing details.
     """
     user, _ = current_auth
+    _require_stripe()
 
     if not user.stripe_customer_id:
         raise HTTPException(status_code=400, detail="No billing account found.")
 
-    session = stripe.billing_portal.Session.create(
+    session = _stripe_call(
+        stripe.billing_portal.Session.create,
         customer=user.stripe_customer_id,
-        return_url=f"{FRONTEND_URL}/dashboard/settings",
+        return_url=f"{settings.frontend_url}/billing",
     )
 
     return {"portal_url": session.url}
@@ -248,6 +295,7 @@ async def billing_status(
     Frontend can poll this after checkout redirect to confirm activation.
     """
     user, _ = current_auth
+    _require_stripe()
 
     plan       = user.plan or "free"
     config     = PLAN_CONFIG.get(plan, PLAN_CONFIG["free"])
@@ -265,7 +313,7 @@ async def billing_status(
                         items[0]["current_period_end"], tz=timezone.utc
                     ).isoformat()
         except stripe.error.StripeError:
-            pass  # Stripe unreachable — return DB state only
+            logger.warning("Stripe status lookup failed; returning persisted billing state")
 
     return {
         "plan":               plan,
@@ -281,65 +329,48 @@ async def billing_status(
 # ── POST /billing/webhook ──────────────────────────────────────────────────────
 @router.post("/webhook", include_in_schema=False)
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
+    _require_stripe(webhook=True)
     payload   = await request.body()
     sig       = request.headers.get("stripe-signature", "")
 
     try:
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
-    except stripe.error.SignatureVerificationError:
+    except (ValueError, stripe.error.SignatureVerificationError):
         raise HTTPException(status_code=400, detail="Invalid webhook signature.")
 
     event_type = event["type"]
-    
-    # Parse raw JSON once — plain Python dicts, no StripeObject anywhere
-    raw = json.loads(payload)
-    data_obj = raw["data"]["object"]
+    data_obj = event["data"]["object"]
 
     if event_type == "checkout.session.completed":
         metadata = data_obj.get("metadata") or {}
         user_id  = metadata.get("user_id")
-        plan     = metadata.get("plan")
         sub_id   = data_obj.get("subscription")
+        customer_id = data_obj.get("customer")
 
-        print(f"[Webhook] checkout.session.completed — user_id={user_id}, plan={plan}, sub_id={sub_id}")
-
-        if not all([user_id, plan, sub_id]):
+        if not all([user_id, sub_id, customer_id]) or not str(user_id).isdigit():
             return {"received": True}
 
         user = db.query(User).filter(User.id == int(user_id)).first()
-        if not user:
+        if not user or (user.stripe_customer_id and user.stripe_customer_id != customer_id):
             return {"received": True}
 
-        subscription = stripe.Subscription.retrieve(sub_id)
-
-        # current_period_start/end live on the subscription ITEM, not the
-        # subscription itself, as of newer Stripe API versions.
-        sub_item = subscription["items"]["data"][0]
-        period_start = datetime.fromtimestamp(
-            sub_item["current_period_start"], tz=timezone.utc
-        )
-        user.plan                        = plan
-        user.stripe_customer_id          = data_obj.get("customer") or user.stripe_customer_id
-        user.stripe_subscription_id      = sub_id
-        user.stripe_current_period_start = period_start
-        db.add(user)
-        db.commit()
+        subscription = _stripe_call(stripe.Subscription.retrieve, sub_id)
+        if subscription.get("customer") != customer_id:
+            return {"received": True}
+        try:
+            user.stripe_customer_id = customer_id
+            _sync_user_from_subscription(db, user, subscription)
+        except ValueError:
+            logger.warning("Checkout webhook contained no valid entitlement")
 
     elif event_type == "customer.subscription.updated":
-            metadata = data_obj.get("metadata") or {}
-            plan     = metadata.get("plan")
-            sub_id   = data_obj.get("id")
-            user     = db.query(User).filter(User.stripe_subscription_id == sub_id).first()
-
-            if user and plan and plan in PLAN_CONFIG:
-                items = data_obj.get("items", {}).get("data", [])
-                raw_ts = items[0]["current_period_start"] if items else None
-                period_start = (
-                    datetime.fromtimestamp(raw_ts, tz=timezone.utc)
-                    if raw_ts else user.stripe_current_period_start
-                )
-                user.plan                        = plan
-                user.stripe_current_period_start = period_start
+        sub_id = data_obj.get("id")
+        user = db.query(User).filter(User.stripe_subscription_id == sub_id).first()
+        if user:
+            try:
+                _sync_user_from_subscription(db, user, data_obj)
+            except ValueError:
+                user.plan = "free"
                 db.add(user)
                 db.commit()
 
@@ -353,12 +384,14 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
             user.stripe_current_period_start = None
             db.add(user)
             db.commit()
-            print(f"[Webhook] ✓ User {user.id} downgraded to free")
 
     elif event_type == "invoice.payment_failed":
         customer_id = data_obj.get("customer")
         user = db.query(User).filter(User.stripe_customer_id == customer_id).first()
         if user:
-            print(f"[Webhook] Payment failed for user {user.id} ({user.email})")
+            user.plan = "free"
+            db.add(user)
+            db.commit()
+            logger.warning("Stripe payment failure revoked an entitlement")
 
     return {"received": True}

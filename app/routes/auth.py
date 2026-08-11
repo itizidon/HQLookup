@@ -1,8 +1,10 @@
 # app/routes/auth_routes.py
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import List
 
 from app.database import get_db
@@ -13,15 +15,31 @@ from app.auth import (
     set_jwt_cookie,
     remove_jwt_cookie,
     get_current_user,
+    validate_password,
 )
+from app.rate_limit import enforce_rate_limit
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 class SignupRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=120)
     email: EmailStr
-    password: str
+    password: str = Field(min_length=12, max_length=72)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Name is required")
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def check_password(cls, value: str) -> str:
+        validate_password(value)
+        return value
 
 
 class BusinessResponse(BaseModel):
@@ -57,20 +75,27 @@ def build_user_response(user: User) -> UserResponse:
 @router.post("/signup", response_model=UserResponse, status_code=201)
 def signup(
     body: SignupRequest,
+    request: Request,
     response: Response,
     db: Session = Depends(get_db),
 ):
-    if db.query(User).filter(User.email == body.email).first():
+    email = str(body.email).strip().lower()
+    enforce_rate_limit(request, bucket="signup", limit=5, window_seconds=3600)
+    if db.query(User).filter(func.lower(User.email) == email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
 
     user = User(
         name=body.name,
-        email=body.email,
+        email=email,
         hashed_password=hash_password(body.password),
     )
 
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Email already registered") from exc
     db.refresh(user)
 
     set_jwt_cookie(response, user.id)
@@ -80,11 +105,20 @@ def signup(
 
 @router.post("/login", response_model=UserResponse)
 def login(
+    request: Request,
+    response: Response,
     form: OAuth2PasswordRequestForm = Depends(),
-    response: Response = None,
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.email == form.username).first()
+    email = form.username.strip().lower()
+    enforce_rate_limit(
+        request,
+        bucket="login",
+        limit=10,
+        window_seconds=15 * 60,
+        identity=email,
+    )
+    user = db.query(User).filter(func.lower(User.email) == email).first()
 
     if not user or not verify_password(form.password, user.hashed_password):
         raise HTTPException(
@@ -104,5 +138,6 @@ def logout(response: Response):
 
 
 @router.get("/me", response_model=UserResponse)
-def me(current_user: User = Depends(get_current_user)):
-    return build_user_response(current_user)
+def me(current_auth=Depends(get_current_user)):
+    user, _ = current_auth
+    return build_user_response(user)

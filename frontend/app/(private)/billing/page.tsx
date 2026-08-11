@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import Navbar from '@/components/Navbar';
 import MetricCard from '@/components/MetricCard';
 import { Loader2, CreditCard } from 'lucide-react';
+import { apiRequest, getErrorMessage, isAbortError } from '@/lib/api';
 
 interface BillingStatusData {
   plan: string;
@@ -13,6 +14,18 @@ interface BillingStatusData {
   stripe_status: string | null;
   cancels_at: string | null;
   has_billing_account: boolean;
+}
+
+interface UserProfile {
+  name: string;
+}
+
+interface CheckoutResponse {
+  checkout_url: string;
+}
+
+interface PortalResponse {
+  portal_url: string;
 }
 
 // Helper function to extract initials from a full name (e.g., "Don Ng" -> "DN")
@@ -36,29 +49,26 @@ export default function BillingPlan() {
 
   // Fetch live server constraints, plan definitions, and user profile concurrently
   useEffect(() => {
+    const controller = new AbortController();
+
     async function fetchData() {
       try {
-        const [billingRes, userRes] = await Promise.all([
-          fetch('http://localhost:8000/billing/status', { credentials: 'include' }),
-          fetch('http://localhost:8000/auth/me', { credentials: 'include' })
+        const [billingData, userData] = await Promise.all([
+          apiRequest<BillingStatusData>('/billing/status', { signal: controller.signal }),
+          apiRequest<UserProfile>('/auth/me', { signal: controller.signal }),
         ]);
-
-        if (!billingRes.ok) throw new Error('Could not retrieve operational billing logs.');
-        
-        const billingData = await billingRes.json();
         setBillingInfo(billingData);
-
-        if (userRes.ok) {
-          const userData = await userRes.json();
-          setUserName(userData.name || '');
-        }
-      } catch (err: any) {
-        setError(err.message || 'An error occurred fetching account context.');
+        setUserName(userData.name || '');
+      } catch (caughtError) {
+        if (isAbortError(caughtError)) return;
+        setError(getErrorMessage(caughtError, 'Could not load billing information.'));
       } finally {
-        setIsLoading(false);
+        if (!controller.signal.aborted) setIsLoading(false);
       }
     }
-    fetchData();
+
+    void fetchData();
+    return () => controller.abort();
   }, []);
 
   // Routes the user out to Stripe Checkout or Billing Portal automatically
@@ -69,26 +79,21 @@ export default function BillingPlan() {
 
     try {
       if (billingInfo.plan === 'free' || !billingInfo.has_billing_account) {
-        const res = await fetch('http://localhost:8000/billing/checkout', {
+        const data = await apiRequest<CheckoutResponse>('/billing/checkout', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ plan: 'starter' }),
-          credentials: 'include',
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Failed to instantiate checkout process.');
-        if (data.checkout_url) window.location.href = data.checkout_url;
+        navigateToBillingUrl(data.checkout_url);
       } else {
-        const res = await fetch('http://localhost:8000/billing/portal', {
+        const data = await apiRequest<PortalResponse>('/billing/portal', {
           method: 'POST',
-          credentials: 'include',
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Failed to initialize portal pipeline.');
-        if (data.portal_url) window.location.href = data.portal_url;
+        navigateToBillingUrl(data.portal_url);
       }
-    } catch (err: any) {
-      setError(err.message || 'An unexpected action failure occurred.');
+    } catch (caughtError) {
+      setError(getErrorMessage(caughtError, 'Could not open Stripe billing.'));
+    } finally {
       setIsActionLoading(false);
     }
   };
@@ -152,19 +157,19 @@ export default function BillingPlan() {
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '20px' }}>
           <MetricCard 
             label="Searches Allowed" 
-            value={billingInfo?.monthly_searches.toString() || '50'} 
+            value={(billingInfo?.monthly_searches ?? 50).toString()} 
             subtext={`Cap limit pool per billing window`} 
             progressPercentage={100} 
           />
           <MetricCard 
             label="Max Businesses" 
-            value={billingInfo?.max_businesses.toString() || '1'} 
+            value={(billingInfo?.max_businesses ?? 1).toString()} 
             subtext={`Active allowance threshold`} 
             progressPercentage={100} 
           />
           <MetricCard 
             label="Allowed Teams" 
-            value={billingInfo?.max_organizations.toString() || '1'} 
+            value={(billingInfo?.max_organizations ?? 1).toString()} 
             subtext={`Workspace organizations`} 
             progressPercentage={100} 
           />
@@ -172,4 +177,12 @@ export default function BillingPlan() {
       </div>
     </div>
   );
+}
+
+function navigateToBillingUrl(value: string) {
+  const url = new URL(value);
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && url.hostname === 'localhost')) {
+    throw new Error('The billing provider returned an invalid redirect URL.');
+  }
+  window.location.assign(url.toString());
 }

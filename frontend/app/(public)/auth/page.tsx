@@ -3,8 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { apiRequest, getErrorMessage } from "@/lib/api";
 
 export default function SignInPage() {
   const router = useRouter();
@@ -27,39 +26,33 @@ export default function SignInPage() {
     setLoading(true);
 
     try {
-      const url = mode === "login" ? `${API_BASE}/api/auth/login` : `${API_BASE}/api/auth/signup`;
+      const endpoint = mode === "login" ? "/auth/login" : "/auth/signup";
       const body =
         mode === "login"
           ? new URLSearchParams({ username: email.trim(), password })
           : JSON.stringify({ name: name.trim(), email: email.trim(), password });
 
-      const res = await fetch(url, {
+      await apiRequest<unknown>(endpoint, {
         method: "POST",
-        credentials: "include",
+        redirectOnUnauthorized: false,
         headers: {
           "Content-Type": mode === "login" ? "application/x-www-form-urlencoded" : "application/json",
         },
         body,
       });
 
-      const data = await res.json().catch(() => ({}));
-
-      if (!res.ok) {
-        // FastAPI returns either detail: string or list of {msg}
-        let message = "Something went wrong";
-        if (data.detail) {
-          if (typeof data.detail === "string") message = data.detail;
-          else if (Array.isArray(data.detail)) message = data.detail.map(d => (d.msg ? d.msg : JSON.stringify(d))).join(", ");
-        }
-        throw new Error(message);
-      }
-
       // Cookie is now set server-side; no JWT handling in frontend.
-      router.push("/dashboard");
+      const requestedReturnTo = new URLSearchParams(window.location.search).get("returnTo");
+      const returnTo =
+        requestedReturnTo?.startsWith("/") &&
+        !requestedReturnTo.startsWith("//") &&
+        !requestedReturnTo.startsWith("/auth")
+          ? requestedReturnTo
+          : "/dashboard";
+      router.replace(returnTo);
       router.refresh();
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "Something went wrong";
-      setError(message);
+    } catch (caughtError) {
+      setError(getErrorMessage(caughtError));
     } finally {
       setLoading(false);
     }
@@ -137,10 +130,10 @@ export default function SignInPage() {
               value={password}
               onChange={e => setPassword(e.target.value)}
               placeholder="••••••••"
-              minLength={mode === "signup" ? 8 : undefined}
+              minLength={mode === "signup" ? 12 : undefined}
               className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 outline-none placeholder:text-zinc-400 focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
             />
-            {mode === "signup" && <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-500">At least 8 characters.</p>}
+            {mode === "signup" && <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-500">At least 12 characters.</p>}
           </div>
 
           {error && (

@@ -1,1 +1,32 @@
-Generic single-database configuration.
+Database migrations
+===================
+
+Alembic reads `DATABASE_URL` from the environment or the repository's local
+`.env` file. Credentials must never be added to `alembic.ini`.
+
+Fresh databases
+---------------
+
+Run `alembic upgrade head`. The baseline enables pgvector and creates the full
+schema represented by `app/models.py`.
+
+Existing databases
+------------------
+
+The old three-file migration chain was incomplete: it referenced core tables
+that it never created. It has been replaced with a complete baseline while
+retaining its previous head revision ID (`ad2e1df4ce24`). A database already
+stamped at that revision remains known to Alembic, but this baseline will not
+retroactively change its schema.
+
+Before deploying over an existing database:
+
+1. Back up the database.
+2. Confirm its current revision with `alembic current`.
+3. Compare its schema with `app/models.py` in a staging copy.
+4. If it already matches, stamp it with `alembic stamp ad2e1df4ce24`.
+5. If it differs, create and test a forward reconciliation migration; do not
+   stamp over missing tables or columns.
+
+Databases stamped at the removed intermediate revisions (`6ed7a7c9c417` or
+`f500b282fd47`) require this same inspection and explicit stamping procedure.
