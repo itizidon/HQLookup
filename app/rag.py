@@ -6,8 +6,6 @@ import os
 import json
 import redis
 import pandas as pd
-import openpyxl
-from openpyxl.utils import range_boundaries
 from datetime import datetime
 from typing import List
 from pathlib import Path
@@ -17,6 +15,12 @@ from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import OpenAI
 from dotenv import load_dotenv
+from app.services.spreadsheet_ingestion import (
+    analyze_spreadsheet_with_llm,
+    build_spreadsheet_chunk_specs,
+    chunk_table_deterministically,
+    scan_workbook,
+)
 load_dotenv()
 
 # ── Client ─────────────────────────────────────────────────────────────────────
@@ -70,144 +74,6 @@ ACTIVE_QUERY_TTL_SECONDS = 60 * 60 * 6  # 6 hours
 
 # ── Singleton embedder ─────────────────────────────────────────────────────────
 _embedder = None
-
-def extract_spreadsheet_to_text(file_path: str) -> str:
-    sheet_texts = []
-    
-    try:
-        wb = openpyxl.load_workbook(file_path, data_only=True)
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            if ws._charts:
-                sheet_texts.append(f"=== SHEET: {sheet_name} (Charts) ===\n")
-                for i, chart in enumerate(ws._charts, 1):
-                    chart_type = type(chart).__name__
-                    title = getattr(chart, 'title', None)
-                    title_str = title.text if title and hasattr(title, 'text') else str(title or "Untitled")
-                    sheet_texts.append(f"- Chart {i}: Type={chart_type}, Title='{title_str}'\n")
-                sheet_texts.append("\n")
-    except Exception as e:
-        print(f"[Spreadsheet] Chart extraction warning: {e}")
-
-    excel_data = pd.ExcelFile(file_path)
-    for sheet_name in excel_data.sheet_names:
-        df = pd.read_excel(excel_data, sheet_name=sheet_name, header=None)
-        sheet_texts.append(f"--- Data Grid for {sheet_name} ---\n")
-        sheet_texts.append(df.to_string(na_rep="", index=True, header=True))
-        sheet_texts.append("\n\n")
-        
-    return "".join(sheet_texts)
-
-def chunk_table_deterministically(file_path: str, table_meta: dict) -> list[str]:
-    table_name  = table_meta.get("table_name", "Unknown Table")
-    cell_range  = table_meta.get("cell_range", "")
-    headers     = table_meta.get("column_headers", [])
-    description = table_meta.get("description", "")
-    
-    try:
-        excel_file = pd.ExcelFile(file_path)
-        df_full = pd.read_excel(excel_file, sheet_name=excel_file.sheet_names[0], header=None)
-    except Exception as e:
-        print(f"[Chunker] Error reading excel file for chunking: {e}")
-        return []
-    
-    df_slice = df_full
-    if cell_range:
-        try:
-            min_col, min_row, max_col, max_row = range_boundaries(cell_range)
-            df_slice = df_full.iloc[min_row-1:max_row, min_col-1:max_col]
-        except Exception:
-            pass
-            
-    context_prefix = f"[Table: {table_name}]\nDescription: {description}\nHeaders: {', '.join(headers)}\n---"
-    
-    row_chunks = []
-    header_set = {str(h).strip().lower() for h in headers if pd.notna(h)}
-
-    for _, row in df_slice.iterrows():
-        # Check if this row is actually just repeating the column headers
-        row_values = [str(val).strip().lower() for val in row.values if pd.notna(val)]
-        if header_set and row_values:
-            # If most values in this row match the header names, it's a header row — skip it!
-            matches = sum(1 for v in row_values if v in header_set)
-            if matches >= len(header_set) * 0.6:  # 60% match threshold
-                continue
-
-        row_str = " | ".join([
-            f"{headers[i]}: {val}" if i < len(headers) and pd.notna(val) else str(val) 
-            for i, val in enumerate(row.values) if pd.notna(val)
-        ])
-        
-        if row_str.strip():
-            chunk_text = f"{context_prefix}\nRow Data: {row_str}"
-            row_chunks.append(chunk_text)
-            
-    return row_chunks
-
-def analyze_spreadsheet_with_llm(file_path: str, client: OpenAI = None) -> dict:
-    if client is None:
-        client = OpenAI()
-
-    spreadsheet_text = extract_spreadsheet_to_text(file_path)
-
-    prompt = f"""
-You are an expert data extraction and spreadsheet analysis assistant. Your task is to analyze the provided spreadsheet data (sheet names, cell contents, or structural text dumps) and identify the logical structure of the workbook.
-
-Your goal is to detect:
-- All distinct tables (even if they are not formatted as Excel Tables).
-- The cell range occupied by each table.
-- The column headers for each table.
-- Any charts or visualizations.
-- Important summary metrics or findings.
-
-Return your response as a single, valid JSON object and nothing else. Do not include markdown code blocks (such as json), explanations, or conversational text.
-
-The JSON object must strictly conform to the following schema:
-{{
-  "spreadsheet_summary": "A brief overview of the workbook contents.",
-  "tables": [
-    {{
-      "table_name": "Name or inferred title of the table",
-      "cell_range": "e.g., A1:D15",
-      "column_headers": ["Header1", "Header2"],
-      "description": "Brief description of the table contents"
-    }}
-  ],
-  "charts": [
-    {{
-      "chart_name": "Name or inferred title of the chart",
-      "chart_type": "e.g., Bar, Line, Pie",
-      "location_or_range": "Cell location if identifiable",
-      "description": "Brief description of what the chart visualizes"
-    }}
-  ],
-  "key_findings": [
-    "Notable data insight or summary total"
-  ]
-}}
-
-Analyze the following spreadsheet content:
-{spreadsheet_text}
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "You are a precise data extraction assistant that outputs strictly valid JSON objects."},
-            {"role": "user", "content": prompt}
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.0
-    )
-
-    raw_content = response.choices[0].message.content
-
-    try:
-        parsed_data = json.loads(raw_content)
-        return parsed_data
-    except Exception as e:
-        print(f"[Spreadsheet LLM] JSON parse error: {e}. Raw content was: {raw_content}")
-        return {"tables": [], "charts": [], "key_findings": [], "spreadsheet_summary": ""}
 
 def chunk_text_small_to_big(text: str) -> List[dict]:
     """
@@ -788,7 +654,7 @@ def extract_text(file_path: str) -> str:
         doc.close()
         return text
 
-    if ext in [".xlsx", ".xls"]:
+    if ext in [".xlsx", ".xlsm", ".xls"]:
         import pandas as pd
         dict_df     = pd.read_excel(path, sheet_name=None)
         text_output = []
@@ -837,188 +703,12 @@ def ingest_document(
     # 1. EXCEL SPREADSHEETS
     # ==================================================================
 
-    if ext in {".xlsx", ".xls"}:
-
-        try:
-            spreadsheet_meta = analyze_spreadsheet_with_llm(
-                file_path
-            )
-
-        except Exception as e:
-            print(
-                f"[Ingest] Spreadsheet analysis failed "
-                f"for {filename}: {e}"
-            )
-
-            spreadsheet_meta = {
-                "tables": [],
-                "charts": [],
-                "key_findings": [],
-                "spreadsheet_summary": "",
-            }
-
-        tables = spreadsheet_meta.get(
-            "tables",
-            [],
+    if ext in {".xlsx", ".xlsm", ".xls"}:
+        chunks_to_add = build_spreadsheet_chunk_specs(
+            file_path,
+            filename,
+            client=client,
         )
-
-        # --------------------------------------------------------------
-        # Table records
-        # --------------------------------------------------------------
-
-        for table in tables:
-
-            table_chunks = chunk_table_deterministically(
-                file_path,
-                table,
-            )
-
-            for chunk_text in table_chunks:
-
-                if not chunk_text.strip():
-                    continue
-
-                chunks_to_add.append({
-                    "text": chunk_text,
-                    "parent": chunk_text,
-
-                    # Specific chunk role
-                    "chunk_type": "tabular_record",
-
-                    # Broad pipeline type
-                    "content_type": "tabular",
-                })
-
-        # --------------------------------------------------------------
-        # Fallback if LLM detected no tables
-        # --------------------------------------------------------------
-
-        if not tables:
-
-            print(
-                f"[Ingest] Warning: no tables detected for "
-                f"{filename}; using raw spreadsheet fallback."
-            )
-
-            try:
-
-                excel_file = pd.ExcelFile(
-                    file_path
-                )
-
-                for sheet_name in excel_file.sheet_names:
-
-                    df = pd.read_excel(
-                        excel_file,
-                        sheet_name=sheet_name,
-                        header=None,
-                    )
-
-                    for row_index, row in df.iterrows():
-
-                        values = [
-                            str(value)
-                            for value in row.values
-                            if pd.notna(value)
-                        ]
-
-                        if not values:
-                            continue
-
-                        row_text = (
-                            f"Sheet: {sheet_name}\n"
-                            f"Row: {row_index + 1}\n"
-                            + " | ".join(values)
-                        )
-
-                        chunks_to_add.append({
-                            "text": row_text,
-                            "parent": row_text,
-                            "chunk_type": "tabular_record",
-                            "content_type": "tabular",
-                        })
-
-            except Exception as e:
-
-                print(
-                    f"[Ingest] Spreadsheet fallback failed "
-                    f"for {filename}: {e}"
-                )
-
-        # --------------------------------------------------------------
-        # Workbook summary
-        # --------------------------------------------------------------
-
-        summary = spreadsheet_meta.get(
-            "spreadsheet_summary",
-            "",
-        )
-
-        if summary:
-
-            summary_text = (
-                f"Workbook Summary:\n"
-                f"{summary}"
-            )
-
-            chunks_to_add.append({
-                "text": summary_text,
-                "parent": summary_text,
-                "chunk_type": "workbook_metadata",
-                "content_type": "metadata",
-            })
-
-        # --------------------------------------------------------------
-        # Charts
-        # --------------------------------------------------------------
-
-        charts = spreadsheet_meta.get(
-            "charts",
-            [],
-        )
-
-        for chart in charts:
-
-            chart_text = (
-                f"[Chart]\n"
-                f"Name: {chart.get('chart_name', 'Untitled')}\n"
-                f"Type: {chart.get('chart_type', 'Unknown')}\n"
-                f"Location: {chart.get('location_or_range', 'Unknown')}\n"
-                f"Description: {chart.get('description', '')}"
-            )
-
-            chunks_to_add.append({
-                "text": chart_text,
-                "parent": chart_text,
-                "chunk_type": "chart_metadata",
-                "content_type": "metadata",
-            })
-
-        # --------------------------------------------------------------
-        # Key findings
-        # --------------------------------------------------------------
-
-        findings = spreadsheet_meta.get(
-            "key_findings",
-            [],
-        )
-
-        for finding in findings:
-
-            if not finding:
-                continue
-
-            finding_text = (
-                f"Workbook Finding:\n"
-                f"{finding}"
-            )
-
-            chunks_to_add.append({
-                "text": finding_text,
-                "parent": finding_text,
-                "chunk_type": "workbook_metadata",
-                "content_type": "metadata",
-            })
 
     # ==================================================================
     # 2. CSV
@@ -1059,7 +749,7 @@ def ingest_document(
     # 3. SPREADSHEET / CSV EMBEDDING
     # ==================================================================
 
-    if ext in {".csv", ".xlsx", ".xls"}:
+    if ext in {".csv", ".xlsx", ".xlsm", ".xls"}:
 
         print(
             f"[Ingest] Total spreadsheet/CSV chunks ready "

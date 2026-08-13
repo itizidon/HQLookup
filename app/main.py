@@ -353,7 +353,7 @@ async def upload_documents(
                 })
 
             # ── Row count check (spreadsheets only) ───────────────────────────
-            if ext in [".csv", ".xlsx", ".xls"]:
+            if ext in [".csv", ".xlsx", ".xlsm", ".xls"]:
                 try:
                     if ext == ".csv":
                         with open(temp_path) as f:

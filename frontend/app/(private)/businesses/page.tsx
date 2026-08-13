@@ -192,7 +192,8 @@ export default function EnterpriseBusinessDetail() {
     if (!e.target.files || e.target.files.length === 0) return;
 
     const newFiles: PendingFile[] = Array.from(e.target.files).map((f) => {
-      const isExcel = f.name.endsWith('.xlsx') || f.name.endsWith('.xls');
+      const lowerName = f.name.toLowerCase();
+      const isExcel = lowerName.endsWith('.xlsx') || lowerName.endsWith('.xlsm') || lowerName.endsWith('.xls');
       return {
         file: f,
         id: `${f.name}_${Date.now()}_${Math.random()}`,
