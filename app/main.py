@@ -1,5 +1,6 @@
 import uvicorn
 import json
+import math
 from fastapi import FastAPI, UploadFile, File, Depends, Query, HTTPException, Form, status
 from typing import List, Optional
 from fastapi.middleware.cors import CORSMiddleware
@@ -139,6 +140,109 @@ def get_user_org_ids(db: Session, user_id: int) -> List[int]:
         m.org_id for m in
         db.query(OrgMember).filter(OrgMember.user_id == user_id).all()
     ]
+
+
+def _coerce_chunk_id(value) -> int | None:
+    """Return a positive integer chunk ID without lossy coercion."""
+
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, int):
+        chunk_id = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        chunk_id = int(value.strip())
+    else:
+        return None
+
+    return chunk_id if chunk_id > 0 else None
+
+
+def resolve_answer_sources(
+    chunks: list[dict],
+    requested_sources=None,
+    *,
+    fallback_to_all: bool = False,
+) -> list[dict]:
+    """Resolve LLM citations against retrieved chunks and add similarity scores."""
+
+    chunks_by_id = {}
+
+    for chunk in chunks:
+        chunk_id = _coerce_chunk_id(
+            chunk.get("id")
+        )
+
+        if chunk_id is None:
+            continue
+
+        chunks_by_id[chunk_id] = chunk
+
+    requested_ids = []
+    seen_ids = set()
+
+    if isinstance(requested_sources, list):
+        for source in requested_sources:
+            if not isinstance(source, dict):
+                continue
+
+            chunk_id = source.get("chunk")
+
+            if chunk_id is None:
+                chunk_id = source.get("chunk_id")
+
+            chunk_id = _coerce_chunk_id(
+                chunk_id
+            )
+
+            if chunk_id is None:
+                continue
+
+            if chunk_id in chunks_by_id and chunk_id not in seen_ids:
+                requested_ids.append(chunk_id)
+                seen_ids.add(chunk_id)
+
+    if requested_ids:
+        source_chunks = [
+            chunks_by_id[chunk_id]
+            for chunk_id in requested_ids
+        ]
+    elif fallback_to_all:
+        source_chunks = list(chunks_by_id.values())
+    else:
+        source_chunks = []
+
+    resolved_sources = []
+
+    for chunk in source_chunks:
+        chunk_id = _coerce_chunk_id(
+            chunk.get("id")
+        )
+
+        if chunk_id is None:
+            continue
+
+        raw_score = chunk.get("score")
+
+        try:
+            correlation = float(raw_score)
+        except (TypeError, ValueError):
+            correlation = None
+
+        if correlation is not None and not math.isfinite(correlation):
+            correlation = None
+
+        resolved_sources.append({
+            "chunk": chunk_id,
+            "filename": str(chunk.get("filename") or "Unknown source"),
+            "correlation": (
+                round(correlation, 4)
+                if correlation is not None
+                else None
+            ),
+        })
+
+    return resolved_sources
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -1615,9 +1719,9 @@ def ask_question(
                     "confidence",
                     0.0,
                 ),
-                "sources": record.get(
-                    "sources",
-                    [],
+                "sources": resolve_answer_sources(
+                    [original_chunk] if original_chunk else [],
+                    fallback_to_all=True,
                 ),
             })
 
@@ -1636,6 +1740,12 @@ def ask_question(
         # ==============================================================
         # PROCESS NORMAL TEXT / PDF / DOCX / METADATA ANSWERS
         # ==============================================================
+
+        text_chunks = [
+            chunk
+            for chunk in chunks
+            if chunk.get("content_type") != "tabular"
+        ]
 
         for text_answer in text_answers:
 
@@ -1658,15 +1768,31 @@ def ask_question(
                 f"{answer_text}"
             )
 
+            requested_sources = text_answer.get(
+                "sources"
+            )
+
+            citations_omitted = (
+                requested_sources is None
+                or (
+                    isinstance(requested_sources, list)
+                    and not requested_sources
+                )
+            )
+
             batch_answers.append({
                 "answer": answer_text,
                 "confidence": text_answer.get(
                     "confidence",
                     0.0,
                 ),
-                "sources": text_answer.get(
-                    "sources",
-                    [],
+                "sources": resolve_answer_sources(
+                    text_chunks,
+                    requested_sources,
+                    # If citations are omitted, expose the context that
+                    # produced the answer. A non-empty but invalid citation
+                    # list is not silently replaced with unrelated chunks.
+                    fallback_to_all=citations_omitted,
                 ),
             })
 

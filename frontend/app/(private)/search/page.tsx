@@ -10,12 +10,13 @@ import { DebounceContainer } from '@/components/Debounce';
 interface RagAnswerSource {
   chunk: number;
   filename: string;
+  correlation?: number | null;
 }
 
 interface RagAnswer {
   answer: string;
-  confidence: number;
-  sources: RagAnswerSource[];
+  confidence?: number | null;
+  sources?: RagAnswerSource[];
 }
 
 interface RagResponse {
@@ -37,6 +38,16 @@ interface RecentQuery {
   answer: string;
 }
 
+const formatCorrelation = (score: number | null | undefined) => {
+  if (typeof score !== 'number' || !Number.isFinite(score)) {
+    return 'Unavailable';
+  }
+
+  const percentage = score * 100;
+
+  return `${Math.round(Math.min(100, Math.max(-100, percentage)))}%`;
+};
+
 export default function SearchHome() {
   const { selectedBusiness, businesses, selectBusiness } = useBusiness();
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
@@ -50,7 +61,6 @@ export default function SearchHome() {
   const [loadingQueries, setLoadingQueries] = useState(false);
   useEffect(() => {
     if (!selectedBusiness) {
-      setRecentQueries([]);
       return;
     }
 
@@ -198,6 +208,7 @@ export default function SearchHome() {
                     cursor: 'pointer'
                   }}
                   onClick={() => {
+                    setRecentQueries([]);
                     selectBusiness(biz);
                     setIsDropdownOpen(false);
                     setResult(null);
@@ -210,11 +221,6 @@ export default function SearchHome() {
           )}
         </div>
 
-        <div className="nav-right" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <button className="nav-link" style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'transparent', border: 'none', cursor: 'pointer' }}>
-            <History size={13} /> History
-          </button>
-        </div>
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '40px 24px', gap: '24px' }}>
@@ -258,23 +264,54 @@ export default function SearchHome() {
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', paddingLeft: '24px' }}>
                   {result.answer?.answers?.map((item, idx) => (
-                    <div key={idx} style={{ fontSize: '13px', color: 'var(--color-text-primary)', lineHeight: '1.5' }}>
-                      • {item.answer}
+                    <div
+                      key={`${idx}-${item.answer}`}
+                      style={{
+                        padding: '10px',
+                        border: '0.5px solid var(--color-border-tertiary)',
+                        borderRadius: 'var(--border-radius-md)',
+                        background: 'var(--color-background-primary)'
+                      }}
+                    >
+                      <div style={{ fontSize: '13px', color: 'var(--color-text-primary)', lineHeight: '1.5' }}>
+                        {idx + 1}. {item.answer}
+                      </div>
+
+                      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '4px', marginTop: '8px' }}>
+                        {(item.sources ?? []).length > 0 ? (
+                          (item.sources ?? []).map((source) => (
+                            <div
+                              key={`${source.filename}-${source.chunk}`}
+                              style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '4px', minWidth: 0 }}
+                            >
+                              <span
+                                className="badge badge-success"
+                                style={{ fontSize: '10px', padding: '2px 6px', gap: '3px', maxWidth: '100%', overflowWrap: 'anywhere' }}
+                              >
+                                <FileText size={10} style={{ flexShrink: 0 }} />
+                                Source: {source.filename} · chunk {source.chunk}
+                              </span>
+                              <span className="badge badge-info" style={{ fontSize: '10px', padding: '2px 6px' }}>
+                                Correlation: {formatCorrelation(source.correlation)}
+                              </span>
+                            </div>
+                          ))
+                        ) : (
+                          <>
+                            <span className="badge" style={{ fontSize: '10px', padding: '2px 6px', color: 'var(--color-text-tertiary)' }}>
+                              Source unavailable
+                            </span>
+                            <span className="badge badge-info" style={{ fontSize: '10px', padding: '2px 6px' }}>
+                              Correlation: Unavailable
+                            </span>
+                          </>
+                        )}
+                      </div>
                     </div>
                   ))}
                 </div>
               </div>
 
-              {result.sources.length > 0 && (
-                <div style={{ borderTop: '0.5px solid var(--color-border-tertiary)', paddingTop: '10px', marginTop: '10px' }}>
-                  <div style={{ fontSize: '11px', color: 'var(--color-text-tertiary)', fontWeight: 500, marginBottom: '4px' }}>Sources Verified:</div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-                    {result.sources.map((src, idx) => (
-                      <span key={idx} className="badge badge-success" style={{ fontSize: '10px', padding: '2px 6px' }}>{src}</span>
-                    ))}
-                  </div>
-                </div>
-              )}
             </div>
 
             {result.hasMore && (
@@ -332,7 +369,7 @@ export default function SearchHome() {
               <div style={{ display: 'flex', justifyContent: 'center', padding: '16px' }}>
                 <Loader2 className="animate-spin" size={16} style={{ color: 'var(--color-text-tertiary)' }} />
               </div>
-            ) : recentQueries.length > 0 ? (
+            ) : selectedBusiness && recentQueries.length > 0 ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
                 {recentQueries.map((q) => (
                   <button

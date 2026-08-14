@@ -71,6 +71,7 @@ redis_client = redis.Redis(
 )
 
 ACTIVE_QUERY_TTL_SECONDS = 60 * 60 * 6  # 6 hours
+ACTIVE_QUERY_CACHE_VERSION = 2
 
 # ── Singleton embedder ─────────────────────────────────────────────────────────
 _embedder = None
@@ -148,7 +149,7 @@ def normalize_query(query: str) -> str:
     return " ".join(query.lower().strip().split())
 
 def get_active_query_key(user_id: int) -> str:
-    return f"active_query:{user_id}"
+    return f"active_query:v{ACTIVE_QUERY_CACHE_VERSION}:{user_id}"
 
 def get_active_query(user_id: int) -> dict | None:
     try:
@@ -441,6 +442,14 @@ def retrieve_chunks_multi(
                     "score": float(row.score),
                     "rrf_score": 0.0,
                 }
+
+            else:
+                # Expose the strongest cosine similarity observed across
+                # the query variants, not whichever vector found it first.
+                rrf_scores[chunk_id]["score"] = max(
+                    rrf_scores[chunk_id]["score"],
+                    float(row.score),
+                )
 
             rrf_scores[
                 chunk_id
