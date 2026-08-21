@@ -35,6 +35,9 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
+      # Make the repository package importable regardless of the runner's
+      # pytest/import mode.
+      PYTHONPATH: ${{ github.workspace }}
       APP_ENV: test
       DATABASE_URL: postgresql+psycopg2://app_test:test_password@localhost:5432/app_test
       FRONTEND_URL: http://localhost:3000
