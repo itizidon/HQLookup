@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import Navbar from '@/components/Navbar';
 import MetricCard from '@/components/MetricCard';
 import { Loader2, CreditCard } from 'lucide-react';
+import { apiFetch, errorMessage, responseErrorMessage } from '@/app/lib/api';
 
 interface BillingStatusData {
   plan: string;
@@ -13,6 +14,27 @@ interface BillingStatusData {
   stripe_status: string | null;
   cancels_at: string | null;
   has_billing_account: boolean;
+}
+
+interface UserData {
+  name?: string;
+}
+
+const STRIPE_REDIRECT_HOSTS = new Set(['checkout.stripe.com', 'billing.stripe.com']);
+
+function navigateToStripe(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+
+  try {
+    const destination = new URL(value);
+    if (destination.protocol !== 'https:' || !STRIPE_REDIRECT_HOSTS.has(destination.hostname)) {
+      return false;
+    }
+    window.location.assign(destination.toString());
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Helper function to extract initials from a full name (e.g., "Don Ng" -> "DN")
@@ -39,21 +61,21 @@ export default function BillingPlan() {
     async function fetchData() {
       try {
         const [billingRes, userRes] = await Promise.all([
-          fetch('http://localhost:8000/billing/status', { credentials: 'include' }),
-          fetch('http://localhost:8000/auth/me', { credentials: 'include' })
+          apiFetch('/billing/status'),
+          apiFetch('/api/auth/me')
         ]);
 
         if (!billingRes.ok) throw new Error('Could not retrieve operational billing logs.');
         
-        const billingData = await billingRes.json();
+        const billingData = await billingRes.json() as BillingStatusData;
         setBillingInfo(billingData);
 
         if (userRes.ok) {
-          const userData = await userRes.json();
+          const userData = await userRes.json() as UserData;
           setUserName(userData.name || '');
         }
-      } catch (err: any) {
-        setError(err.message || 'An error occurred fetching account context.');
+      } catch (err: unknown) {
+        setError(errorMessage(err, 'An error occurred fetching account context.'));
       } finally {
         setIsLoading(false);
       }
@@ -69,26 +91,38 @@ export default function BillingPlan() {
 
     try {
       if (billingInfo.plan === 'free' || !billingInfo.has_billing_account) {
-        const res = await fetch('http://localhost:8000/billing/checkout', {
+        const res = await apiFetch('/billing/checkout', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ plan: 'starter' }),
-          credentials: 'include',
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Failed to instantiate checkout process.');
-        if (data.checkout_url) window.location.href = data.checkout_url;
+        if (!res.ok) {
+          throw new Error(await responseErrorMessage(res, 'Failed to instantiate checkout process.'));
+        }
+        const data: unknown = await res.json();
+        const checkoutUrl = data && typeof data === 'object' && 'checkout_url' in data
+          ? (data as { checkout_url?: unknown }).checkout_url
+          : null;
+        if (!navigateToStripe(checkoutUrl)) {
+          throw new Error('The server returned an invalid checkout destination.');
+        }
       } else {
-        const res = await fetch('http://localhost:8000/billing/portal', {
+        const res = await apiFetch('/billing/portal', {
           method: 'POST',
-          credentials: 'include',
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Failed to initialize portal pipeline.');
-        if (data.portal_url) window.location.href = data.portal_url;
+        if (!res.ok) {
+          throw new Error(await responseErrorMessage(res, 'Failed to initialize portal pipeline.'));
+        }
+        const data: unknown = await res.json();
+        const portalUrl = data && typeof data === 'object' && 'portal_url' in data
+          ? (data as { portal_url?: unknown }).portal_url
+          : null;
+        if (!navigateToStripe(portalUrl)) {
+          throw new Error('The server returned an invalid billing portal destination.');
+        }
       }
-    } catch (err: any) {
-      setError(err.message || 'An unexpected action failure occurred.');
+    } catch (err: unknown) {
+      setError(errorMessage(err, 'An unexpected action failure occurred.'));
       setIsActionLoading(false);
     }
   };

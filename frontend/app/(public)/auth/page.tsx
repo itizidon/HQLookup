@@ -3,8 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { apiFetch, responseErrorMessage } from "@/app/lib/api";
 
 export default function SignInPage() {
   const router = useRouter();
@@ -27,31 +26,22 @@ export default function SignInPage() {
     setLoading(true);
 
     try {
-      const url = mode === "login" ? `${API_BASE}/api/auth/login` : `${API_BASE}/api/auth/signup`;
+      const path = mode === "login" ? "/api/auth/login" : "/api/auth/signup";
       const body =
         mode === "login"
           ? new URLSearchParams({ username: email.trim(), password })
           : JSON.stringify({ name: name.trim(), email: email.trim(), password });
 
-      const res = await fetch(url, {
+      const res = await apiFetch(path, {
         method: "POST",
-        credentials: "include",
         headers: {
           "Content-Type": mode === "login" ? "application/x-www-form-urlencoded" : "application/json",
         },
         body,
       });
 
-      const data = await res.json().catch(() => ({}));
-
       if (!res.ok) {
-        // FastAPI returns either detail: string or list of {msg}
-        let message = "Something went wrong";
-        if (data.detail) {
-          if (typeof data.detail === "string") message = data.detail;
-          else if (Array.isArray(data.detail)) message = data.detail.map(d => (d.msg ? d.msg : JSON.stringify(d))).join(", ");
-        }
-        throw new Error(message);
+        throw new Error(await responseErrorMessage(res, "Unable to authenticate."));
       }
 
       // Cookie is now set server-side; no JWT handling in frontend.

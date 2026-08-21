@@ -3,9 +3,11 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 
 export default async function Home() {
-  const cookieStore = (await cookies()).get("token")?.value; // 👈 call it
-  console.log(cookieStore);
-  if (cookieStore) {
+  const cookieStore = await cookies();
+  const cookieName = process.env.NODE_ENV === "production" ? "__Host-token" : "token";
+  const hasSession = cookieStore.has(cookieName);
+
+  if (hasSession) {
     redirect("/search");
   }
   return (

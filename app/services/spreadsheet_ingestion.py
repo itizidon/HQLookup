@@ -11,7 +11,6 @@ import base64
 import inspect
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -24,24 +23,20 @@ import pandas as pd
 from openai import OpenAI
 from openpyxl.utils.cell import get_column_letter, range_boundaries
 
+from app.settings import settings
+
 
 logger = logging.getLogger(__name__)
 
-MAX_SPREADSHEET_LLM_CHARS = int(
-    os.getenv("MAX_SPREADSHEET_LLM_CHARS", "60000")
-)
-MAX_VISUALS_FOR_LLM = int(os.getenv("MAX_VISUALS_FOR_LLM", "50"))
-MAX_CHART_REFERENCE_CELLS = int(
-    os.getenv("MAX_CHART_REFERENCE_CELLS", "100000")
-)
-MAX_TABLES_FROM_LLM = int(os.getenv("MAX_TABLES_FROM_LLM", "100"))
-MAX_HEADERS_PER_TABLE = int(os.getenv("MAX_HEADERS_PER_TABLE", "1000"))
-MAX_FINDINGS_FROM_LLM = int(os.getenv("MAX_FINDINGS_FROM_LLM", "100"))
-SPREADSHEET_LLM_MODEL = os.getenv(
-    "SPREADSHEET_LLM_MODEL",
-    os.getenv("LLM_MODEL", "mistral:7b"),
-)
-SPREADSHEET_VISION_MODEL = os.getenv("SPREADSHEET_VISION_MODEL", "").strip()
+MAX_SPREADSHEET_LLM_CHARS = settings.max_spreadsheet_llm_chars
+MAX_VISUALS_FOR_LLM = settings.max_visuals_for_llm
+MAX_CHART_REFERENCE_CELLS = settings.max_chart_reference_cells
+MAX_TABLES_FROM_LLM = settings.max_tables_from_llm
+MAX_HEADERS_PER_TABLE = settings.max_headers_per_table
+MAX_FINDINGS_FROM_LLM = settings.max_findings_from_llm
+SPREADSHEET_LLM_MODEL = settings.spreadsheet_llm_model
+SPREADSHEET_VISION_MODEL = settings.spreadsheet_vision_model
+MAX_LLM_OUTPUT_TOKENS = settings.max_llm_output_tokens
 
 _MODERN_EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
 _SUPPORTED_SERIES_TYPES = {"area", "bar", "line", "pie", "scatter"}
@@ -83,8 +78,10 @@ def _empty_analysis() -> dict[str, Any]:
 
 def _configured_openai_client() -> OpenAI:
     return OpenAI(
-        base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
-        api_key=os.getenv("OPENAI_API_KEY", "ollama"),
+        base_url=settings.llm_base_url,
+        api_key=settings.openai_api_key,
+        timeout=settings.llm_timeout_seconds,
+        max_retries=0,
     )
 
 
@@ -96,7 +93,7 @@ def _safe_close(workbook: Any) -> None:
         if vba_archive is not None and vba_archive is not archive:
             vba_archive.close()
     except Exception:  # pragma: no cover - close support varies by reader
-        logger.debug("[Spreadsheet] Workbook close failed", exc_info=True)
+        logger.debug("Spreadsheet workbook close failed")
 
 
 def _safe_worksheet_charts(worksheet: Any) -> list[Any]:
@@ -109,11 +106,7 @@ def _safe_worksheet_charts(worksheet: Any) -> list[Any]:
     try:
         return list(getattr(worksheet, "_charts", ()) or ())
     except Exception:
-        logger.warning(
-            "[Spreadsheet] Could not enumerate charts on sheet=%s",
-            getattr(worksheet, "title", "unknown"),
-            exc_info=True,
-        )
+        logger.warning("Spreadsheet chart enumeration failed")
         return []
 
 
@@ -123,11 +116,7 @@ def _safe_worksheet_images(worksheet: Any) -> list[Any]:
     try:
         return list(getattr(worksheet, "_images", ()) or ())
     except Exception:
-        logger.warning(
-            "[Spreadsheet] Could not enumerate images on sheet=%s",
-            getattr(worksheet, "title", "unknown"),
-            exc_info=True,
-        )
+        logger.warning("Spreadsheet image enumeration failed")
         return []
 
 
@@ -140,7 +129,7 @@ def _anchor_location(anchor: Any) -> str:
         try:
             return f"{get_column_letter(marker.col + 1)}{marker.row + 1}"
         except Exception:
-            logger.debug("[Visual] Invalid cell anchor", exc_info=True)
+            logger.debug("Spreadsheet visual has an invalid cell anchor")
 
     position = getattr(anchor, "pos", None)
     if position is not None:
@@ -512,8 +501,8 @@ def _source_data(
             multilevel.reference = reference
             return multilevel
         cells = [cell for row in grid for cell in row]
-    except SpreadsheetReferenceError as exc:
-        logger.warning("[Chart Series] %s: %s", context, exc)
+    except SpreadsheetReferenceError:
+        logger.warning("Spreadsheet chart reference could not be resolved")
         result.values.update(cached_values)
         result.indices.update(cached_indices)
         result.statuses.update(
@@ -534,11 +523,7 @@ def _source_data(
             else:
                 result.values[index] = None
                 result.statuses[index] = "unavailable"
-                logger.warning(
-                    "[Chart Series] %s formula has no cached value at %s",
-                    context,
-                    formula_cell.coordinate,
-                )
+                logger.warning("Spreadsheet formula has no cached chart value")
         else:
             result.values[index] = value
             result.statuses[index] = "cell" if value is not None else "blank"
@@ -576,8 +561,8 @@ def _series_label(
                         return str(formula_cell.value)
                     # A resolved blank cell is authoritative over a stale cache.
                     return f"Series {series_index + 1}"
-        except SpreadsheetReferenceError as exc:
-            logger.warning("[Chart Series] %s series title: %s", context, exc)
+        except SpreadsheetReferenceError:
+            logger.warning("Spreadsheet chart series title could not be resolved")
         if cached_values:
             first_index = min(cached_values)
             cached = cached_values[first_index]
@@ -641,8 +626,8 @@ def _title_value(
                         return ""
                 if value is not None:
                     return str(value).strip()
-        except SpreadsheetReferenceError as exc:
-            logger.warning("[Chart] Could not resolve title: %s", exc)
+        except SpreadsheetReferenceError:
+            logger.warning("Spreadsheet chart title could not be resolved")
         cached, _ = _cache_points(
             getattr(string_reference, "strCache", None)
         )
@@ -658,7 +643,7 @@ def _plot_charts(chart: Any) -> list[Any]:
     try:
         candidates = list(getattr(chart, "_charts", ()) or ()) or [chart]
     except Exception:
-        logger.warning("[Chart] Could not enumerate combined chart plots", exc_info=True)
+        logger.warning("Spreadsheet combined chart enumeration failed")
         candidates = [chart]
 
     unique: list[Any] = []
@@ -690,8 +675,7 @@ def _chart_series(
         series_type = str(getattr(plot, "_series_type", "")).lower()
         if series_type not in _SUPPORTED_SERIES_TYPES:
             logger.warning(
-                "[Chart] Unsupported chart plot visual_id=%s type=%s series_type=%s",
-                visual_id,
+                "Unsupported spreadsheet chart plot type=%s series_type=%s",
                 plot_type,
                 series_type or "unknown",
             )
@@ -794,7 +778,7 @@ def _chart_series(
                         )
                 extracted.append(item)
             except Exception:
-                logger.exception("[Chart Series] Failed to extract %s", context)
+                logger.warning("Spreadsheet chart series extraction failed")
             finally:
                 series_index += 1
 
@@ -868,7 +852,7 @@ def _legacy_sheet_manifest(file_path: str) -> list[dict[str, Any]]:
                 }
             )
     except Exception:
-        logger.exception("[Spreadsheet] Could not scan legacy workbook %s", file_path)
+        logger.warning("Legacy spreadsheet scan failed")
     return sheets
 
 
@@ -887,9 +871,7 @@ def scan_workbook(
     extension = Path(file_path).suffix.lower()
     if extension == ".xls":
         logger.warning(
-            "[Spreadsheet] filename=%s legacy .xls native chart/image "
-            "extraction is unsupported; continuing with table ingestion",
-            display_name,
+            "Legacy XLS chart/image extraction is unsupported; continuing with table ingestion"
         )
         return {
             "sheets": _legacy_sheet_manifest(file_path),
@@ -946,12 +928,7 @@ def scan_workbook(
                         )
                     )
                 except Exception:
-                    logger.exception(
-                        "[Chart] filename=%s sheet=%s visual_id=%s failed",
-                        display_name,
-                        sheet_name,
-                        visual_id,
-                    )
+                    logger.warning("Spreadsheet chart scan failed")
 
             for image_index, image in enumerate(_safe_worksheet_images(worksheet)):
                 visual_id = f"{sheet_name}:image:{image_index}"
@@ -970,12 +947,7 @@ def scan_workbook(
                         }
                     )
                 except Exception:
-                    logger.exception(
-                        "[Visual] filename=%s sheet=%s visual_id=%s failed",
-                        display_name,
-                        sheet_name,
-                        visual_id,
-                    )
+                    logger.warning("Spreadsheet image scan failed")
 
         # A workbook chartsheet is not part of ``workbook.worksheets``.  It can
         # still own a native chart whose series reference ordinary worksheets.
@@ -994,12 +966,7 @@ def scan_workbook(
                         )
                     )
                 except Exception:
-                    logger.exception(
-                        "[Chart] filename=%s chartsheet=%s visual_id=%s failed",
-                        display_name,
-                        sheet_name,
-                        visual_id,
-                    )
+                    logger.warning("Spreadsheet chart-sheet scan failed")
     finally:
         _safe_close(value_workbook)
         _safe_close(formula_workbook)
@@ -1054,42 +1021,23 @@ def chunk_table_deterministically(
     )
 
     if not sheet_name:
-        logger.warning(
-            "[Table] table=%s has no sheet_name; skipping deterministic extraction",
-            table_name,
-        )
+        logger.warning("Spreadsheet table has no sheet name; skipping extraction")
         return []
 
     try:
         excel_file = pd.ExcelFile(file_path)
         if sheet_name not in excel_file.sheet_names:
-            logger.warning(
-                "[Table] table=%s sheet=%s does not exist in %s",
-                table_name,
-                sheet_name,
-                Path(file_path).name,
-            )
+            logger.warning("Spreadsheet table references a missing sheet")
             return []
         frame = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
     except Exception:
-        logger.exception(
-            "[Table] Failed to read filename=%s sheet=%s table=%s",
-            Path(file_path).name,
-            sheet_name,
-            table_name,
-        )
+        logger.warning("Spreadsheet table read failed")
         return []
 
     try:
         min_col, min_row, max_col, max_row = _local_table_range(cell_range)
     except (TypeError, ValueError):
-        logger.exception(
-            "[Table] Invalid range filename=%s sheet=%s table=%s range=%s",
-            Path(file_path).name,
-            sheet_name,
-            table_name,
-            cell_range,
-        )
+        logger.warning("Spreadsheet table range is invalid")
         return []
 
     frame_slice = frame.iloc[min_row - 1 : max_row, min_col - 1 : max_col]
@@ -1348,20 +1296,13 @@ def validate_spreadsheet_analysis(
                 # Backward-compatible for older single-sheet analysis responses.
                 sheet_name = next(iter(valid_sheet_names))
             if sheet_name not in valid_sheet_names:
-                logger.warning(
-                    "[Table] Ignoring LLM table with invalid sheet_name=%r",
-                    sheet_name,
-                )
+                logger.warning("Ignoring LLM table with an invalid sheet reference")
                 continue
             cell_range = _string(raw_table.get("cell_range"), max_length=100)
             try:
                 _local_table_range(cell_range)
             except (TypeError, ValueError):
-                logger.warning(
-                    "[Table] Ignoring LLM table with invalid range=%r sheet=%s",
-                    cell_range,
-                    sheet_name,
-                )
+                logger.warning("Ignoring LLM table with an invalid cell range")
                 continue
             raw_headers = raw_table.get("column_headers")
             headers = (
@@ -1400,10 +1341,7 @@ def validate_spreadsheet_analysis(
             visual_id = _string(raw_semantic.get("visual_id"), max_length=500)
             if visual_id not in valid_visual_ids or visual_id in seen_visuals:
                 if visual_id and visual_id not in valid_visual_ids:
-                    logger.warning(
-                        "[Visual] Ignoring LLM semantics for unknown visual_id=%s",
-                        visual_id,
-                    )
+                    logger.warning("Ignoring LLM semantics for an unknown visual")
                 continue
             seen_visuals.add(visual_id)
             result["visual_semantics"].append(
@@ -1529,14 +1467,12 @@ BOUNDED CELL STRUCTURE:
             ],
             response_format={"type": "json_object"},
             temperature=0.0,
+            max_tokens=MAX_LLM_OUTPUT_TOKENS,
         )
         raw_content = response.choices[0].message.content
         parsed = json.loads(raw_content or "")
     except Exception:
-        logger.exception(
-            "[Spreadsheet LLM] Analysis failed for filename=%s",
-            Path(file_path).name,
-        )
+        logger.warning("Spreadsheet LLM analysis failed")
         return _empty_analysis()
     return validate_spreadsheet_analysis(parsed, manifest)
 
@@ -1564,6 +1500,8 @@ def _image_bytes(
         images = _safe_worksheet_images(workbook[sheet_name])
         image = images[image_index]
         raw = image._data()  # Private but the only loaded-image byte boundary.
+        if len(raw) > settings.max_archive_uncompressed_mb * 1024 * 1024:
+            raise ValueError("Embedded image exceeds the configured upload limit")
         if raw.startswith(b"\x89PNG\r\n\x1a\n"):
             mime_type = "image/png"
         elif raw.startswith(b"\xff\xd8\xff"):
@@ -1637,11 +1575,7 @@ def analyze_embedded_visual_with_llm(
     """
 
     if not SPREADSHEET_VISION_MODEL:
-        logger.info(
-            "[Visual] visual_id=%s vision analysis skipped: "
-            "SPREADSHEET_VISION_MODEL is not configured",
-            visual.get("visual_id"),
-        )
+        logger.info("Spreadsheet vision analysis skipped because no model is configured")
         return {}
 
     visual_id = str(visual.get("visual_id") or "")
@@ -1681,16 +1615,12 @@ def analyze_embedded_visual_with_llm(
             ],
             response_format={"type": "json_object"},
             temperature=0.0,
+            max_tokens=MAX_LLM_OUTPUT_TOKENS,
         )
         parsed = json.loads(response.choices[0].message.content or "")
         return _validate_visual_analysis(parsed, visual_id)
     except Exception:
-        logger.exception(
-            "[Visual] Vision analysis failed filename=%s visual_id=%s sheet=%s",
-            Path(file_path).name,
-            visual_id,
-            visual.get("sheet_name"),
-        )
+        logger.warning("Spreadsheet vision analysis failed")
         return {}
 
 
@@ -1700,9 +1630,11 @@ def _chunk_spec(
     chunk_type: str,
     content_type: str,
 ) -> dict[str, str]:
+    bounded_text = text[: settings.max_ingested_chunk_chars]
+    bounded_parent = parent[: settings.max_ingested_chunk_chars]
     return {
-        "text": text,
-        "parent": parent,
+        "text": bounded_text,
+        "parent": bounded_parent,
         "chunk_type": chunk_type,
         "content_type": content_type,
     }
@@ -1996,10 +1928,7 @@ def _fallback_row_chunks(file_path: str) -> list[dict[str, str]]:
                     )
                 )
     except Exception:
-        logger.exception(
-            "[Spreadsheet] Raw row fallback failed filename=%s",
-            Path(file_path).name,
-        )
+        logger.warning("Spreadsheet raw-row fallback failed")
     return chunks
 
 
@@ -2032,7 +1961,7 @@ def build_spreadsheet_chunk_specs(
     try:
         manifest = scan_workbook(file_path, filename=filename)
     except Exception:
-        logger.exception("[Spreadsheet] Deterministic scan failed filename=%s", filename)
+        logger.warning("Deterministic spreadsheet scan failed")
         manifest = {
             "sheets": _legacy_sheet_manifest(file_path),
             "charts": [],
@@ -2064,18 +1993,10 @@ def build_spreadsheet_chunk_specs(
                 )
                 table_chunks_added += 1
         except Exception:
-            logger.exception(
-                "[Table] filename=%s sheet=%s table=%s failed",
-                filename,
-                table.get("sheet_name"),
-                table.get("table_name"),
-            )
+            logger.warning("Spreadsheet table chunk generation failed")
 
     if not normalized_analysis["tables"] or table_chunks_added == 0:
-        logger.warning(
-            "[Spreadsheet] filename=%s no usable logical tables; using raw row fallback",
-            filename,
-        )
+        logger.warning("Spreadsheet has no usable logical tables; using row fallback")
         chunks.extend(_fallback_row_chunks(file_path))
 
     seen_metadata: set[str] = set()
@@ -2120,12 +2041,7 @@ def build_spreadsheet_chunk_specs(
                 )
             )
         except Exception:
-            logger.exception(
-                "[Chart] Chunk generation failed filename=%s visual_id=%s sheet=%s",
-                filename,
-                chart.get("visual_id"),
-                chart.get("sheet_name"),
-            )
+            logger.warning("Spreadsheet chart chunk generation failed")
 
     active_visual_analyzer = visual_analyzer
     if active_visual_analyzer is None and SPREADSHEET_VISION_MODEL:
@@ -2151,12 +2067,7 @@ def build_spreadsheet_chunk_specs(
                     }
                 )
             except Exception:
-                logger.exception(
-                    "[Visual] Analysis failed filename=%s visual_id=%s sheet=%s",
-                    filename,
-                    visual.get("visual_id"),
-                    visual.get("sheet_name"),
-                )
+                logger.warning("Spreadsheet visual analysis failed")
         chunks.append(_visual_chunk(visual, visual_analysis))
 
     return chunks

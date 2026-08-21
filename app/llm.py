@@ -19,35 +19,31 @@ Supports:
 All user-facing answers are returned as strings.
 """
 
-import os
 import json
+import logging
 import re
 from typing import List
 
 from openai import OpenAI
-from dotenv import load_dotenv
+from app.settings import settings
 
 
-load_dotenv()
+logger = logging.getLogger(__name__)
 
 
 # ── Client configuration ──────────────────────────────────────────────────────
 
 client = OpenAI(
-    base_url=os.getenv(
-        "LLM_BASE_URL",
-        "http://localhost:11434/v1",
-    ),
-    api_key=os.getenv(
-        "OPENAI_API_KEY",
-        "ollama",
-    ),
+    base_url=settings.llm_base_url,
+    api_key=settings.openai_api_key,
+    timeout=settings.llm_timeout_seconds,
+    max_retries=0,
 )
 
-LLM_MODEL = os.getenv(
-    "LLM_MODEL",
-    "mistral:7b",
-)
+LLM_MODEL = settings.llm_model
+MAX_LLM_PROMPT_CHARS = settings.max_llm_prompt_chars
+MAX_LLM_OUTPUT_TOKENS = settings.max_llm_output_tokens
+_CONTEXT_MARKER = "__HQLOOKUP_CONTEXT_PLACEHOLDER__"
 
 
 # ── JSON cleanup ──────────────────────────────────────────────────────────────
@@ -82,14 +78,15 @@ def clean_json_response(raw_text: str) -> str:
 
 def build_context(
     chunks: List[dict],
+    *,
+    max_chars: int | None = None,
 ) -> str:
 
     context_blocks = []
+    remaining = max_chars if max_chars is not None else MAX_LLM_PROMPT_CHARS
 
     for i, chunk in enumerate(chunks, 1):
-
-        context_blocks.append(
-            f"""[{i}]
+        block = f"""[{i}]
 FILE: {chunk.get("filename", "unknown")}
 CHUNK ID: {chunk.get("id", i)}
 CONTENT TYPE: {chunk.get("content_type", "unknown")}
@@ -98,7 +95,13 @@ SCORE: {chunk.get("score", "unknown")}
 
 {chunk.get("text", "")}
 """
-        )
+        if remaining <= 0:
+            break
+        if len(block) > remaining:
+            marker = "\n[Context truncated at the configured prompt limit]\n"
+            block = block[: max(0, remaining - len(marker))] + marker
+        context_blocks.append(block)
+        remaining -= len(block)
 
     return "\n\n---\n\n".join(
         context_blocks
@@ -111,10 +114,6 @@ def build_tabular_prompt(
     question: str,
     chunks: List[dict],
 ) -> str:
-
-    context = build_context(
-        chunks
-    )
 
     # Build JSON examples with Python so literal braces do not
     # interfere with f-string formatting.
@@ -152,7 +151,7 @@ def build_tabular_prompt(
         indent=2,
     )
 
-    return f"""
+    prompt_template = f"""
 You are a precise spreadsheet retrieval assistant.
 
 Answer the user's question using ONLY the provided spreadsheet context.
@@ -366,13 +365,19 @@ Non-matching record:
 
 CONTEXT:
 
-{context}
+{_CONTEXT_MARKER}
 
 
 QUESTION:
 
-{question}
+{question[:4000]}
 """.strip()
+    context_budget = max(
+        0,
+        MAX_LLM_PROMPT_CHARS - len(prompt_template) + len(_CONTEXT_MARKER),
+    )
+    context = build_context(chunks, max_chars=context_budget)
+    return prompt_template.replace(_CONTEXT_MARKER, context, 1)
 
 
 # ── Normal text/PDF/DOCX prompt ───────────────────────────────────────────────
@@ -381,10 +386,6 @@ def build_text_prompt(
     question: str,
     chunks: List[dict],
 ) -> str:
-
-    context = build_context(
-        chunks
-    )
 
     output_example = {
         "answers": [
@@ -414,7 +415,7 @@ def build_text_prompt(
         indent=2,
     )
 
-    return f"""
+    prompt_template = f"""
 You are a precise retrieval assistant.
 
 Answer the user's question using ONLY the provided document context.
@@ -511,13 +512,19 @@ OUTPUT FORMAT:
 
 CONTEXT:
 
-{context}
+{_CONTEXT_MARKER}
 
 
 QUESTION:
 
-{question}
+{question[:4000]}
 """.strip()
+    context_budget = max(
+        0,
+        MAX_LLM_PROMPT_CHARS - len(prompt_template) + len(_CONTEXT_MARKER),
+    )
+    context = build_context(chunks, max_chars=context_budget)
+    return prompt_template.replace(_CONTEXT_MARKER, context, 1)
 
 
 # ── OpenAI call ───────────────────────────────────────────────────────────────
@@ -526,39 +533,34 @@ def call_openai(
     prompt: str,
 ) -> str:
 
-    response = client.chat.completions.create(
-        model=LLM_MODEL,
-        response_format={
-            "type": "json_object",
-        },
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a precise retrieval assistant. "
-                    "Return strictly valid JSON. "
-                    "Never use information outside the supplied context."
-                ),
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            response_format={
+                "type": "json_object",
             },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        temperature=0.2,
-    )
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise retrieval assistant. "
+                        "Return strictly valid JSON. "
+                        "Never use information outside the supplied context."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=0.2,
+            max_tokens=MAX_LLM_OUTPUT_TOKENS,
+        )
+    except Exception:
+        logger.error("LLM request failed")
+        return ""
 
-    print(
-        "\n=== DEBUG: RAW LLM RESPONSE OBJECT ==="
-    )
-
-    print(
-        response
-    )
-
-    print(
-        "======================================\n"
-    )
+    logger.debug("LLM response received")
 
     content = response.choices[0].message.content
 
@@ -585,16 +587,10 @@ def parse_llm_json(
 
     except json.JSONDecodeError as exc:
 
-        print(
-            "[LLM WARNING] Failed to parse JSON."
-        )
-
-        print(
-            f"[LLM WARNING] Error: {exc}"
-        )
-
-        print(
-            f"[LLM WARNING] Raw output:\n{raw}"
+        logger.warning(
+            "LLM returned invalid JSON (line=%s column=%s)",
+            exc.lineno,
+            exc.colno,
         )
 
         return {}
@@ -603,10 +599,7 @@ def parse_llm_json(
         parsed,
         dict,
     ):
-        print(
-            "[LLM WARNING] "
-            "Parsed response is not a JSON object."
-        )
+        logger.warning("LLM response was not a JSON object")
 
         return {}
 
@@ -630,17 +623,7 @@ def generate_tabular_answer(
         chunks,
     )
 
-    print(
-        "\n=== DEBUG: TABULAR PROMPT SENT TO LLM ==="
-    )
-
-    print(
-        prompt
-    )
-
-    print(
-        "==========================================\n"
-    )
+    logger.debug("Submitting tabular LLM prompt with %s chunks", len(chunks))
 
     raw = call_openai(
         prompt
@@ -658,11 +641,7 @@ def generate_tabular_answer(
         records,
         list,
     ):
-        print(
-            "[LLM WARNING] "
-            'Tabular response does not contain '
-            'a valid "records" array.'
-        )
+        logger.warning("Tabular LLM response did not contain a records array")
 
         return {
             "records": [],
@@ -690,17 +669,7 @@ def generate_text_answer(
         chunks,
     )
 
-    print(
-        "\n=== DEBUG: TEXT PROMPT SENT TO LLM ==="
-    )
-
-    print(
-        prompt
-    )
-
-    print(
-        "=======================================\n"
-    )
+    logger.debug("Submitting text LLM prompt with %s chunks", len(chunks))
 
     raw = call_openai(
         prompt
@@ -718,11 +687,7 @@ def generate_text_answer(
         answers,
         list,
     ):
-        print(
-            "[LLM WARNING] "
-            'Text response does not contain '
-            'a valid "answers" array.'
-        )
+        logger.warning("Text LLM response did not contain an answers array")
 
         return {
             "answers": [],

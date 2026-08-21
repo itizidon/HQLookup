@@ -8,14 +8,51 @@ import {
   ChevronsUpDown, Building2, Loader2, ShieldAlert, Sliders, 
   Users, ChevronDown, ChevronRight, Sparkles, FileSpreadsheet, X 
 } from 'lucide-react';
-import { useBusiness } from '@/app/context/BusinessContext';
+import { useBusiness, type Business } from '@/app/context/BusinessContext';
+import { apiFetch, errorMessage, responseErrorMessage } from '@/app/lib/api';
 
 interface ServerDocument {
-  id: string;
+  id: string | number;
   name: string;
   type: string;
   business_id: number;
 }
+
+interface MemberRecord {
+  id: string | number;
+  email: string;
+  role: string;
+  status?: string;
+  is_root?: boolean;
+  created_at?: string;
+}
+
+interface TeamMember {
+  id: string | number;
+  email: string;
+  role: string;
+  is_root: boolean;
+}
+
+interface PendingInvitation {
+  id: string | number;
+  email: string;
+  role: string;
+  created_at: string;
+}
+
+interface UploadedDocument {
+  document_id: string | number;
+  filename: string;
+}
+
+type ActiveTab = 'files' | 'settings' | 'team';
+
+const tabs: Array<{ id: ActiveTab; label: string; icon: React.ReactNode }> = [
+  { id: 'files', label: 'Knowledge Base', icon: <FileText size={14} /> },
+  { id: 'settings', label: 'Usage Limits', icon: <Sliders size={14} /> },
+  { id: 'team', label: 'Access Control', icon: <Users size={14} /> },
+];
 
 interface BusinessDetails {
   id: number;
@@ -34,7 +71,7 @@ interface PendingFile {
 
 export default function EnterpriseBusinessDetail() {
   // Pulling context sources to read the central business directory list
-  const { businesses, isLoading: contextLoading } = useBusiness();
+  const { businesses, isLoading: contextLoading, selectBusiness } = useBusiness();
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -46,8 +83,7 @@ export default function EnterpriseBusinessDetail() {
   const activeOrgId = urlOrgId ? Number(urlOrgId) : null;
 
   // ── LOCAL STATE MATRICES ──
-  const [businessDetails, setBusinessDetails] = useState<BusinessDetails | null>(null);
-  const [activeTab, setActiveTab] = useState<'files' | 'settings' | 'team'>('files');
+  const [activeTab, setActiveTab] = useState<ActiveTab>('files');
 
   // Interactive UI / Search Filter States
   const [searchQuery, setSearchQuery] = useState('');
@@ -60,7 +96,7 @@ export default function EnterpriseBusinessDetail() {
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
 
   // Settings Allocation Form States
-  const [localAlloc, setLocalAlloc] = useState<number>(25);
+  const [allocationDraft, setAllocationDraft] = useState<{ businessId: number; value: number } | null>(null);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
 
@@ -71,12 +107,32 @@ export default function EnterpriseBusinessDetail() {
 
   // Access Control Repositories
   const [teamLoading, setTeamLoading] = useState(false);
-  const [allMembers, setAllMembers] = useState<any[]>([]);
+  const [allMembers, setAllMembers] = useState<MemberRecord[]>([]);
+
+  const businessDetails = useMemo<BusinessDetails | null>(() => {
+    if (!activeBizId || !activeOrgId) return null;
+
+    const matched = businesses.find(
+      (business) => business.id === activeBizId && business.org_id === activeOrgId,
+    );
+    if (!matched) return null;
+
+    return {
+      id: matched.id,
+      name: matched.name,
+      org_id: matched.org_id,
+      query_allocation: matched.query_allocation ?? 25,
+    };
+  }, [activeBizId, activeOrgId, businesses]);
+
+  const localAlloc = allocationDraft && allocationDraft.businessId === businessDetails?.id
+    ? allocationDraft.value
+    : businessDetails?.query_allocation ?? 25;
 
   // Split unified members payload cleanly into active/pending structures on the fly
   const { teamMembers, pendingInvites } = useMemo(() => {
-    const active: any[] = [];
-    const pending: any[] = [];
+    const active: TeamMember[] = [];
+    const pending: PendingInvitation[] = [];
 
     allMembers.forEach((m) => {
       if (m.status === 'pending') {
@@ -91,7 +147,7 @@ export default function EnterpriseBusinessDetail() {
           id: m.id,
           email: m.email,
           role: m.role,
-          is_root: m.is_root
+          is_root: Boolean(m.is_root)
         });
       }
     });
@@ -109,78 +165,72 @@ export default function EnterpriseBusinessDetail() {
 
   // ── REFRESH-PROOF PIPELINE ──
   useEffect(() => {
-    if (!activeBizId || !activeOrgId) {
-      setBusinessDetails(null);
-      setDocuments([]);
-      setAllMembers([]);
-      return;
-    }
+    if (!businessDetails) return;
 
-    setSettingsError(null);
-    setInviteEmail('');
-    setInviteStatus(null);
-
-    if (businesses && businesses.length > 0) {
-      const matched = businesses.find(b => b.id === activeBizId);
-      if (matched) {
-        setBusinessDetails({
-          id: matched.id,
-          name: matched.name,
-          org_id: matched.org_id,
-          query_allocation: matched.query_allocation ?? 25
-        });
-        setLocalAlloc(matched.query_allocation ?? 25);
-      }
-    }
+    const controller = new AbortController();
+    const businessId = businessDetails.id;
+    const organizationId = businessDetails.org_id;
 
     const fetchDocs = async () => {
       setDocsLoading(true);
+      setDocuments([]);
       try {
-        const res = await fetch("http://localhost:8000/documents", {
+        const res = await apiFetch("/documents", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          credentials: "include",
+          signal: controller.signal,
           body: JSON.stringify({
-            business_ids: [activeBizId],
+            business_ids: [businessId],
             page: 1,
             page_size: 50
           })
         });
-        const data = await res.json();
+        const data = await res.json() as { documents?: ServerDocument[] };
         if (data.documents) {
           setDocuments(data.documents);
         }
       } catch (err) {
-        console.error("Error retrieving documents:", err);
+        if (!controller.signal.aborted) {
+          console.error("Error retrieving documents:", err);
+        }
       } finally {
-        setDocsLoading(false);
+        if (!controller.signal.aborted) setDocsLoading(false);
       }
     };
 
     const fetchTeamAndInvites = async () => {
       setTeamLoading(true);
+      setAllMembers([]);
       try {
-        const res = await fetch(
-          `http://localhost:8000/organizations/${activeOrgId}/businesses/${activeBizId}/members`,
-          { credentials: "include" }
+        const res = await apiFetch(
+          `/organizations/${organizationId}/businesses/${businessId}/members`,
+          { signal: controller.signal },
         );
 
         if (res.ok) {
-          const data = await res.json();
+          const data = await res.json() as { members?: MemberRecord[] };
           setAllMembers(data.members || []);
         }
       } catch (err) {
-        console.error("Error retrieving unified access control data list:", err);
+        if (!controller.signal.aborted) {
+          console.error("Error retrieving unified access control data list:", err);
+        }
       } finally {
-        setTeamLoading(false);
+        if (!controller.signal.aborted) setTeamLoading(false);
       }
     };
 
     fetchDocs();
     fetchTeamAndInvites();
-  }, [activeBizId, activeOrgId, businesses]);
+    return () => controller.abort();
+  }, [businessDetails]);
 
-  const handleSelectBusiness = (biz: typeof businesses[0]) => {
+  const handleSelectBusiness = (biz: Business) => {
+    selectBusiness(biz);
+    setAllocationDraft(null);
+    setSettingsError(null);
+    setInviteEmail('');
+    setInviteStatus(null);
     const params = new URLSearchParams(searchParams.toString());
     params.set('orgId', biz.org_id.toString());
     params.set('bizId', biz.id.toString());
@@ -236,11 +286,13 @@ export default function EnterpriseBusinessDetail() {
 
   // Execute actual upload API call with file contexts
   const handleStartUpload = async () => {
-    if (pendingFiles.length === 0 || !activeBizId) return;
+    if (pendingFiles.length === 0 || !businessDetails) return;
+
+    const businessId = businessDetails.id;
 
     setUploading(true);
     const formData = new FormData();
-    formData.append("business_id", activeBizId.toString());
+    formData.append("business_id", businessId.toString());
 
     // Map file metadata contexts as a JSON string array to pass alongside FormData
     const contextsPayload: Record<string, string> = {};
@@ -255,18 +307,17 @@ export default function EnterpriseBusinessDetail() {
     formData.append("file_contexts", JSON.stringify(contextsPayload));
 
     try {
-      const res = await fetch("http://localhost:8000/upload-multiple", {
+      const res = await apiFetch("/upload-multiple", {
         method: "POST",
         body: formData,
-        credentials: "include",
       });
-      const data = await res.json();
+      const data = await res.json() as { uploaded?: UploadedDocument[] };
       if (data.uploaded) {
-        const newDocs: ServerDocument[] = data.uploaded.map((u: any) => ({
-          id: u.document_id.toString(),
-          name: u.filename,
-          type: u.filename.split('.').pop()?.toUpperCase() || 'UNKNOWN',
-          business_id: activeBizId
+        const newDocs: ServerDocument[] = data.uploaded.map((uploaded) => ({
+          id: uploaded.document_id.toString(),
+          name: uploaded.filename,
+          type: uploaded.filename.split('.').pop()?.toUpperCase() || 'UNKNOWN',
+          business_id: businessId
         }));
         setDocuments((prev) => [...newDocs, ...prev]);
         setPendingFiles([]); // Clear staging queue
@@ -278,11 +329,10 @@ export default function EnterpriseBusinessDetail() {
     }
   };
 
-  const handleDeleteDoc = async (docId: string) => {
-    if (!activeBizId) return;
+  const handleDeleteDoc = async (docId: string | number) => {
+    if (!businessDetails) return;
     try {
-      const res = await fetch(`http://localhost:8000/documents/${docId}?business_id=${activeBizId}`, {
-        credentials: "include",
+      const res = await apiFetch(`/documents/${encodeURIComponent(String(docId))}?business_id=${businessDetails.id}`, {
         method: "DELETE",
       });
       if (res.ok) {
@@ -294,27 +344,23 @@ export default function EnterpriseBusinessDetail() {
   };
 
   const handleSaveSettings = async () => {
-    if (!activeBizId) return;
+    if (!businessDetails) return;
     setIsSavingSettings(true);
     setSettingsError(null);
     try {
-      const res = await fetch(`http://localhost:8000/businesses/settings`, {
+      const res = await apiFetch("/businesses/settings", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          business_id: activeBizId,
+          business_id: businessDetails.id,
           query_allocation: Number(localAlloc)
         }),
-        credentials: "include",
       });
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail || "Could not patch settings profile.");
+        throw new Error(await responseErrorMessage(res, "Could not patch settings profile."));
       }
-      
-      setBusinessDetails(prev => prev ? { ...prev, query_allocation: Number(localAlloc) } : null);
-    } catch (err: any) {
-      setSettingsError(err.message || "An unhandled error occurred.");
+    } catch (err: unknown) {
+      setSettingsError(errorMessage(err, "An unhandled error occurred."));
     } finally {
       setIsSavingSettings(false);
     }
@@ -322,53 +368,43 @@ export default function EnterpriseBusinessDetail() {
 
   const handleInlineInvite = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inviteEmail.trim() || !activeBizId || !activeOrgId) return;
+    if (!inviteEmail.trim() || !businessDetails) return;
 
     setIsSendingInvite(true);
     setInviteStatus(null);
 
     try {
-      const res = await fetch(`http://localhost:8000/organizations/${activeOrgId}/invite`, {
+      const res = await apiFetch(`/organizations/${businessDetails.org_id}/invite`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        credentials: "include",
         body: JSON.stringify({
           email: inviteEmail.trim(),
           role: "member",
-          business_ids: [activeBizId]
+          business_ids: [businessDetails.id]
         })
       });
 
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail || "Could not complete workspace invitation.");
+        throw new Error(await responseErrorMessage(res, "Could not complete workspace invitation."));
       }
 
+      const invitation = await res.json() as MemberRecord;
       setInviteStatus({ type: 'success', message: `Invitation dispatched successfully to ${inviteEmail}!` });
-
-      const simulatedInvite = {
-        id: `pending_${Math.random().toString()}`,
-        email: inviteEmail.trim(),
-        role: "member",
-        status: "pending",
-        created_at: new Date().toISOString()
-      };
-      setAllMembers(prev => [simulatedInvite, ...prev]);
+      setAllMembers(prev => [invitation, ...prev]);
       setInviteEmail('');
-    } catch (err: any) {
-      setInviteStatus({ type: 'error', message: err.message || "An unhandled network error occurred." });
+    } catch (err: unknown) {
+      setInviteStatus({ type: 'error', message: errorMessage(err, "An unhandled network error occurred.") });
     } finally {
       setIsSendingInvite(false);
     }
   };
 
-  const handleRevokeInvite = async (inviteId: string) => {
-    if (!activeOrgId) return;
+  const handleRevokeInvite = async (inviteId: string | number) => {
+    if (!businessDetails) return;
     try {
-      const parsedId = inviteId.replace('pending_', '');
-      const res = await fetch(`http://localhost:8000/organizations/${activeOrgId}/invitations/${parsedId}`, {
+      const parsedId = String(inviteId).replace('pending_', '');
+      const res = await apiFetch(`/organizations/${businessDetails.org_id}/invitations/${encodeURIComponent(parsedId)}`, {
         method: "DELETE",
-        credentials: "include"
       });
       if (res.ok) {
         setAllMembers(prev => prev.filter(member => member.id !== inviteId));
@@ -440,10 +476,10 @@ export default function EnterpriseBusinessDetail() {
           </div>
         </div>
 
-        {activeBizId && (
+        {businessDetails && (
           <Link 
-            href={`/search?orgId=${activeOrgId}&bizId=${activeBizId}`} 
-            className="btn btn-primary" 
+            href={`/search?orgId=${businessDetails.org_id}&bizId=${businessDetails.id}`}
+            className="btn btn-primary"
             style={{ flexShrink: '0', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px', textDecoration: 'none' }}
           >
             <Search size={14} /> Open search
@@ -453,11 +489,13 @@ export default function EnterpriseBusinessDetail() {
 
       {/* ── MAIN WORKSPACE CONTENT WINDOW ── */}
       <div style={{ padding: '24px' }}>
-        {!activeBizId ? (
+        {!businessDetails ? (
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '360px', color: 'var(--color-text-secondary)', gap: '12px' }}>
             <Building2 size={36} style={{ strokeWidth: 1.5, color: 'var(--color-text-secondary)' }} />
             <div style={{ fontSize: '14px', textAlign: 'center' }}>
-              Select an isolated business environment from the dropdown menu above to adjust vectors or bounds.
+              {contextLoading
+                ? 'Loading authorized business workspaces...'
+                : 'Select an authorized business environment from the dropdown menu above.'}
             </div>
           </div>
         ) : (
@@ -475,14 +513,10 @@ export default function EnterpriseBusinessDetail() {
 
             {/* Segmented Workspace Navigation Tabs */}
             <div style={{ display: 'flex', background: '#ffffff', borderBottom: '1px solid var(--color-border-tertiary)', padding: '0 16px' }}>
-              {[
-                { id: 'files', label: 'Knowledge Base', icon: <FileText size={14} /> },
-                { id: 'settings', label: 'Usage Limits', icon: <Sliders size={14} /> },
-                { id: 'team', label: 'Access Control', icon: <Users size={14} /> }
-              ].map((t) => (
+              {tabs.map((t) => (
                 <button
                   key={t.id}
-                  onClick={() => setActiveTab(t.id as any)}
+                  onClick={() => setActiveTab(t.id)}
                   style={{
                     ...s.tabLink,
                     color: activeTab === t.id ? 'var(--color-primary, #4f46e5)' : 'var(--color-text-secondary)',
@@ -686,7 +720,10 @@ export default function EnterpriseBusinessDetail() {
                     <input
                       type="number"
                       value={localAlloc}
-                      onChange={(e) => setLocalAlloc(Number(e.target.value))}
+                      onChange={(e) => setAllocationDraft({
+                        businessId: businessDetails.id,
+                        value: Number(e.target.value),
+                      })}
                       style={s.formInput}
                       min={0}
                     />

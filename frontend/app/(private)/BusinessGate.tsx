@@ -2,12 +2,18 @@
 
 import { useEffect, useState, useRef } from "react";
 import { useBusiness } from "@/app/context/BusinessContext";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
+import { apiFetch, errorMessage, responseErrorMessage } from "@/app/lib/api";
+
+interface OrganizationSummary {
+  id: number;
+}
 
 export default function BusinessGate({ children }: { children: React.ReactNode }) {
   const { refreshBusinesses, selectedBusiness, businesses, isLoading: isContextLoading } = useBusiness();
   const router   = useRouter();
+  const pathname = usePathname();
   const [isInitializing, setIsInitializing]   = useState(true);
   const [error, setError]                     = useState<string | null>(null);
 
@@ -23,33 +29,33 @@ export default function BusinessGate({ children }: { children: React.ReactNode }
 
     const initWorkspace = async () => {
       try {
-        const orgRes = await fetch("http://localhost:8000/organizations", {
+        const orgRes = await apiFetch("/organizations", {
           method: "GET",
-          credentials: "include",
         });
 
-        if (!orgRes.ok) throw new Error("Failed to retrieve your organization setup.");
-
-        const orgData  = await orgRes.json();
-        const activeOrg = Array.isArray(orgData) ? orgData[0] : orgData;
-
-        if (activeOrg?.id) {
-          await refreshBusinesses([activeOrg.id]);
-        } else {
-          await refreshBusinesses([]);
+        if (!orgRes.ok) {
+          throw new Error(await responseErrorMessage(orgRes, "Failed to retrieve your organization setup."));
         }
-      } catch (err: any) {
+
+        const orgData = await orgRes.json() as OrganizationSummary[] | OrganizationSummary;
+        const organizations = Array.isArray(orgData) ? orgData : [orgData];
+        const orgIds = organizations
+          .map((organization) => organization?.id)
+          .filter((id): id is number => Number.isInteger(id));
+
+        await refreshBusinesses(orgIds);
+      } catch (err: unknown) {
         console.error("[BusinessGate] Bootstrap error:", err);
-        setError(err.message || "Unexpected error.");
+        setError(errorMessage(err, "Unexpected error."));
       } finally {
         setIsInitializing(false);
       }
     };
 
     initWorkspace();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [refreshBusinesses]);
 
-  // ── Effect 2: Route guard — pathname intentionally NOT in deps ─────────────
+  // Route redirects after workspace state is ready.
   useEffect(() => {
     if (isInitializing || isContextLoading) return;
 
@@ -61,10 +67,8 @@ export default function BusinessGate({ children }: { children: React.ReactNode }
     if (isInitializing || isContextLoading) return;
     if (hasRouted.current) return; // Already routed for this state — stop
 
-    const currentPath = window.location.pathname; // Read directly, not from deps
-
     if (businesses.length === 0) {
-      if (currentPath !== "/dashboard") {
+      if (pathname !== "/dashboard") {
         hasRouted.current = true;
         router.push("/dashboard");
       }
@@ -73,13 +77,11 @@ export default function BusinessGate({ children }: { children: React.ReactNode }
 
     if (businesses.length > 0 && !selectedBusiness) return; // Wait for auto-select
 
-    if (currentPath === "/" && selectedBusiness) {
+    if (pathname === "/" && selectedBusiness) {
       hasRouted.current = true;
       router.push("/search");
     }
-  }, [isInitializing, isContextLoading, businesses.length, selectedBusiness?.id]);
-  // ↑ pathname deliberately excluded — we read window.location.pathname directly
-  //   to avoid the push → pathname change → re-run → push loop
+  }, [isInitializing, isContextLoading, businesses.length, selectedBusiness, pathname, router]);
 
   if (isInitializing || (isContextLoading && businesses.length === 0)) {
     return (

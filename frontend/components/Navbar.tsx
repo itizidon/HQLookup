@@ -4,6 +4,7 @@ import { useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
 import { FileText, LogOut } from 'lucide-react';
 import { useRouter } from 'next/navigation';
+import { apiFetch, errorMessage } from '@/app/lib/api';
 
 export default function Navbar({ avatarInitials = 'D' }) {
   const [isOpen, setIsOpen] = useState(false);
@@ -23,13 +24,18 @@ export default function Navbar({ avatarInitials = 'D' }) {
 
   const handleSignOut = async () => {
     try {
-      await fetch('http://localhost:8000/api/auth/logout', {
+      const response = await apiFetch('/api/auth/logout', {
         method: 'POST',
-        credentials: 'include',
       });
-      router.push('/');
-    } catch (err) {
-      console.error('Sign out failed:', err);
+
+      if (!response.ok) {
+        throw new Error('The server could not end this session.');
+      }
+
+      router.replace('/');
+      router.refresh();
+    } catch (error: unknown) {
+      console.error('Sign out failed:', errorMessage(error, 'Unknown error'));
     }
   };
 

@@ -7,12 +7,14 @@ import {
   useCallback, // 👈 Added useCallback
   ReactNode,
 } from "react";
+import { apiFetch } from "@/app/lib/api";
 
 // Update type definition to match your new multi-tenant organization structure
 export type Business = {
   id: number;
   name: string;
   org_id: number;
+  query_allocation?: number;
 };
 
 type State = {
@@ -35,14 +37,18 @@ const initialState: State = {
 
 function businessReducer(state: State, action: Action): State {
   switch (action.type) {
-    case "SET_BUSINESSES":
+    case "SET_BUSINESSES": {
+      const selectedBusiness = state.selectedBusiness
+        ? action.payload.find((business) => business.id === state.selectedBusiness?.id) ?? null
+        : null;
       return {
         ...state,
         businesses: action.payload,
         isLoading: false,
-        // Auto-select the first business if we don't have one selected yet
-        selectedBusiness: state.selectedBusiness || action.payload[0] || null,
+        // Never retain a selection that is absent from the latest authorized list.
+        selectedBusiness: selectedBusiness ?? action.payload[0] ?? null,
       };
+    }
     case "SELECT_BUSINESS":
       return { ...state, selectedBusiness: action.payload };
     case "CLEAR_SELECTION":
@@ -90,9 +96,8 @@ export function BusinessProvider({ children }: { children: ReactNode }) {
 
     dispatch({ type: "SET_LOADING", payload: true });
     try {
-      const res = await fetch("http://localhost:8000/me/businesses", {
+      const res = await apiFetch("/me/businesses", {
         method: "POST",
-        credentials: "include",
         headers: { 
           "Content-Type": "application/json" 
         },
@@ -103,7 +108,7 @@ export function BusinessProvider({ children }: { children: ReactNode }) {
   
       if (!res.ok) throw new Error("Could not reconcile business data.");
       
-      const data = await res.json();
+      const data = await res.json() as { businesses?: Business[] };
       const businessesList = data.businesses || [];
       
       dispatch({ type: "SET_BUSINESSES", payload: businessesList });

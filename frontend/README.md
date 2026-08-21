@@ -16,6 +16,18 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+Browser requests use the same-origin `/backend` path. In development it proxies
+to `http://127.0.0.1:8000`. For builds and production, set the server-only
+`BACKEND_URL` variable to the absolute backend origin:
+
+```bash
+BACKEND_URL=https://api.example.com npm run build
+```
+
+`BACKEND_URL` is intentionally not a `NEXT_PUBLIC_` variable. It must be
+available to the Next.js server when configuration is loaded, and production
+startup fails if it is missing, malformed, or points to a loopback host.
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.

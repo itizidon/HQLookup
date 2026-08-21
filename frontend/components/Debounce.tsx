@@ -1,18 +1,4 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
-
-export function debounce<T extends (...args: any[]) => void>(
-    func: T, 
-    delay: number
-  ): (...args: Parameters<T>) => void {
-    let timeoutId: ReturnType<typeof setTimeout>;
-    
-    return (...args: Parameters<T>) => {
-      clearTimeout(timeoutId);
-      timeoutId = setTimeout(() => {
-        func(...args);
-      }, delay);
-    };
-  }
+import React, { useState, useCallback, useEffect } from 'react';
 
 interface DebounceContainerProps {
   /** The async action to perform (e.g., your fetch/POST request) */
@@ -32,31 +18,31 @@ export function DebounceContainer({
   children 
 }: DebounceContainerProps) {
   const [isLoading, setIsLoading] = useState(false);
-  
-  // Keep the latest action in a ref to prevent unnecessary debounce recreations
-  const actionRef = useRef(action);
-  useEffect(() => {
-    actionRef.current = action;
-  }, [action]);
+  const [timeoutId, setTimeoutId] = useState<ReturnType<typeof setTimeout> | null>(null);
 
-  // Wrapper that handles the loading state during async execution
-  const executeAction = async () => {
-    if (isLoading) return;
-    setIsLoading(true);
-    try {
-      await actionRef.current();
-    } catch (error) {
-      console.error("Action execution failed:", error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  useEffect(() => () => {
+    if (timeoutId) clearTimeout(timeoutId);
+  }, [timeoutId]);
 
-  // Memoize the debounced version so it persists between renders
-  const debouncedHandler = useMemo(
-    () => debounce(executeAction, delay),
-    [delay, isLoading]
-  );
+  const debouncedHandler = useCallback(() => {
+    if (timeoutId) clearTimeout(timeoutId);
+
+    const nextTimeoutId = setTimeout(() => {
+      if (isLoading) return;
+
+      setIsLoading(true);
+      Promise.resolve(action())
+        .catch((error: unknown) => {
+          console.error("Action execution failed:", error);
+        })
+        .finally(() => {
+          setIsLoading(false);
+          setTimeoutId(null);
+        });
+    }, delay);
+
+    setTimeoutId(nextTimeoutId);
+  }, [action, delay, isLoading, timeoutId]);
 
   return <>{children({ handleAction: debouncedHandler, isLoading })}</>;
 }

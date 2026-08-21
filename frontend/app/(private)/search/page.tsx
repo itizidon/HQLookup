@@ -3,9 +3,11 @@
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { FileText } from 'lucide-react';
-import { Search, ChevronDown, History, Clock, Loader2, Building2, MessageSquare, ArrowRight, Plus } from 'lucide-react';
+import { Search, ChevronDown, Clock, Loader2, Building2, MessageSquare, ArrowRight, Plus } from 'lucide-react';
 import { useBusiness } from '@/app/context/BusinessContext';
 import { DebounceContainer } from '@/components/Debounce';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { apiFetch } from '@/app/lib/api';
 
 interface RagAnswerSource {
   chunk: number;
@@ -49,7 +51,18 @@ const formatCorrelation = (score: number | null | undefined) => {
 };
 
 export default function SearchHome() {
-  const { selectedBusiness, businesses, selectBusiness } = useBusiness();
+  const { selectedBusiness: contextBusiness, businesses, selectBusiness } = useBusiness();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const requestedBusinessValue = searchParams.get('bizId');
+  const requestedOrganizationValue = searchParams.get('orgId');
+  const requestedBusinessId = requestedBusinessValue ? Number(requestedBusinessValue) : null;
+  const requestedOrganizationId = requestedOrganizationValue ? Number(requestedOrganizationValue) : null;
+  const requestedBusiness = businesses.find((business) => (
+    business.id === requestedBusinessId
+    && (requestedOrganizationId === null || business.org_id === requestedOrganizationId)
+  ));
+  const selectedBusiness = requestedBusiness ?? contextBusiness;
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
 
   const [query, setQuery] = useState('');
@@ -67,9 +80,8 @@ export default function SearchHome() {
     const fetchRecentQueries = async () => {
       setLoadingQueries(true);
       try {
-        const res = await fetch(`http://localhost:8000/queries/recent?business_id=${selectedBusiness.id}&page=1&page_size=5`, {
+        const res = await apiFetch(`/queries/recent?business_id=${selectedBusiness.id}&page=1&page_size=5`, {
           method: "GET",
-          credentials: "include",
         });
         if (!res.ok) throw new Error("Failed to fetch recent queries");
         const data = await res.json();
@@ -92,10 +104,9 @@ export default function SearchHome() {
     setResult(null);
 
     try {
-      const response = await fetch("http://localhost:8000/ask", {
+      const response = await apiFetch("/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        credentials: "include",
         body: JSON.stringify({
           question: query,
           business_id: selectedBusiness.id,
@@ -108,9 +119,8 @@ export default function SearchHome() {
       const data: RagResponse = await response.json();
       setResult(data);
 
-      const updatedRes = await fetch(`http://localhost:8000/queries/recent?business_id=${selectedBusiness.id}&page=1&page_size=5`, {
+      const updatedRes = await apiFetch(`/queries/recent?business_id=${selectedBusiness.id}&page=1&page_size=5`, {
         method: "GET",
-        credentials: "include",
       });
       if (updatedRes.ok) {
         const updatedData = await updatedRes.json();
@@ -129,10 +139,9 @@ export default function SearchHome() {
     setLoadingMore(true);
 
     try {
-      const response = await fetch("http://localhost:8000/ask", {
+      const response = await apiFetch("/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        credentials: "include",
         body: JSON.stringify({
           question: query,
           business_id: selectedBusiness.id,
@@ -210,6 +219,7 @@ export default function SearchHome() {
                   onClick={() => {
                     setRecentQueries([]);
                     selectBusiness(biz);
+                    router.replace(`/search?orgId=${biz.org_id}&bizId=${biz.id}`);
                     setIsDropdownOpen(false);
                     setResult(null);
                   }}

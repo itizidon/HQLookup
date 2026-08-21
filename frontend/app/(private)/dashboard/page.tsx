@@ -5,7 +5,8 @@ import { Plus, Loader2, Building2, X, ShieldAlert, ChevronDown } from 'lucide-re
 import Navbar from '@/components/Navbar';
 import MetricCard from '@/components/MetricCard';
 import { useRouter } from 'next/navigation';
-import { useBusiness } from '@/app/context/BusinessContext';
+import { useBusiness, type Business } from '@/app/context/BusinessContext';
+import { apiFetch, errorMessage, responseErrorMessage } from '@/app/lib/api';
 
 interface Org {
   id: number;
@@ -63,8 +64,6 @@ export default function AdminDashboard() {
   const [isCreatingOrg, setIsCreatingOrg] = useState(false);
   const [orgError, setOrgError] = useState<string | null>(null);
 
-  const [isMounted, setIsMounted] = useState(false);
-
   const [isBizModalOpen, setIsBizModalOpen] = useState(false);
   const [bizName, setBizName] = useState("");
   const [isCreatingBiz, setIsCreatingBiz] = useState(false);
@@ -77,9 +76,8 @@ export default function AdminDashboard() {
 
     const fetchWorkspaceMetrics = async () => {
       try {
-        const res = await fetch(`http://localhost:8000/auth/usage-metrics?org_id=${currentOrgId}`, {
+        const res = await apiFetch(`/auth/usage-metrics?org_id=${currentOrgId}`, {
           method: "GET",
-          credentials: "include",
         });
         if (res.ok) {
           const data = await res.json();
@@ -96,21 +94,19 @@ export default function AdminDashboard() {
   useEffect(() => {
     const fetchUserDataAndWorkspaces = async () => {
       try {
-        const userRes = await fetch("http://localhost:8000/auth/me", {
+        const userRes = await apiFetch("/api/auth/me", {
           method: "GET",
-          credentials: "include",
         });
         if (userRes.ok) {
-          const userData = await userRes.json();
+          const userData = await userRes.json() as UserProfile;
           setUserProfile(userData);
         }
 
-        const orgRes = await fetch("http://localhost:8000/organizations", {
+        const orgRes = await apiFetch("/organizations", {
           method: "GET",
-          credentials: "include",
         });
         if (!orgRes.ok) throw new Error();
-        const orgData = await orgRes.json();
+        const orgData = await orgRes.json() as Org[];
         setOrganizations(orgData);
         if (orgData.length > 0) {
           setCurrentOrgId(orgData[0].id);
@@ -123,7 +119,6 @@ export default function AdminDashboard() {
     };
 
     fetchUserDataAndWorkspaces();
-    setIsMounted(true);
   }, []);
 
   const userPlanKey = userProfile?.plan?.toLowerCase() || 'free';
@@ -144,20 +139,21 @@ export default function AdminDashboard() {
     setIsCreatingOrg(true);
     setOrgError(null);
     try {
-      const res = await fetch("http://localhost:8000/organizations", {
+      const res = await apiFetch("/organizations", {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: orgName }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Could not instantiate an organization.");
+      if (!res.ok) {
+        throw new Error(await responseErrorMessage(res, "Could not instantiate an organization."));
+      }
+      const data = await res.json() as Org;
       setOrganizations(prev => [...prev, data]);
       setCurrentOrgId(data.id);
       setIsOrgModalOpen(false);
       setOrgName("");
-    } catch (err: any) {
-      setOrgError(err.message || "An unhandled server anomaly occurred.");
+    } catch (err: unknown) {
+      setOrgError(errorMessage(err, "An unhandled server anomaly occurred."));
     } finally {
       setIsCreatingOrg(false);
     }
@@ -171,9 +167,8 @@ export default function AdminDashboard() {
     setBizError(null);
 
     try {
-      const res = await fetch("http://localhost:8000/businesses", {
+      const res = await apiFetch("/businesses", {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: bizName,
@@ -181,10 +176,8 @@ export default function AdminDashboard() {
         }),
       });
 
-      const data = await res.json();
-
       if (!res.ok) {
-        throw new Error(data.detail || "Could not spin up a new business asset.");
+        throw new Error(await responseErrorMessage(res, "Could not spin up a new business asset."));
       }
 
       if (refreshBusinesses && currentOrgId) {
@@ -195,14 +188,14 @@ export default function AdminDashboard() {
 
       setIsBizModalOpen(false);
       setBizName("");
-    } catch (err: any) {
-      setBizError(err.message || "An error occurred while creating the business.");
+    } catch (err: unknown) {
+      setBizError(errorMessage(err, "An error occurred while creating the business."));
     } finally {
       setIsCreatingBiz(false);
     }
   };
 
-  const handleManageBusinessRedirect = (biz: any) => {
+  const handleManageBusinessRedirect = (biz: Business) => {
     selectBusiness(biz);
     if (currentOrgId) {
       router.push(`/businesses?orgId=${currentOrgId}&bizId=${biz.id}`);
@@ -232,10 +225,7 @@ export default function AdminDashboard() {
                       const newOrgId = Number(e.target.value);
                       setCurrentOrgId(newOrgId);
 
-                      const alreadyLoaded = businesses.some(b => b.org_id === newOrgId);
-                      if (!alreadyLoaded && refreshBusinesses) {
-                        refreshBusinesses([newOrgId]);
-                      }
+                      void refreshBusinesses([newOrgId]);
                     }}
                     style={s.orgSelect}
                   >
@@ -282,11 +272,11 @@ export default function AdminDashboard() {
                 className="btn btn-primary"
                 style={{
                   fontSize: '13px',
-                  opacity: (isMounted ? !currentOrgId : false) || isBizLimitReached ? 0.5 : 1,
-                  cursor: (isMounted ? !currentOrgId : false) || isBizLimitReached ? 'not-allowed' : 'pointer'
+                  opacity: !currentOrgId || isBizLimitReached ? 0.5 : 1,
+                  cursor: !currentOrgId || isBizLimitReached ? 'not-allowed' : 'pointer'
                 }}
                 onClick={() => setIsBizModalOpen(true)}
-                disabled={(isMounted ? !currentOrgId : false) || isBizLimitReached}
+                disabled={!currentOrgId || isBizLimitReached}
               >
                 <Plus size={14} /> New business
               </button>
@@ -309,7 +299,7 @@ export default function AdminDashboard() {
         ) : (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '20px' }}>
             {filteredBusinesses.map((biz) => {
-              const match = metricsData?.businesses?.find((b: any) => b.id === biz.id);
+              const match = metricsData?.businesses?.find((business) => business.id === biz.id);
               const bizUsage = match?.usage ?? 0;
               const bizAlloc = match?.allocation ?? 25;
               const bizPercent = Math.min(Math.round((bizUsage / bizAlloc) * 100), 100);

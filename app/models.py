@@ -1,5 +1,17 @@
 from app.database import Base
-from sqlalchemy import Column, Integer, String, ForeignKey, Table, Text, DateTime, Boolean
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from pgvector.sqlalchemy import Vector
@@ -39,6 +51,9 @@ class OrgMember(Base):
     Tracks every user who belongs to an org (admin or not).
     """
     __tablename__ = "org_members"
+    __table_args__ = (
+        UniqueConstraint("org_id", "user_id", name="uq_org_members_org_user"),
+    )
 
     id              = Column(Integer, primary_key=True, index=True)
     org_id          = Column(Integer, ForeignKey("organizations.id"), nullable=False, index=True)
@@ -58,6 +73,26 @@ class User(Base):
     controlling global organization creation caps.
     """
     __tablename__ = "users"
+    __table_args__ = (
+        Index(
+            "uq_users_email_lower",
+            text("lower(email)"),
+            unique=True,
+            postgresql_where=text("email IS NOT NULL"),
+        ),
+        Index(
+            "uq_users_stripe_customer_id",
+            "stripe_customer_id",
+            unique=True,
+            postgresql_where=text("stripe_customer_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_users_stripe_subscription_id",
+            "stripe_subscription_id",
+            unique=True,
+            postgresql_where=text("stripe_subscription_id IS NOT NULL"),
+        ),
+    )
 
     id              = Column(Integer, primary_key=True, index=True)
     email           = Column(String, unique=True, nullable=False)
@@ -198,8 +233,25 @@ class Invitation(Base):
     email       = Column(String, nullable=False)
     role        = Column(String, nullable=False, default="member")
     status      = Column(String, nullable=False, default="pending")  # pending / accepted / revoked
-    token       = Column(String, nullable=True)   # the JWT token sent in the email
+    # ``token`` is retained temporarily for migration compatibility only. New
+    # invitations never store the bearer credential itself.
+    token       = Column(String, nullable=True)
+    token_hash  = Column(String(64), nullable=True, index=True)
+    expires_at  = Column(DateTime(timezone=True), nullable=True)
     created_at  = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     organization = relationship("Organization")
     business     = relationship("Business")
+
+
+class StripeWebhookEvent(Base):
+    """A durable receipt used to make Stripe webhook handling idempotent."""
+
+    __tablename__ = "stripe_webhook_events"
+
+    event_id = Column(String, primary_key=True)
+    processed_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )

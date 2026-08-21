@@ -1,9 +1,17 @@
 import uvicorn
+import hashlib
+import html
 import json
 import math
+import secrets
+import time
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Depends, Query, HTTPException, Form, status
-from typing import List, Optional
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from typing import List, Literal, Optional
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pathlib import Path
 from app.database import get_db
 from sqlalchemy.orm import Session
@@ -14,30 +22,42 @@ from app.rag import (
     ingest_document,
     retrieve_chunks,
     retrieve_chunks_multi,
-    check_search_limit,
-    increment_search_count,
+    QuotaBackendUnavailable,
+    reserve_search,
     clear_active_query,
     get_active_query,
     set_active_query,
+    get_embedder,
     normalize_query,
     PLAN_CONFIG,
 )
 from app.llm import generate_answer
-from pydantic import BaseModel, Field, EmailStr
-from app.auth import get_current_user
-import os
-import uuid
+from pydantic import BaseModel, Field, EmailStr, field_validator
+from app.auth import get_current_user, hash_password, validate_password, verify_password
+from app.access import (
+    get_accessible_businesses,
+    get_billing_owner,
+    get_user_organization_ids,
+    require_business_access,
+    require_businesses_access,
+    require_organization_access,
+)
+from app.settings import settings
+from app.security import CookieOriginMiddleware, UploadBodyLimitMiddleware
+from app.rate_limit import (
+    limit_document_upload,
+    limit_invite_accept,
+    limit_invite_send,
+    limit_invite_verify,
+    limit_search,
+)
+from app.uploads import UnsafeUpload, count_spreadsheet_rows, store_upload
 from datetime import datetime, timedelta, timezone
 from app.routes.billing import router as billing_router
 
-import jwt
 import resend
 
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your_super_secret_signing_key_change_this_in_production")
-JWT_ALGORITHM  = "HS256"
-
-resend.api_key = os.getenv("RESEND_API_KEY")
-FRONTEND_URL   = os.getenv("FRONTEND_URL", "http://localhost:3000")
+resend.api_key = settings.resend_api_key
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -46,14 +66,14 @@ class BusinessSettingsUpdate(BaseModel):
     query_allocation: int = Field(..., ge=0, description="The maximum number of allowed searches")
 
 class AskRequest(BaseModel):
-    question:    str
-    get_k:       int = 3
-    offset:      int = 0
-    business_id: int
+    question:    str = Field(..., min_length=1, max_length=4000)
+    get_k:       int = Field(default=3, ge=1, le=50)
+    offset:      int = Field(default=0, ge=0, le=10_000)
+    business_id: int = Field(..., gt=0)
 
 class CreateBusinessRequest(BaseModel):
-    name:   str
-    org_id: int
+    name:   str = Field(..., min_length=1, max_length=200)
+    org_id: int = Field(..., gt=0)
 
 class BusinessResponse(BaseModel):
     id:   int
@@ -61,9 +81,9 @@ class BusinessResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 class DocumentRequest(BaseModel):
-    business_ids: List[int]
-    page:         int = 1
-    page_size:    int = 50
+    business_ids: List[int] = Field(default_factory=list, max_length=100)
+    page:         int = Field(default=1, ge=1)
+    page_size:    int = Field(default=50, ge=1, le=100)
 
 # If your Pydantic schema looks like this:
 class DocumentResponseItem(BaseModel):
@@ -75,47 +95,121 @@ class DocumentResponseItem(BaseModel):
 
 class DocumentListResponse(BaseModel):
     documents: List[DocumentResponseItem]
+    total: int
 
 class OrgCreateSchema(BaseModel):
-    name: str
+    name: str = Field(..., min_length=1, max_length=200)
 
 class OrgResponseSchema(BaseModel):
     id:       int
     name:     str
     owner_id: int
     is_active: bool
-
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 class WorkspaceQueryRequest(BaseModel):
     org_id:      int
     business_id: int
-    status:      str = "pending"
+    status:      Literal["pending"] = "pending"
 
 class AcceptInviteRequest(BaseModel):
-    token:    str
-    password: str = Field(..., min_length=6)
-    name:     str = "User"
+    token:    str = Field(..., min_length=32, max_length=512)
+    password: str = Field(..., min_length=8, max_length=72)
+    name:     str = Field(default="User", min_length=1, max_length=200)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_bytes(cls, value: str) -> str:
+        return validate_password(value)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Name is required.")
+        return value
+
+
+class VerifyInviteRequest(BaseModel):
+    token: str = Field(..., min_length=32, max_length=512)
 
 class OrgInviteRequest(BaseModel):
     email:        EmailStr
-    role:         str       = "member"
-    business_ids: List[int] = []
+    role:         Literal["admin", "member"] = "member"
+    business_ids: List[int] = Field(
+        default_factory=list,
+        min_length=1,
+        max_length=100,
+    )
 
 class MultiOrgBusinessesRequest(BaseModel):
-    org_ids: List[int] = Field(..., description="List of target organization IDs to filter businesses by")
+    org_ids: List[int] = Field(
+        default_factory=list,
+        max_length=100,
+        description="List of target organization IDs to filter businesses by",
+    )
 
 
 # ── App setup ──────────────────────────────────────────────────────────────────
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if settings.is_production:
+        get_embedder()
+    yield
+
+
+app = FastAPI(
+    lifespan=lifespan,
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
+)
+
+
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=list(settings.trusted_hosts),
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=list(settings.cors_origins),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type"],
 )
+app.add_middleware(
+    CookieOriginMiddleware,
+    allowed_origins=settings.cors_origins,
+    cookie_names=("token", "__Host-token"),
+)
+app.add_middleware(
+    UploadBodyLimitMiddleware,
+    # Keep JSON/form endpoints bounded while leaving room for multipart
+    # boundaries and the optional context form field.
+    max_bytes=1024 * 1024,
+    path_limits={
+        "/upload-multiple": (settings.max_upload_total_mb + 2) * 1024 * 1024,
+        "/billing/webhook": 1024 * 1024,
+    },
+)
+
+
+@app.exception_handler(RequestValidationError)
+async def sanitized_validation_error(_request, exc: RequestValidationError):
+    """Return useful validation errors without echoing submitted secrets."""
+
+    errors = [
+        {
+            "loc": list(error.get("loc", ())),
+            "msg": str(error.get("msg", "Invalid request value")),
+            "type": str(error.get("type", "value_error")),
+        }
+        for error in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
 app.include_router(auth_router)
 app.include_router(billing_router)
 
@@ -133,14 +227,6 @@ def get_business_doc_state(db: Session, business_id: int) -> dict:
         "document_count":     count,
         "latest_document_id": latest_doc.id if latest_doc else None,
     }
-
-def get_user_org_ids(db: Session, user_id: int) -> List[int]:
-    """Reusable helper — returns all org IDs a user belongs to."""
-    return [
-        m.org_id for m in
-        db.query(OrgMember).filter(OrgMember.user_id == user_id).all()
-    ]
-
 
 def _coerce_chunk_id(value) -> int | None:
     """Return a positive integer chunk ID without lossy coercion."""
@@ -251,82 +337,161 @@ def read_root():
     return {"Hello": "World"}
 
 
-# ── Auth: verify invite token ──────────────────────────────────────────────────
-@app.get("/auth/verify-invite")
-def verify_invite_token(token: str, db: Session = Depends(get_db)):
-    try:
-        payload    = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-        email      = payload["email"]
-        user_exists = db.query(User).filter(User.email == email).first() is not None
-        return {
-            "valid":       True,
-            "email":       email,
-            "org_id":      payload["org_id"],
-            "user_exists": user_exists,
-        }
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=400, detail="This invitation link has expired.")
-    except jwt.InvalidTokenError:
+INVITATION_LIFETIME = timedelta(days=7)
+
+
+def invitation_token_hash(token: str) -> str:
+    """Return the non-reversible identifier stored for an invitation token."""
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _aware_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _load_pending_invitation_group(
+    db: Session,
+    token: str,
+    *,
+    for_update: bool = False,
+) -> list[Invitation]:
+    token_hash = invitation_token_hash(token)
+    query = db.query(Invitation).filter(
+        Invitation.token_hash == token_hash,
+        Invitation.status == "pending",
+    )
+    if for_update:
+        query = query.with_for_update()
+    invitations = query.order_by(Invitation.id.asc()).all()
+    if not invitations:
         raise HTTPException(status_code=400, detail="Invalid invitation token.")
+
+    now = datetime.now(timezone.utc)
+    if any(
+        invitation.expires_at is None
+        or _aware_utc(invitation.expires_at) <= now
+        for invitation in invitations
+    ):
+        raise HTTPException(status_code=400, detail="This invitation link has expired.")
+
+    org_ids = {invitation.org_id for invitation in invitations}
+    emails = {invitation.email.strip().lower() for invitation in invitations}
+    roles = {invitation.role for invitation in invitations}
+    if len(org_ids) != 1 or len(emails) != 1 or len(roles) != 1:
+        raise HTTPException(status_code=400, detail="Invalid invitation token.")
+    if not roles.issubset({"admin", "member"}):
+        raise HTTPException(status_code=400, detail="Invalid invitation token.")
+
+    org_id = next(iter(org_ids))
+    active_org = db.query(Organization).filter(
+        Organization.id == org_id,
+        Organization.is_active.is_(True),
+    ).first()
+    if active_org is None:
+        raise HTTPException(status_code=400, detail="Invalid invitation token.")
+
+    business_ids = {invitation.business_id for invitation in invitations}
+    valid_business_count = db.query(Business).filter(
+        Business.id.in_(business_ids),
+        Business.org_id == org_id,
+    ).count()
+    if valid_business_count != len(business_ids):
+        raise HTTPException(status_code=400, detail="Invalid invitation token.")
+
+    return invitations
+
+
+# ── Auth: verify invite token ──────────────────────────────────────────────────
+@app.post("/auth/verify-invite", dependencies=[Depends(limit_invite_verify)])
+def verify_invite_token(body: VerifyInviteRequest, db: Session = Depends(get_db)):
+    invitations = _load_pending_invitation_group(db, body.token)
+    invitation = invitations[0]
+    email = invitation.email.strip().lower()
+    user_exists = db.query(User).filter(func.lower(User.email) == email).first() is not None
+    return {
+        "valid": True,
+        "email": email,
+        "org_id": invitation.org_id,
+        "user_exists": user_exists,
+    }
 
 
 # ── Auth: accept invite ────────────────────────────────────────────────────────
-@app.post("/auth/accept-invite")
+@app.post("/auth/accept-invite", dependencies=[Depends(limit_invite_accept)])
 def accept_workspace_invitation(body: AcceptInviteRequest, db: Session = Depends(get_db)):
     try:
-        payload = jwt.decode(body.token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-        raise HTTPException(status_code=400, detail="Invalid or expired invitation token.")
+        # Lock every row represented by this bearer token. A concurrent accept
+        # blocks here and, after the first commit, can no longer find a pending
+        # row, making the token genuinely single-use.
+        invitations = _load_pending_invitation_group(db, body.token, for_update=True)
+        first_invitation = invitations[0]
+        email = first_invitation.email.strip().lower()
+        org_id = first_invitation.org_id
+        role = first_invitation.role
+        business_ids = {invitation.business_id for invitation in invitations}
 
-    email        = payload["email"]
-    org_id       = payload["org_id"]
-    role         = payload["role"]
-    business_ids = payload["business_ids"]
-
-    # Create or fetch user
-    target_user = db.query(User).filter(User.email == email).first()
-    if not target_user:
-        from app.auth import hash_password
-        target_user = User(
-            email=email,
-            name=body.name,
-            hashed_password=hash_password(body.password),
-            plan="free",
+        target_user = (
+            db.query(User).filter(func.lower(User.email) == email).with_for_update().first()
         )
-        db.add(target_user)
-        db.flush()
-
-    # Add org membership
-    existing_member = db.query(OrgMember).filter(
-        OrgMember.org_id  == org_id,
-        OrgMember.user_id == target_user.id,
-    ).first()
-    if not existing_member:
-        db.add(OrgMember(org_id=org_id, user_id=target_user.id, role=role))
-
-    # Grant business access
-    for biz_id in business_ids:
-        already = db.execute(
-            user_business.select().where(
-                user_business.c.user_id    == target_user.id,
-                user_business.c.business_id == biz_id,
+        if target_user:
+            if not verify_password(body.password, target_user.hashed_password):
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid invitation credentials.",
+                )
+        else:
+            target_user = User(
+                email=email,
+                name=body.name,
+                hashed_password=hash_password(body.password),
+                plan="free",
             )
-        ).first()
-        if not already:
-            db.execute(user_business.insert().values(user_id=target_user.id, business_id=biz_id))
+            db.add(target_user)
+            db.flush()
 
-    # Mark invitation as accepted
-    invitation = db.query(Invitation).filter(Invitation.token == body.token).first()
-    if invitation:
-        invitation.status = "accepted"
+        existing_member = db.query(OrgMember).filter(
+            OrgMember.org_id == org_id,
+            OrgMember.user_id == target_user.id,
+        ).with_for_update().first()
+        if not existing_member:
+            db.add(OrgMember(org_id=org_id, user_id=target_user.id, role=role))
+        elif role == "admin" and existing_member.role != "admin":
+            existing_member.role = "admin"
 
-    db.commit()
+        for business_id in business_ids:
+            already_assigned = db.execute(
+                user_business.select().where(
+                    user_business.c.user_id == target_user.id,
+                    user_business.c.business_id == business_id,
+                )
+            ).first()
+            if not already_assigned:
+                db.execute(user_business.insert().values(
+                    user_id=target_user.id,
+                    business_id=business_id,
+                ))
+
+        for invitation in invitations:
+            invitation.status = "accepted"
+
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to accept invitation.",
+        ) from exc
+
     return {"status": "success", "message": "Invitation accepted. You can now sign in."}
 
 
 # ── Auth: current user profile ─────────────────────────────────────────────────
 @app.get("/auth/me")
-async def get_current_user_profile(current_auth = Depends(get_current_user)):
+def get_current_user_profile(current_auth = Depends(get_current_user)):
     user, _     = current_auth
     user_plan   = user.plan.lower() if hasattr(user, "plan") and user.plan else "free"
     tier_config = PLAN_CONFIG.get(user_plan, PLAN_CONFIG["free"])
@@ -343,18 +508,17 @@ async def get_current_user_profile(current_auth = Depends(get_current_user)):
 
 # ── Auth: usage metrics ────────────────────────────────────────────────────────
 @app.get("/auth/usage-metrics")
-async def get_comprehensive_usage_metrics(
+def get_comprehensive_usage_metrics(
     org_id:       int,
     current_auth          = Depends(get_current_user),
     db:           Session = Depends(get_db),
 ):
     user, _ = current_auth
-    org     = db.query(Organization).filter(Organization.id == org_id).first()
-    if not org:
-        raise HTTPException(status_code=404, detail="Organization not found.")
+    access = require_organization_access(db, user, org_id)
+    org = access.organization
 
-    is_owner      = org.owner_id == user.id
-    billing_owner = user if is_owner else db.query(User).filter(User.id == org.owner_id).first()
+    is_owner = access.is_owner
+    billing_owner = get_billing_owner(db, org)
 
     start_of_period = (
         billing_owner.stripe_current_period_start
@@ -373,7 +537,7 @@ async def get_comprehensive_usage_metrics(
         QueryLog.created_at >= start_of_period,
     ).scalar() or 0
 
-    businesses         = db.query(Business).filter(Business.org_id == org_id).all()
+    businesses = get_accessible_businesses(db, user, org_id)
     business_breakdown = []
     for biz in businesses:
         biz_count = db.query(func.count(QueryLog.id)).filter(
@@ -399,125 +563,130 @@ async def get_comprehensive_usage_metrics(
 
 # ── Upload documents ───────────────────────────────────────────────────────────
 @app.post("/upload-multiple")
-async def upload_documents(
+def upload_documents(
     business_id:     int              = Form(...),
     file_contexts:   Optional[str]    = Form(None),
     current_context: User             = Depends(get_current_user),
     files:           List[UploadFile] = File(...),
     db:              Session          = Depends(get_db),
 ):
-    import pandas as pd
+    user, _ = current_context
+    business = require_business_access(db, user, business_id)
+    limit_document_upload(user.id)
 
-    user, _      = current_context
-    user_org_ids = get_user_org_ids(db, user.id)
-
-    business = (
-        db.query(Business)
-        .filter(Business.id == business_id, Business.org_id.in_(user_org_ids))
-        .first()
-    )
-    if not business:
-        raise HTTPException(status_code=403, detail="Business not found or access denied.")
+    if not files or len(files) > settings.max_upload_files:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Upload between 1 and {settings.max_upload_files} files at a time.",
+        )
 
     # ── Plan limits ────────────────────────────────────────────────────────────
-    user_plan = user.plan if hasattr(user, "plan") else "free"
+    billing_owner = get_billing_owner(db, business.organization)
+    user_plan = (billing_owner.plan or "free").lower()
     config    = PLAN_CONFIG.get(user_plan, PLAN_CONFIG["free"])
     max_rows  = config["max_rows"]
     max_mb    = config["max_file_mb"]
 
     # Parse optional JSON map: {"filename.xlsx": "context note"}
-    contexts_map = {}
+    contexts_map: dict[str, str] = {}
     if file_contexts:
+        if len(file_contexts) > 100_000:
+            raise HTTPException(status_code=400, detail="file_contexts is too large.")
         try:
-            contexts_map = json.loads(file_contexts)
-        except Exception as e:
-            print(f"Failed to parse file_contexts payload: {e}")
+            raw_contexts = json.loads(file_contexts)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="file_contexts must be a valid JSON object.",
+            ) from exc
+        if not isinstance(raw_contexts, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in raw_contexts.items()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="file_contexts must map filenames to text.",
+            )
+        if any(len(value) > 4000 for value in raw_contexts.values()):
+            raise HTTPException(status_code=400, detail="A file context is too long.")
+        contexts_map = {
+            Path(key).name: value.strip()
+            for key, value in raw_contexts.items()
+        }
 
     uploaded = []
-    for file in files:
-        safe_filename    = Path(file.filename).name
-        specific_context = contexts_map.get(safe_filename, "").strip() or None
-        ext              = Path(safe_filename).suffix.lower()
-        temp_path        = f"/tmp/{uuid.uuid4()}_{safe_filename}"
+    total_bytes = 0
+    max_file_bytes = int(max_mb * 1024 * 1024)
+    max_total_bytes = settings.max_upload_total_mb * 1024 * 1024
 
-        # Save to disk
-        contents = await file.read()
-        with open(temp_path, "wb") as f:
-            f.write(contents)
+    for file in files:
+        stored = None
+        display_filename = Path(file.filename or "upload").name[:255] or "upload"
 
         try:
-            # ── File size check ────────────────────────────────────────────────
-            file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
-            if file_size_mb > max_mb:
-                raise HTTPException(status_code=400, detail={
-                    "message":     f"{safe_filename} exceeds the {max_mb}MB limit for your {config['display_name']} plan.",
-                    "size_mb":     round(file_size_mb, 1),
-                    "limit_mb":    max_mb,
-                    "upgrade_url": "/pricing",
-                })
+            stored = store_upload(
+                file,
+                max_file_bytes=max_file_bytes,
+                max_remaining_bytes=max_total_bytes - total_bytes,
+            )
+            total_bytes += stored.size_bytes
+            specific_context = contexts_map.get(stored.filename) or None
 
             # ── Row count check (spreadsheets only) ───────────────────────────
-            if ext in [".csv", ".xlsx", ".xlsm", ".xls"]:
-                try:
-                    if ext == ".csv":
-                        with open(temp_path) as f:
-                            row_count = sum(1 for _ in f) - 1
-                    else:
-                        xl        = pd.ExcelFile(temp_path)
-                        row_count = sum(
-                            len(pd.read_excel(temp_path, sheet_name=s, header=None))
-                            for s in xl.sheet_names
-                        )
-
-                    if row_count > max_rows:
-                        raise HTTPException(status_code=400, detail={
-                            "message":     f"{safe_filename} has {row_count} rows which exceeds your {config['display_name']} plan limit of {max_rows}.",
-                            "rows":        row_count,
-                            "limit":       max_rows,
-                            "upgrade_url": "/pricing",
-                        })
-                except HTTPException:
-                    raise
-                except Exception as e:
-                    print(f"[Upload] Row count check failed for {safe_filename}: {e}")
+            if stored.extension in {".csv", ".xlsx", ".xlsm", ".xls"}:
+                row_count = count_spreadsheet_rows(
+                    stored.path,
+                    stored.extension,
+                    stop_after=max_rows,
+                )
+                if row_count > max_rows:
+                    raise UnsafeUpload(
+                        f"Spreadsheet exceeds the {max_rows}-row {config['display_name']} plan limit"
+                    )
 
             # ── Create document record ─────────────────────────────────────────
             doc = Document(
                 business_id=business.id,
-                filename=safe_filename,
+                filename=stored.filename,
                 content="",
                 description=specific_context,
                 status="ready",
             )
             db.add(doc)
-            db.commit()
-            db.refresh(doc)
+            db.flush()
 
             # ── Ingest ─────────────────────────────────────────────────────────
             chunks_count = ingest_document(
                 db=db,
                 business_id=business.id,
                 document_id=doc.id,
-                file_path=temp_path,
-                filename=safe_filename,
+                file_path=stored.path,
+                filename=stored.filename,
             )
+            if chunks_count <= 0:
+                raise UnsafeUpload("Document did not contain searchable content")
+
             uploaded.append({
-                "filename":    safe_filename,
+                "filename":    stored.filename,
                 "document_id": doc.id,
                 "chunks":      chunks_count,
             })
 
-        except HTTPException:
-            raise
-        except Exception as e:
-            print(f"[Upload] Failed for {safe_filename}: {e}")
+        except UnsafeUpload as exc:
+            db.rollback()
             uploaded.append({
-                "filename": safe_filename,
-                "error":    str(e),
+                "filename": display_filename,
+                "error": str(exc),
+            })
+        except Exception:
+            db.rollback()
+            uploaded.append({
+                "filename": display_filename,
+                "error": "Upload processing failed.",
             })
         finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            if stored is not None:
+                Path(stored.path).unlink(missing_ok=True)
 
     clear_active_query(user.id)
     return {"uploaded": uploaded}
@@ -525,25 +694,19 @@ async def upload_documents(
 
 # ── Get documents ──────────────────────────────────────────────────────────────
 @app.post("/documents", response_model=DocumentListResponse, status_code=status.HTTP_200_OK)
-async def get_documents(
+def get_documents(
     payload:      DocumentRequest,
     db:           Session = Depends(get_db),
     current_auth          = Depends(get_current_user),
 ):
-    user, _      = current_auth
-    user_org_ids = get_user_org_ids(db, user.id)
-
-    # 1. Authorize requested business IDs
-    allowed_business_ids = {
-        b.id for b in db.query(Business.id).filter(Business.org_id.in_(user_org_ids)).all()
-    }
-    
     if not payload.business_ids:
         return DocumentListResponse(documents=[], total=0)
 
-    for requested_id in payload.business_ids:
-        if requested_id not in allowed_business_ids:
-            raise HTTPException(status_code=403, detail=f"Not authorized for business ID: {requested_id}")
+    user, _ = current_auth
+    authorized_business_ids = [
+        business.id
+        for business in require_businesses_access(db, user, payload.business_ids)
+    ]
 
     # 2. Compute safe pagination bounds
     page = max(payload.page, 1)
@@ -551,7 +714,7 @@ async def get_documents(
     offset = (page - 1) * page_size
 
     # 3. Query documents
-    query = db.query(Document).filter(Document.business_id.in_(payload.business_ids))
+    query = db.query(Document).filter(Document.business_id.in_(authorized_business_ids))
     total_count = query.count()  # Optional: include if response schema requires total
 
     query_results = (
@@ -590,50 +753,31 @@ def get_my_businesses(
     if not requested_org_ids:
         return {"businesses": []}
 
-    memberships       = db.query(OrgMember).filter(
-        OrgMember.org_id.in_(requested_org_ids),
-        OrgMember.user_id == user.id,
-    ).all()
-    authorized_org_ids = {m.org_id for m in memberships}
-    org_role_map       = {m.org_id: m.role for m in memberships}
-
-    admin_org_ids  = []
-    member_org_ids = []
-
-    for org_id in requested_org_ids:
-        if org_id not in authorized_org_ids:
-            raise HTTPException(status_code=403, detail=f"Not a member of org ID {org_id}")
-        org      = db.query(Organization).filter(Organization.id == org_id).first()
-        is_owner = org and org.owner_id == user.id
-        is_admin = org_role_map.get(org_id) == "admin"
-        if is_owner or is_admin:
-            admin_org_ids.append(org_id)
-        else:
-            member_org_ids.append(org_id)
-
     combined = []
-    if admin_org_ids:
-        combined.extend(db.query(Business).filter(Business.org_id.in_(admin_org_ids)).all())
-    if member_org_ids:
-        combined.extend(
-            db.query(Business)
-            .join(user_business, Business.id == user_business.c.business_id)
-            .filter(Business.org_id.in_(member_org_ids), user_business.c.user_id == user.id)
-            .all()
-        )
+    for org_id in dict.fromkeys(requested_org_ids):
+        combined.extend(get_accessible_businesses(db, user, org_id))
 
     return {"businesses": [{"id": b.id, "name": b.name, "org_id": b.org_id} for b in combined]}
 
 
 # ── Organizations: create ──────────────────────────────────────────────────────
 @app.post("/organizations", response_model=OrgResponseSchema, status_code=status.HTTP_201_CREATED)
-async def create_organization(
+def create_organization(
     payload:      OrgCreateSchema,
     db:           Session = Depends(get_db),
     current_auth          = Depends(get_current_user),
 ):
     user, _   = current_auth
-    user_plan = user.plan if hasattr(user, "plan") else "free"
+    # Serialize entitlement checks so concurrent requests cannot exceed the
+    # organization cap.
+    locked_user = (
+        db.query(User)
+        .filter(User.id == user.id)
+        .populate_existing()
+        .with_for_update()
+        .one()
+    )
+    user_plan = (locked_user.plan or "free").lower()
     config    = PLAN_CONFIG.get(user_plan, PLAN_CONFIG["free"])
     max_orgs  = config.get("max_organizations", 1)
 
@@ -652,172 +796,152 @@ async def create_organization(
         db.commit()
         db.refresh(new_org)
         return new_org
-    except Exception as e:
+    except Exception as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to create organization.",
+        ) from exc
 
 
 # ── Organizations: list ────────────────────────────────────────────────────────
 @app.get("/organizations", response_model=List[OrgResponseSchema], status_code=status.HTTP_200_OK)
-async def get_user_organizations(
+def get_user_organizations(
     db:           Session = Depends(get_db),
     current_auth          = Depends(get_current_user),
 ):
     user, _ = current_auth
-    try:
-        memberships = db.query(OrgMember).filter(OrgMember.user_id == user.id).all()
-        return [
-            {
-                "id":       m.organization.id,
-                "name":     m.organization.name,
-                "owner_id": m.organization.owner_id,
-                "is_active": m.organization.is_active,
-            }
-            for m in memberships if m.organization
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    org_ids = get_user_organization_ids(db, user)
+    if not org_ids:
+        return []
+    return db.query(Organization).filter(Organization.id.in_(org_ids)).all()
 
 
 # ── Organizations: invite user ─────────────────────────────────────────────────
 @app.post("/organizations/{org_id}/invite", status_code=status.HTTP_201_CREATED)
-async def invite_user_to_workspace(
+def invite_user_to_workspace(
     org_id:       int,
     body:         OrgInviteRequest,
     db:           Session = Depends(get_db),
     current_auth          = Depends(get_current_user),
 ):
     admin_user, _ = current_auth
+    access = require_organization_access(db, admin_user, org_id, admin=True)
+    limit_invite_send(admin_user.id, org_id)
+    # Serialize seat checks and invitation replacement within an organization.
+    org = db.query(Organization).filter(
+        Organization.id == access.organization.id
+    ).with_for_update().one()
+    normalized_email = str(body.email).strip().lower()
+    business_ids = list(dict.fromkeys(body.business_ids))
 
-    # 1. Fetch organization and verify admin permissions
-    org = db.query(Organization).filter(Organization.id == org_id).first()
-    if not org:
-        raise HTTPException(status_code=404, detail="Organization not found.")
-
-    admin_membership = db.query(OrgMember).filter(
-        OrgMember.org_id == org_id, OrgMember.user_id == admin_user.id
-    ).first()
-    if org.owner_id != admin_user.id and (not admin_membership or admin_membership.role != "admin"):
-        raise HTTPException(status_code=403, detail="Admin permissions required.")
-
-    # 2. Schema check: Ensure at least one valid business ID is provided
-    if not body.business_ids or len(body.business_ids) == 0:
+    valid_count = db.query(Business).filter(
+        Business.id.in_(business_ids),
+        Business.org_id == org_id,
+    ).count()
+    if valid_count != len(business_ids):
         raise HTTPException(
-            status_code=400, 
-            detail="At least one valid location target (business_id) must be selected for this invitation."
+            status_code=400,
+            detail="One or more selected business IDs are invalid.",
         )
 
-    # 3. Seat limit check
-    billing_owner  = db.query(User).filter(User.id == org.owner_id).first()
-    owner_plan     = billing_owner.plan.lower() if billing_owner and billing_owner.plan else "free"
-    config         = PLAN_CONFIG.get(owner_plan, PLAN_CONFIG["free"])
-    max_seats      = config.get("max_users", 2)
-    active_seats   = db.query(OrgMember).filter(OrgMember.org_id == org_id).count()
-    pending_seats  = db.query(Invitation).filter(
-        Invitation.org_id == org_id, Invitation.status == "pending"
-    ).count()
-    if (active_seats + pending_seats) >= max_seats:
+    billing_owner = get_billing_owner(db, org)
+    owner_plan = (billing_owner.plan or "free").lower()
+    max_seats = PLAN_CONFIG.get(owner_plan, PLAN_CONFIG["free"]).get("max_users", 2)
+    active_seats = db.query(OrgMember).filter(OrgMember.org_id == org_id).count()
+    target_is_member = db.query(OrgMember).join(User, OrgMember.user_id == User.id).filter(
+        OrgMember.org_id == org_id,
+        func.lower(User.email) == normalized_email,
+    ).first() is not None
+    other_pending_seats = db.query(
+        func.count(func.distinct(func.lower(Invitation.email)))
+    ).filter(
+        Invitation.org_id == org_id,
+        Invitation.status == "pending",
+        Invitation.expires_at > datetime.now(timezone.utc),
+        func.lower(Invitation.email) != normalized_email,
+    ).scalar() or 0
+    prospective_seats = active_seats + other_pending_seats + (0 if target_is_member else 1)
+    if prospective_seats > max_seats:
         raise HTTPException(
             status_code=400,
             detail=f"Seat limit reached ({max_seats} max). Upgrade to invite more members.",
         )
 
-    # 4. Validate business IDs belong to this org layer safely
-    valid_count = db.query(Business).filter(
-        Business.id.in_(body.business_ids), Business.org_id == org_id
-    ).count()
-    if valid_count != len(body.business_ids):
-        raise HTTPException(status_code=400, detail="One or more selected business IDs are invalid.")
-
-    # 5. Generate a secure, short-lived JWT token (Expires in 7 days)
-    token_expiry  = datetime.now(timezone.utc) + timedelta(days=7)
-    invite_token  = jwt.encode(
-        {"email": body.email, "org_id": org_id, "role": body.role,
-         "business_ids": body.business_ids, "exp": token_expiry},
-        JWT_SECRET_KEY, algorithm=JWT_ALGORITHM,
-    )
-
-    # 6. Save invitations to DB - Every entry now maps cleanly to its required business_id
-    # We track the primary invite ID to cleanly hand it right back to the frontend engine
-    primary_invite_id = None
-    created_invites = []
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = invitation_token_hash(raw_token)
+    now = datetime.now(timezone.utc)
+    expires_at = now + INVITATION_LIFETIME
+    # Keep the bearer token in the URL fragment. Fragments are not sent to the
+    # frontend server, reverse proxy, or access logs; client code removes it
+    # before verification.
+    invite_link = f"{settings.frontend_url}/accept-invite#token={raw_token}"
+    created_invitations: list[Invitation] = []
 
     try:
-        for biz_id in body.business_ids:
-            # Check for an existing duplicate pending invite to same email + business to avoid spam
-            existing = db.query(Invitation).filter(
-                Invitation.org_id      == org_id,
-                Invitation.business_id == biz_id,
-                Invitation.email       == body.email,
-                Invitation.status      == "pending",
-            ).first()
-            
-            if not existing:
-                inv = Invitation(
-                    org_id      = org_id,
-                    business_id = biz_id,  # 👈 Maps the non-nullable relation correctly
-                    email       = body.email,
-                    role        = body.role,
-                    status      = "pending",
-                    token       = invite_token,
-                    created_at  = datetime.now(timezone.utc)
-                )
-                db.add(inv)
-                created_invites.append(inv)
-        
-        db.commit()
-        
-        # Capture the database ID of the primary location invited to
-        if created_invites:
-            db.refresh(created_invites[0])
-            primary_invite_id = created_invites[0].id
-        else:
-            # Fallback handling: If it was already pending, find it
-            fallback = db.query(Invitation).filter(
-                Invitation.org_id == org_id,
-                Invitation.business_id == body.business_ids[0],
-                Invitation.email == body.email
-            ).first()
-            primary_invite_id = fallback.id if fallback else 999
-            
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Database transaction error: {str(e)}")
+        # A resend replaces the old grant set so an earlier email cannot grant
+        # locations that an administrator subsequently removed.
+        old_pending = db.query(Invitation).filter(
+            Invitation.org_id == org_id,
+            func.lower(Invitation.email) == normalized_email,
+            Invitation.status == "pending",
+        ).with_for_update().all()
+        for invitation in old_pending:
+            invitation.status = "revoked"
 
-    # 7. Send the transactional invite email via Resend
-    invite_link = f"{FRONTEND_URL}/accept-invite?token={invite_token}"
-    try:
+        for business_id in business_ids:
+            invitation = Invitation(
+                org_id=org_id,
+                business_id=business_id,
+                email=normalized_email,
+                role=body.role,
+                status="pending",
+                token=None,
+                token_hash=token_hash,
+                expires_at=expires_at,
+                created_at=now,
+            )
+            db.add(invitation)
+            created_invitations.append(invitation)
+
+        db.flush()
+        primary_invite_id = created_invitations[0].id
+
+        safe_admin_email = html.escape(admin_user.email)
+        safe_org_name = html.escape(org.name)
+        safe_invite_link = html.escape(invite_link, quote=True)
+        subject_org_name = str(org.name).replace("\r", " ").replace("\n", " ")[:200]
         resend.Emails.send({
-            "from":    "Team <onboarding@resend.dev>",
-            "to":      [body.email],
-            "subject": f"You've been invited to join {org.name}",
-            "html":    f"""
+            "from": settings.resend_from_email,
+            "to": [normalized_email],
+            "subject": f"You've been invited to join {subject_org_name}",
+            "html": f"""
                 <div style="font-family:sans-serif;padding:20px;color:#333">
                     <h2>You're invited!</h2>
-                    <p><strong>{admin_user.email}</strong> invited you to join their workspace: <strong>{org.name}</strong>.</p>
+                    <p><strong>{safe_admin_email}</strong> invited you to join their workspace: <strong>{safe_org_name}</strong>.</p>
                     <div style="margin:24px 0">
-                        <a href="{invite_link}" style="background:#000;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;display:inline-block">
+                        <a href="{safe_invite_link}" style="background:#000;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;display:inline-block">
                             Accept Invitation
                         </a>
                     </div>
-                    <p style="font-size:12px;color:#666">Or copy: {invite_link}</p>
+                    <p style="font-size:12px;color:#666">Or copy: {safe_invite_link}</p>
                 </div>
             """,
         })
-    except Exception as e:
-        # Rollback database changes if the transactional email delivery fails completely
-        for inv in created_invites:
-            db.delete(inv)
         db.commit()
-        raise HTTPException(status_code=500, detail=f"Email delivery failed: {str(e)}")
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to create or deliver invitation.",
+        ) from exc
 
-    # 8. Returns the explicit object format expected by your React useState array updater
     return {
         "id": f"pending_{primary_invite_id}",
-        "email": body.email,
+        "email": normalized_email,
         "role": body.role,
         "status": "pending",
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "created_at": now.isoformat(),
     }
 
 
@@ -830,22 +954,14 @@ def get_business_members(
     current_auth          = Depends(get_current_user),
 ):
     user, _ = current_auth
-
-    # 1. Auth Guard: Verify the requesting user belongs to this organization
-    membership = db.query(OrgMember).filter(
-        OrgMember.org_id == org_id, OrgMember.user_id == user.id
-    ).first()
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not a member of this organization.")
-
-    # 2. Verify the location profile belongs to this parent workspace container
-    business = db.query(Business).filter(
-        Business.id == business_id, Business.org_id == org_id
-    ).first()
-    if not business:
-        raise HTTPException(status_code=404, detail="Business not found.")
-
-    org = db.query(Organization).filter(Organization.id == org_id).first()
+    business = require_business_access(
+        db,
+        user,
+        business_id,
+        org_id=org_id,
+        admin=True,
+    )
+    org = business.organization
 
     # ── Active members ─────────────────────────────────────────────────────────
     # Pull all workspace memberships for this organization
@@ -869,11 +985,11 @@ def get_business_members(
         if not u:
             continue
             
-        is_owner = (int(org.owner_id) == int(u.id))
+        is_owner = int(org.owner_id) == int(u.id)
+        is_admin = (m.role or "").lower() == "admin"
         is_assigned = u.id in assigned_user_ids
 
-        # Include if they are the root creator, or explicitly mapped via bridge table rows
-        if is_owner or is_assigned:
+        if is_owner or is_admin or is_assigned:
             active_members.append({
                 "id":      str(m.id),  # Matches the OrgMember row ID format expected by page.tsx
                 "email":   u.email,
@@ -889,6 +1005,7 @@ def get_business_members(
             Invitation.org_id      == org_id,
             Invitation.business_id == business_id,
             Invitation.status      == "pending",
+            Invitation.expires_at > datetime.now(timezone.utc),
         )
         .order_by(Invitation.created_at.desc())
         .all()
@@ -918,29 +1035,26 @@ def revoke_invitation(
     current_auth            = Depends(get_current_user),
 ):
     user, _ = current_auth
-
-    org = db.query(Organization).filter(Organization.id == org_id).first()
-    if not org:
-        raise HTTPException(status_code=404, detail="Organization not found.")
-
-    membership = db.query(OrgMember).filter(
-        OrgMember.org_id == org_id, OrgMember.user_id == user.id
-    ).first()
-    is_owner = org.owner_id == user.id
-    is_admin = membership and membership.role == "admin"
-    if not is_owner and not is_admin:
-        raise HTTPException(status_code=403, detail="Admin permissions required to revoke invitations.")
+    require_organization_access(db, user, org_id, admin=True)
 
     invitation = db.query(Invitation).filter(
         Invitation.id     == invitation_id,
         Invitation.org_id == org_id,
         Invitation.status == "pending",
-    ).first()
+    ).with_for_update().first()
     if not invitation:
         raise HTTPException(status_code=404, detail="Invitation not found or already accepted.")
 
     email = invitation.email
-    db.delete(invitation)
+    invitation_group = [invitation]
+    if invitation.token_hash:
+        invitation_group = db.query(Invitation).filter(
+            Invitation.org_id == org_id,
+            Invitation.token_hash == invitation.token_hash,
+            Invitation.status == "pending",
+        ).with_for_update().all()
+    for grouped_invitation in invitation_group:
+        grouped_invitation.status = "revoked"
     db.commit()
     return {"message": f"Invitation to {email} revoked."}
 
@@ -954,13 +1068,8 @@ def get_organization_members(
 ):
     current_user, _ = current_auth
 
-    membership = db.query(OrgMember).filter(
-        OrgMember.org_id == org_id, OrgMember.user_id == current_user.id
-    ).first()
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not authorized.")
-
-    org     = db.query(Organization).filter(Organization.id == org_id).first()
+    access = require_organization_access(db, current_user, org_id, admin=True)
+    org = access.organization
     members = db.query(OrgMember).filter(OrgMember.org_id == org_id).all()
 
     formatted = []
@@ -985,14 +1094,12 @@ def get_pending_invitations(
 ):
     current_user, _ = current_auth
 
-    membership = db.query(OrgMember).filter(
-        OrgMember.org_id == body.org_id, OrgMember.user_id == current_user.id
-    ).first()
-    if not membership:
-        raise HTTPException(status_code=403, detail="Not authorized.")
+    require_organization_access(db, current_user, body.org_id, admin=True)
 
     invites = db.query(Invitation).filter(
-        Invitation.org_id == body.org_id, Invitation.status == body.status
+        Invitation.org_id == body.org_id,
+        Invitation.status == body.status,
+        Invitation.expires_at > datetime.now(timezone.utc),
     ).all()
 
     return {"invitations": [
@@ -1013,17 +1120,26 @@ def create_business_route(
     if not business_name:
         raise HTTPException(status_code=400, detail="Business name is required.")
 
-    membership = db.query(OrgMember).filter(
-        OrgMember.org_id == body.org_id, OrgMember.user_id == user.id
-    ).first()
-    if not membership:
-        raise HTTPException(status_code=403, detail="No permission to modify this organization.")
-
-    org = db.query(Organization).filter(Organization.id == body.org_id).first()
-    if not org:
-        raise HTTPException(status_code=404, detail="Organization not found.")
+    require_organization_access(db, user, body.org_id, admin=True)
+    # Serialize the count/create decision within this organization.
+    org = db.query(Organization).filter(
+        Organization.id == body.org_id
+    ).with_for_update().one()
     if not org.is_active:
         raise HTTPException(status_code=402, detail="Organization is inactive.")
+
+    billing_owner = get_billing_owner(db, org)
+    owner_plan = (billing_owner.plan or "free").lower()
+    max_businesses = PLAN_CONFIG.get(owner_plan, PLAN_CONFIG["free"]).get(
+        "max_businesses",
+        1,
+    )
+    business_count = db.query(Business).filter(Business.org_id == org.id).count()
+    if business_count >= max_businesses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The {owner_plan} plan allows at most {max_businesses} businesses.",
+        )
 
     business = Business(name=business_name, org_id=org.id)
     db.add(business)
@@ -1034,19 +1150,21 @@ def create_business_route(
 
 # ── Businesses: update settings ────────────────────────────────────────────────
 @app.patch("/businesses/settings")
-async def update_business_settings(
+def update_business_settings(
     settings_data: BusinessSettingsUpdate,
     current_auth           = Depends(get_current_user),
     db:            Session = Depends(get_db),
 ):
     user, _ = current_auth
 
-    business = db.query(Business).filter(Business.id == settings_data.business_id).first()
-    if not business:
-        raise HTTPException(status_code=404, detail="Business not found.")
-
-    org = db.query(Organization).filter(Organization.id == business.org_id).first()
-    if not org or org.owner_id != user.id:
+    business = require_business_access(
+        db,
+        user,
+        settings_data.business_id,
+        admin=True,
+    )
+    org = business.organization
+    if org.owner_id != user.id:
         raise HTTPException(status_code=403, detail="Only the org owner can change allocations.")
 
     plan_limit = PLAN_CONFIG.get(user.plan.lower(), PLAN_CONFIG["free"]).get("monthly_searches", 50)
@@ -1090,24 +1208,13 @@ def ask_question(
     current_context=Depends(get_current_user),
 ):
     user, _ = current_context
-
-    user_org_ids = get_user_org_ids(
-        db,
-        user.id,
-    )
+    limit_search(user.id)
 
     # ------------------------------------------------------------------
     # 1. Validate business / organization access
     # ------------------------------------------------------------------
 
-    business = (
-        db.query(Business)
-        .filter(
-            Business.id == body.business_id,
-            Business.org_id.in_(user_org_ids),
-        )
-        .first()
-    )
+    business = require_business_access(db, user, body.business_id)
 
     if not business or not business.organization:
         raise HTTPException(
@@ -1117,11 +1224,8 @@ def ask_question(
 
     org = business.organization
 
-    user_plan = (
-        user.plan
-        if hasattr(user, "plan")
-        else "free"
-    )
+    billing_owner = get_billing_owner(db, org)
+    user_plan = (billing_owner.plan or "free").lower()
 
     config = PLAN_CONFIG.get(
         user_plan,
@@ -1129,29 +1233,69 @@ def ask_question(
     )
 
     # ------------------------------------------------------------------
-    # 2. Check search limits
+    # 2. Atomically reserve this request's search quota. Cost-bearing requests
+    # fail closed if Redis is unavailable, and each HTTP request has a separate
+    # hard cap on downstream model calls.
     # ------------------------------------------------------------------
 
-    allowed, current, limit = check_search_limit(
-        org.id,
-        user_plan,
-    )
+    try:
+        reservation = reserve_search(
+            org.id,
+            user_plan,
+            body.business_id,
+            getattr(business, "query_allocation", 25),
+        )
+        if len(reservation) == 3:
+            allowed, current, limit = reservation
+            business_current = 0
+            business_limit = getattr(business, "query_allocation", 25)
+            quota_reason = 0
+        else:
+            (
+                allowed,
+                current,
+                limit,
+                business_current,
+                business_limit,
+                quota_reason,
+            ) = reservation
+    except QuotaBackendUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Search quota service is temporarily unavailable.",
+        ) from exc
 
     if not allowed:
+        if quota_reason == 2:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "message": f"Business monthly allocation of {business_limit} searches reached.",
+                    "current": business_current,
+                    "limit": business_limit,
+                    "upgrade_url": "/billing",
+                },
+            )
         raise HTTPException(
             status_code=402,
             detail={
                 "message": f"Monthly limit of {limit} searches reached.",
                 "current": current,
                 "limit": limit,
-                "upgrade_url": "/pricing",
+                "upgrade_url": "/billing",
             },
         )
 
-    remaining_plan_calls = max(
-        0,
-        limit - current,
-    )
+    max_llm_calls = settings.max_llm_calls_per_request
+    request_deadline = time.monotonic() + settings.ask_deadline_seconds
+    llm_calls = 0
+
+    def reserve_llm_call() -> bool:
+        nonlocal llm_calls
+        if llm_calls >= max_llm_calls or time.monotonic() >= request_deadline:
+            return False
+        llm_calls += 1
+        return True
 
     # ------------------------------------------------------------------
     # 3. Requested answer page
@@ -1184,8 +1328,6 @@ def ask_question(
     )
 
     if cache_is_valid:
-        print("[Cache] HIT")
-
         retrieval_results = cached.get(
             "retrieval_results",
             [],
@@ -1217,8 +1359,6 @@ def ask_question(
         )
 
     else:
-        print("[Cache] MISS")
-
         retrieval_limit = INITIAL_RETRIEVAL_SIZE
         retrieval_vectors = None
         retrieval_fully_exhausted = False
@@ -1234,6 +1374,7 @@ def ask_question(
                 query=body.question,
                 get_k=retrieval_limit,
                 offset=0,
+                reserve_llm_call=reserve_llm_call,
             )
 
             # Use only the requested retrieval window here.
@@ -1257,6 +1398,7 @@ def ask_question(
                 get_k=retrieval_limit,
                 offset=0,
                 use_hyde=True,
+                reserve_llm_call=reserve_llm_call,
             )
 
             retrieval_results = retrieval.get(
@@ -1285,17 +1427,6 @@ def ask_question(
         retrieval_fully_exhausted = (
             len(retrieval_results) == 0
         )
-
-        print(
-            f"[Retrieval] Initial candidate pool: "
-            f"{len(retrieval_results)} chunks"
-        )
-
-        increment_search_count(
-            org.id
-        )
-
-        remaining_plan_calls -= 1
 
     # ------------------------------------------------------------------
     # Helper:
@@ -1344,8 +1475,6 @@ def ask_question(
     #     which generated answer page the frontend requested
     # ------------------------------------------------------------------
 
-    llm_calls = 0
-
     target_answer_count = (
         answer_offset
         + ANSWER_PAGE_SIZE
@@ -1353,7 +1482,8 @@ def ask_question(
 
     while (
         len(all_answers) < target_answer_count
-        and llm_calls < remaining_plan_calls
+        and llm_calls < max_llm_calls
+        and time.monotonic() < request_deadline
     ):
 
         # ==============================================================
@@ -1363,31 +1493,15 @@ def ask_question(
         if retrieval_cursor >= len(retrieval_results):
 
             if retrieval_fully_exhausted:
-                print(
-                    "[Retrieval Expansion] "
-                    "No more candidates available."
-                )
                 break
 
             if retrieval_limit >= MAX_RETRIEVAL_SIZE:
-                print(
-                    "[Retrieval Expansion] "
-                    f"Reached maximum retrieval size "
-                    f"of {MAX_RETRIEVAL_SIZE}."
-                )
-
                 retrieval_fully_exhausted = True
                 break
 
             new_retrieval_limit = min(
                 retrieval_limit + RETRIEVAL_EXPAND_SIZE,
                 MAX_RETRIEVAL_SIZE,
-            )
-
-            print(
-                "[Retrieval Expansion] "
-                f"Expanding search "
-                f"{retrieval_limit} -> {new_retrieval_limit}"
             )
 
             # ----------------------------------------------------------
@@ -1405,6 +1519,7 @@ def ask_question(
                     # created for the original request. This prevents
                     # Load More from regenerating query variants/HyDE.
                     vectors=retrieval_vectors,
+                    reserve_llm_call=reserve_llm_call,
                 )
 
                 # `results` is the top `new_retrieval_limit` window.
@@ -1423,6 +1538,7 @@ def ask_question(
                     get_k=new_retrieval_limit,
                     offset=0,
                     use_hyde=True,
+                    reserve_llm_call=reserve_llm_call,
                 )
 
                 expanded_results = expanded.get(
@@ -1438,6 +1554,7 @@ def ask_question(
                     get_k=new_retrieval_limit,
                     offset=0,
                     use_hyde=False,
+                    reserve_llm_call=reserve_llm_call,
                 )
 
                 expanded_results = expanded.get(
@@ -1460,33 +1577,14 @@ def ask_question(
                 )
             ]
 
-            print(
-                "[Retrieval Expansion] "
-                f"Expanded retrieval returned "
-                f"{len(expanded_results)} candidates; "
-                f"{len(new_results)} are new."
-            )
-
             retrieval_limit = new_retrieval_limit
 
             if not new_results:
                 retrieval_fully_exhausted = True
-
-                print(
-                    "[Retrieval Expansion] "
-                    "No new chunks found."
-                )
-
                 break
 
             retrieval_results.extend(
                 new_results
-            )
-
-            print(
-                "[Retrieval Expansion] "
-                f"Candidate pool now contains "
-                f"{len(retrieval_results)} chunks."
             )
 
             continue
@@ -1507,35 +1605,17 @@ def ask_question(
         if not chunks:
             break
 
-        print(
-            f"[LLM] Processing candidates "
-            f"{retrieval_cursor}:{batch_end} "
-            f"of {len(retrieval_results)}"
-        )
-
-        print(
-            "\n[LLM BATCH INPUT]"
-        )
-
-        for chunk in chunks:
-            print(
-                f"chunk_id={chunk.get('id')} | "
-                f"chunk_index={chunk.get('chunk_index')} | "
-                f"content_type={chunk.get('content_type')} | "
-                f"chunk_type={chunk.get('chunk_type')} | "
-                f"{chunk.get('text', '')}"
-            )
-
         # --------------------------------------------------------------
         # Main LLM call
         # --------------------------------------------------------------
+
+        if not reserve_llm_call():
+            break
 
         result = generate_answer(
             body.question,
             chunks,
         )
-
-        llm_calls += 1
 
         records = result.get(
             "records",
@@ -1603,10 +1683,6 @@ def ask_question(
             destination_answers,
         ):
             if not isinstance(record, dict):
-                print(
-                    "[INVALID DECISION] "
-                    f"Expected object, received: {record}"
-                )
                 return
 
             chunk_id = record.get(
@@ -1614,11 +1690,6 @@ def ask_question(
             )
 
             if chunk_id is None:
-                print(
-                    "[INVALID DECISION] "
-                    "LLM returned a tabular decision "
-                    "without chunk_id"
-                )
                 return
 
             try:
@@ -1627,10 +1698,6 @@ def ask_question(
                 )
 
             except (TypeError, ValueError):
-                print(
-                    "[INVALID DECISION] "
-                    f"Invalid chunk_id={chunk_id}"
-                )
                 return
 
             # ----------------------------------------------------------
@@ -1638,10 +1705,6 @@ def ask_question(
             # ----------------------------------------------------------
 
             if chunk_id not in expected_ids:
-                print(
-                    "[INVALID DECISION] "
-                    f"Unexpected chunk_id={chunk_id}"
-                )
                 return
 
             # ----------------------------------------------------------
@@ -1649,10 +1712,6 @@ def ask_question(
             # ----------------------------------------------------------
 
             if chunk_id in returned_ids:
-                print(
-                    "[DUPLICATE DECISION] "
-                    f"chunk_id={chunk_id}"
-                )
                 return
 
             original_chunk = tabular_chunks_by_id.get(
@@ -1674,13 +1733,6 @@ def ask_question(
                 returned_ids.add(
                     chunk_id
                 )
-
-                print(
-                    f"[NO MATCH] "
-                    f"chunk_id={chunk_id} | "
-                    f"{original_chunk.get('text', '')[:300] if original_chunk else ''}"
-                )
-
                 return
 
             # ----------------------------------------------------------
@@ -1692,12 +1744,6 @@ def ask_question(
             )
 
             if not answer_text:
-                print(
-                    "[INVALID MATCH] "
-                    f"chunk_id={chunk_id} "
-                    "has matches=true but no usable answer"
-                )
-
                 # Do NOT add it to returned_ids.
                 #
                 # That makes this row eligible for retry.
@@ -1705,12 +1751,6 @@ def ask_question(
 
             returned_ids.add(
                 chunk_id
-            )
-
-            print(
-                f"[MATCH] "
-                f"chunk_id={chunk_id} | "
-                f"{answer_text}"
             )
 
             destination_answers.append({
@@ -1750,10 +1790,6 @@ def ask_question(
         for text_answer in text_answers:
 
             if not isinstance(text_answer, dict):
-                print(
-                    "[INVALID TEXT ANSWER] "
-                    f"Expected object, received: {text_answer}"
-                )
                 continue
 
             answer_text = normalize_answer_text(
@@ -1762,11 +1798,6 @@ def ask_question(
 
             if not answer_text:
                 continue
-
-            print(
-                f"[TEXT MATCH] "
-                f"{answer_text}"
-            )
 
             requested_sources = text_answer.get(
                 "sources"
@@ -1805,13 +1836,6 @@ def ask_question(
             - returned_tabular_ids
         )
 
-        if missing_tabular_ids:
-            print(
-                "[MISSING DECISION] "
-                f"Initial batch failed to account for "
-                f"chunk IDs: {sorted(missing_tabular_ids)}"
-            )
-
         # ==============================================================
         # RETRY ONLY MISSING SPREADSHEET DECISIONS
         #
@@ -1827,15 +1851,10 @@ def ask_question(
         while (
             missing_tabular_ids
             and retry_round < MISSING_DECISION_RETRIES
-            and llm_calls < remaining_plan_calls
+            and llm_calls < max_llm_calls
+            and time.monotonic() < request_deadline
         ):
             retry_round += 1
-
-            print(
-                "[MISSING DECISION RETRY] "
-                f"Round {retry_round} | "
-                f"remaining={sorted(missing_tabular_ids)}"
-            )
 
             ids_to_retry = sorted(
                 missing_tabular_ids
@@ -1843,7 +1862,10 @@ def ask_question(
 
             for missing_id in ids_to_retry:
 
-                if llm_calls >= remaining_plan_calls:
+                if (
+                    llm_calls >= max_llm_calls
+                    or time.monotonic() >= request_deadline
+                ):
                     break
 
                 missing_chunk = tabular_chunks_by_id.get(
@@ -1851,29 +1873,19 @@ def ask_question(
                 )
 
                 if not missing_chunk:
-                    print(
-                        "[RETRY ERROR] "
-                        f"Could not locate "
-                        f"chunk_id={missing_id}"
-                    )
                     continue
-
-                print(
-                    "[RETRY CHUNK] "
-                    f"chunk_id={missing_id} | "
-                    f"{missing_chunk.get('text', '')[:500]}"
-                )
 
                 # ------------------------------------------------------
                 # Retry ONE missing spreadsheet row.
                 # ------------------------------------------------------
 
+                if not reserve_llm_call():
+                    break
+
                 retry_result = generate_answer(
                     body.question,
                     [missing_chunk],
                 )
-
-                llm_calls += 1
 
                 retry_records = retry_result.get(
                     "records",
@@ -1910,17 +1922,6 @@ def ask_question(
         # ==============================================================
 
         if missing_tabular_ids:
-            print(
-                "[UNRESOLVED MISSING DECISION] "
-                f"Could not safely account for "
-                f"chunk IDs: {sorted(missing_tabular_ids)}"
-            )
-
-            print(
-                "[BATCH NOT COMMITTED] "
-                "retrieval_cursor remains unchanged."
-            )
-
             # ----------------------------------------------------------
             # Do NOT:
             #
@@ -1972,22 +1973,6 @@ def ask_question(
         answer_offset:
         answer_offset + ANSWER_PAGE_SIZE
     ]
-
-    print(
-        "\n[PAGINATION DEBUG] "
-        f"answer_offset={answer_offset} "
-        f"total_all_answers={len(all_answers)} "
-        f"retrieval_cursor={retrieval_cursor} "
-        f"retrieval_results={len(retrieval_results)}"
-    )
-
-    for i, answer in enumerate(
-        all_answers
-    ):
-        print(
-            f"[ALL ANSWER {i}] "
-            f"{answer.get('answer')}"
-        )
 
     # ------------------------------------------------------------------
     # 8. Determine whether additional work/results remain
@@ -2115,16 +2100,8 @@ def get_recent_queries(
     db:          Session = Depends(get_db),
     current_user          = Depends(get_current_user),
 ):
-    user, _      = current_user
-    user_org_ids = get_user_org_ids(db, user.id)
-
-    business = (
-        db.query(Business)
-        .filter(Business.id == business_id, Business.org_id.in_(user_org_ids))
-        .first()
-    )
-    if not business:
-        raise HTTPException(status_code=403, detail="Access denied.")
+    user, _ = current_user
+    require_business_access(db, user, business_id)
 
     query   = db.query(QueryLog).filter(QueryLog.business_id == business_id).order_by(QueryLog.id.desc())
     total   = query.count()
@@ -2145,16 +2122,8 @@ def delete_document(
     db:           Session = Depends(get_db),
     current_user          = Depends(get_current_user),
 ):
-    user, _      = current_user
-    user_org_ids = get_user_org_ids(db, user.id)
-
-    business = (
-        db.query(Business)
-        .filter(Business.id == business_id, Business.org_id.in_(user_org_ids))
-        .first()
-    )
-    if not business:
-        raise HTTPException(status_code=403, detail="Access denied.")
+    user, _ = current_user
+    require_business_access(db, user, business_id)
 
     doc = db.query(Document).filter(Document.id == document_id, Document.business_id == business_id).first()
     if not doc:
@@ -2163,8 +2132,22 @@ def delete_document(
     from app.models import Chunk
     db.query(Chunk).filter(Chunk.document_id == document_id).delete()
     db.delete(doc)
+    # Query logs and Redis retrieval caches can contain derived excerpts from
+    # the deleted document. Clear them for the whole tenant, not just the
+    # deleting user's browser session.
+    db.query(QueryLog).filter(QueryLog.business_id == business_id).delete(
+        synchronize_session=False
+    )
     db.commit()
-    clear_active_query(user.id)
+    member_ids = {
+        member_id
+        for (member_id,) in db.query(OrgMember.user_id).filter(
+            OrgMember.org_id == business.organization.id,
+        ).all()
+    }
+    member_ids.add(business.organization.owner_id)
+    for member_id in member_ids:
+        clear_active_query(member_id)
     return {"message": "Document deleted successfully"}
 
 

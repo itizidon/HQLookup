@@ -2,33 +2,37 @@
 Core RAG service using pgvector.
 Handles: document ingestion → chunking → embedding → PostgreSQL storage → retrieval
 """
-import os
 import json
+import logging
 import redis
 import pandas as pd
-from datetime import datetime
-from typing import List
+from datetime import datetime, timezone
+from typing import Callable, List
 from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import OpenAI
-from dotenv import load_dotenv
+from app.settings import settings
 from app.services.spreadsheet_ingestion import (
     analyze_spreadsheet_with_llm,
     build_spreadsheet_chunk_specs,
     chunk_table_deterministically,
     scan_workbook,
 )
-load_dotenv()
+logger = logging.getLogger(__name__)
 
 # ── Client ─────────────────────────────────────────────────────────────────────
 client = OpenAI(
-    base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1"),
-    api_key=os.getenv("OPENAI_API_KEY", "ollama"),
+    base_url=settings.llm_base_url,
+    api_key=settings.openai_api_key,
+    timeout=settings.llm_timeout_seconds,
+    max_retries=0,
 )
-LLM_MODEL = os.getenv("LLM_MODEL", "mistral:7b")
+LLM_MODEL = settings.llm_model
+MAX_QUERY_VARIANTS = 4
+MAX_QUERY_VARIANT_CHARS = 300
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 TOP_K              = 5
@@ -63,11 +67,11 @@ PLAN_CONFIG = {
 }
 
 # ── Redis ──────────────────────────────────────────────────────────────────────
-redis_client = redis.Redis(
-    host=os.getenv("REDIS_HOST", "localhost"),
-    port=int(os.getenv("REDIS_PORT", 6379)),
-    db=0,
+redis_client = redis.Redis.from_url(
+    settings.redis_url,
     decode_responses=True,
+    socket_connect_timeout=2,
+    socket_timeout=2,
 )
 
 ACTIVE_QUERY_TTL_SECONDS = 60 * 60 * 6  # 6 hours
@@ -112,29 +116,60 @@ def chunk_text_small_to_big(text: str) -> List[dict]:
 def get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
-        _embedder = SentenceTransformer(EMBED_MODEL)
+        model_path = settings.embedding_model_path
+        if settings.is_production:
+            path = Path(model_path)
+            if not path.is_absolute() or not path.is_dir():
+                raise RuntimeError(
+                    "Production embedding model path is missing or not absolute"
+                )
+            if not list(path.rglob("*.safetensors")):
+                raise RuntimeError("Production embedding model must use safetensors")
+            unsafe_artifacts = tuple(
+                suffix
+                for suffix in ("*.bin", "*.pt", "*.pth", "*.pkl", "*.pickle")
+                if list(path.rglob(suffix))
+            )
+            if unsafe_artifacts:
+                raise RuntimeError("Unsafe embedding model artifact detected")
+        _embedder = SentenceTransformer(
+            model_path,
+            trust_remote_code=False,
+            local_files_only=settings.is_production,
+        )
+        if _embedder.get_sentence_embedding_dimension() != 384:
+            raise RuntimeError("Embedding model must produce 384-dimensional vectors")
     return _embedder
 
 
 # ── Search quota ───────────────────────────────────────────────────────────────
+class QuotaBackendUnavailable(RuntimeError):
+    """Raised when a cost-bearing request cannot reserve quota safely."""
+
+
+def _monthly_search_key(org_id: int) -> str:
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    return f"searches:org:{org_id}:{month}"
+
+
 def get_monthly_search_count(org_id: int) -> int:
-    key = f"searches:org:{org_id}:{datetime.now().strftime('%Y-%m')}"
+    key = _monthly_search_key(org_id)
     try:
         val = redis_client.get(key)
         return int(val) if val else 0
-    except Exception:
-        return 0
+    except redis.RedisError as exc:
+        raise QuotaBackendUnavailable("Search quota service is unavailable") from exc
 
 def increment_search_count(org_id: int) -> int:
-    key = f"searches:org:{org_id}:{datetime.now().strftime('%Y-%m')}"
+    key = _monthly_search_key(org_id)
     try:
         pipe = redis_client.pipeline()
         pipe.incr(key)
         pipe.expire(key, 60 * 60 * 24 * 35)  # 35 days
         count, _ = pipe.execute()
-        return count
-    except Exception:
-        return 0
+        return int(count)
+    except redis.RedisError as exc:
+        raise QuotaBackendUnavailable("Search quota service is unavailable") from exc
 
 def check_search_limit(org_id: int, plan: str) -> tuple[bool, int, int]:
     """Returns (allowed, current_count, limit)"""
@@ -142,6 +177,83 @@ def check_search_limit(org_id: int, plan: str) -> tuple[bool, int, int]:
     limit   = config["monthly_searches"]
     current = get_monthly_search_count(org_id)
     return current < limit, current, limit
+
+
+_RESERVE_SEARCH_SCRIPT = """
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local limit = tonumber(ARGV[1])
+if current >= limit then
+    return {0, current}
+end
+current = redis.call('INCR', KEYS[1])
+if current == 1 then
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+end
+return {1, current}
+"""
+
+_RESERVE_SEARCH_WITH_BUSINESS_SCRIPT = """
+local org_current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local business_current = tonumber(redis.call('GET', KEYS[2]) or '0')
+local org_limit = tonumber(ARGV[1])
+local business_limit = tonumber(ARGV[2])
+if org_current >= org_limit then
+    return {0, org_current, business_current, 1}
+end
+if business_current >= business_limit then
+    return {0, org_current, business_current, 2}
+end
+org_current = redis.call('INCR', KEYS[1])
+business_current = redis.call('INCR', KEYS[2])
+if org_current == 1 then
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+end
+if business_current == 1 then
+    redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
+end
+return {1, org_current, business_current, 0}
+"""
+
+
+def reserve_search(
+    org_id: int,
+    plan: str,
+    business_id: int | None = None,
+    business_limit: int | None = None,
+) -> tuple:
+    """Atomically reserve one monthly search, failing closed on Redis errors."""
+
+    limit = PLAN_CONFIG.get(plan, PLAN_CONFIG["free"])["monthly_searches"]
+    try:
+        if business_id is None or business_limit is None:
+            allowed, current = redis_client.eval(
+                _RESERVE_SEARCH_SCRIPT,
+                1,
+                _monthly_search_key(org_id),
+                limit,
+                60 * 60 * 24 * 35,
+            )
+            return bool(int(allowed)), int(current), limit
+
+        allowed, org_current, business_current, reason = redis_client.eval(
+            _RESERVE_SEARCH_WITH_BUSINESS_SCRIPT,
+            2,
+            _monthly_search_key(org_id),
+            f"searches:business:{business_id}:{datetime.now(timezone.utc):%Y-%m}",
+            limit,
+            max(0, business_limit),
+            60 * 60 * 24 * 35,
+        )
+        return (
+            bool(int(allowed)),
+            int(org_current),
+            limit,
+            int(business_current),
+            max(0, business_limit),
+            int(reason),
+        )
+    except redis.RedisError as exc:
+        raise QuotaBackendUnavailable("Search quota service is unavailable") from exc
 
 
 # ── Active query cache (per user) ──────────────────────────────────────────────
@@ -189,10 +301,8 @@ def set_active_query(
             }),
         )
 
-    except Exception as e:
-        print(
-            f"[Redis] Failed to cache active query: {e}"
-        )
+    except redis.RedisError:
+        logger.warning("Failed to cache active query for user_id=%s", user_id)
 
 def clear_active_query(user_id: int) -> None:
     try:
@@ -202,7 +312,10 @@ def clear_active_query(user_id: int) -> None:
 
 
 # ── HyDE ──────────────────────────────────────────────────────────────────────
-def generate_hypothetical_answer(query: str) -> str:
+def generate_hypothetical_answer(
+    query: str,
+    reserve_llm_call: Callable[[], bool] | None = None,
+) -> str:
     hyde_prompt = f"""You are a search assistant. A user is searching a document database.
 Write a SHORT hypothetical passage (2-4 sentences) that would be the ideal answer 
 to the following question. Write it as if it were extracted from a real document or table.
@@ -211,6 +324,8 @@ Do NOT include any explanation — output ONLY the passage itself.
 
 Question: {query}
 Passage:"""
+    if reserve_llm_call is not None and not reserve_llm_call():
+        return query
     try:
         response = client.chat.completions.create(
             model=LLM_MODEL,
@@ -220,14 +335,18 @@ Passage:"""
         )
         hypothetical = response.choices[0].message.content.strip()
         return hypothetical
-    except Exception as e:
-        print(f"[HyDE] Failed, falling back to raw query: {e}")
+    except Exception:
+        logger.warning("HyDE generation failed; using the original query")
         return query
 
 
-def build_hyde_vector(query: str, embedder: SentenceTransformer) -> list:
+def build_hyde_vector(
+    query: str,
+    embedder: SentenceTransformer,
+    reserve_llm_call: Callable[[], bool] | None = None,
+) -> list:
     import numpy as np
-    hypothetical = generate_hypothetical_answer(query)
+    hypothetical = generate_hypothetical_answer(query, reserve_llm_call)
     vecs         = embedder.encode([query, hypothetical], normalize_embeddings=True)
     avg          = (vecs[0] + vecs[1]) / 2.0
     norm         = np.linalg.norm(avg)
@@ -237,7 +356,10 @@ def build_hyde_vector(query: str, embedder: SentenceTransformer) -> list:
 
 
 # ── Multi-Query HyDE ───────────────────────────────────────────────────────────
-def generate_query_variants(query: str) -> List[str]:
+def generate_query_variants(
+    query: str,
+    reserve_llm_call: Callable[[], bool] | None = None,
+) -> List[str]:
     prompt = f"""You are a search query expander for a document retrieval system.
 Given a user question, generate 4 alternative search queries that mean the same thing
 but use different vocabulary, levels of formality, and domain-specific terms.
@@ -251,6 +373,8 @@ Rules:
 
 User question: {query}
 """
+    if reserve_llm_call is not None and not reserve_llm_call():
+        return [query]
     try:
         response = client.chat.completions.create(
             model=LLM_MODEL,
@@ -262,20 +386,39 @@ User question: {query}
         raw      = raw.replace("```json", "").replace("```", "").strip()
         variants = json.loads(raw)
         if isinstance(variants, list):
-            return [query] + variants
-    except Exception as e:
-        print(f"[MultiQuery] Failed, using original query only: {e}")
+            clean_variants: list[str] = []
+            seen = {query.strip().casefold()}
+            for variant in variants:
+                if not isinstance(variant, str):
+                    continue
+                normalized = " ".join(variant.split())
+                identity = normalized.casefold()
+                if not normalized or len(normalized) > MAX_QUERY_VARIANT_CHARS:
+                    continue
+                if identity in seen:
+                    continue
+                clean_variants.append(normalized)
+                seen.add(identity)
+                if len(clean_variants) >= MAX_QUERY_VARIANTS:
+                    break
+            return [query] + clean_variants
+    except Exception:
+        logger.warning("Multi-query generation failed; using the original query")
     return [query]
 
 
-def build_multi_hyde_vectors(query: str, embedder: SentenceTransformer) -> List[list]:
+def build_multi_hyde_vectors(
+    query: str,
+    embedder: SentenceTransformer,
+    reserve_llm_call: Callable[[], bool] | None = None,
+) -> List[list]:
     import numpy as np
-    variants = generate_query_variants(query)
+    variants = generate_query_variants(query, reserve_llm_call)
     vectors  = []
     for variant in variants:
         try:
-            vectors.append(build_hyde_vector(variant, embedder))
-        except Exception as e:
+            vectors.append(build_hyde_vector(variant, embedder, reserve_llm_call))
+        except Exception:
             vectors.append(embedder.encode([variant], normalize_embeddings=True).tolist()[0])
     return vectors
 
@@ -287,24 +430,20 @@ def retrieve_chunks_multi(
     offset: int = 0,
     document_ids: List[int] | None = None,
     vectors: list | None = None,
+    reserve_llm_call: Callable[[], bool] | None = None,
 ) -> dict:
 
     embedder = get_embedder()
 
     if vectors is None:
-        print(
-            "[Retrieval] No cached vectors; "
-            "generating Multi-Query/HyDE vectors"
-        )
+        logger.debug("Generating retrieval vectors")
         vectors = build_multi_hyde_vectors(
             query,
             embedder,
+            reserve_llm_call,
         )
     else:
-        print(
-            f"[Retrieval] Reusing {len(vectors)} "
-            "cached Multi-Query/HyDE vectors"
-        )
+        logger.debug("Reusing %s cached retrieval vectors", len(vectors))
 
     doc_filter_sql = ""
 
@@ -414,10 +553,7 @@ def retrieve_chunks_multi(
             params,
         ).fetchall()
 
-        print(
-            f"[Retrieval] vector returned "
-            f"{len(rows)} candidate chunks"
-        )
+        logger.debug("Retrieval vector returned %s candidates", len(rows))
 
         for rank, row in enumerate(rows):
 
@@ -474,18 +610,11 @@ def retrieve_chunks_multi(
         if r.get("content_type") == "tabular"
     ]
 
-    print(
-        f"[Retrieval] "
-        f"structured candidates={len(structured)} "
-        f"total merged={len(merged)}"
+    logger.debug(
+        "Retrieval merged candidates structured=%s total=%s",
+        len(structured),
+        len(merged),
     )
-
-    for r in structured:
-        print(
-            f"  statement/chunk={r['chunk_index']} "
-            f"score={r['score']:.4f} "
-            f"{r['text'][:150]}"
-        )
 
     # ------------------------------------------------------------------
     # 3. Deduplicate
@@ -600,24 +729,12 @@ def retrieve_chunks_multi(
     # DEBUG
     # ================================================================
 
-    print(
-        f"\n[MultiQuery] "
-        f"{len(vectors)} variants "
-        f"→ {len(merged)} candidates "
-        f"→ {len(deduped)} after dedup"
+    logger.debug(
+        "Multi-query retrieval variants=%s merged=%s deduplicated=%s",
+        len(vectors),
+        len(merged),
+        len(deduped),
     )
-
-    for result in deduped[:20]:
-
-        print(
-            f"  score={result['score']:.4f}"
-            f" | rrf={result['rrf_score']:.4f}"
-            f" | content={result['content_type']}"
-            f" | type={result['chunk_type']}"
-            f" | index={result['chunk_index']}"
-            f" | {result['filename']}"
-            f" | {result['text'][:100]}"
-        )
 
     # ================================================================
     # PAGINATION
@@ -650,6 +767,7 @@ def retrieve_chunks_multi(
 
 # ── Text extraction ────────────────────────────────────────────────────────────
 def extract_text(file_path: str) -> str:
+    max_extracted_chars = settings.max_ingested_chunk_chars * 200
     path = Path(file_path)
     ext  = path.suffix.lower()
 
@@ -660,6 +778,10 @@ def extract_text(file_path: str) -> str:
         for page in doc:
             for b in page.get_text("blocks"):
                 text += b[4] + " "
+                if len(text) >= max_extracted_chars:
+                    break
+            if len(text) >= max_extracted_chars:
+                break
         doc.close()
         return text
 
@@ -678,13 +800,13 @@ def extract_text(file_path: str) -> str:
     if ext == ".docx":
         import docx
         doc = docx.Document(path)
-        return "\n".join([p.text for p in doc.paragraphs])
+        return "\n".join([p.text for p in doc.paragraphs])[:max_extracted_chars]
 
     if ext in [".txt", ".md"]:
         with open(path, "r", encoding="utf-8") as f:
-            return f.read()
+            return f.read(max_extracted_chars)
 
-    print(f"Unsupported file extension: {ext}")
+    logger.warning("Rejected unsupported file extension")
     return ""
 
 
@@ -731,26 +853,25 @@ def ingest_document(
                 file_path,
             )
 
-            # For now, keep the existing CSV behavior.
-            csv_text = df.to_string(
-                index=False,
-            )
+            for row_index, row in df.iterrows():
+                values = [
+                    f"{column}: {value}"
+                    for column, value in row.items()
+                    if pd.notna(value)
+                ]
+                row_text = (
+                    f"Row: {row_index + 1}\n" + " | ".join(values)
+                )[: settings.max_ingested_chunk_chars]
+                if row_text.strip():
+                    chunks_to_add.append({
+                        "text": row_text,
+                        "parent": row_text,
+                        "chunk_type": "tabular_record",
+                        "content_type": "tabular",
+                    })
 
-            if csv_text.strip():
-
-                chunks_to_add.append({
-                    "text": csv_text,
-                    "parent": csv_text,
-                    "chunk_type": "tabular_record",
-                    "content_type": "tabular",
-                })
-
-        except Exception as e:
-
-            print(
-                f"[Ingest] CSV processing failed "
-                f"for {filename}: {e}"
-            )
+        except Exception:
+            logger.warning("CSV ingestion failed")
 
             return 0
 
@@ -760,17 +881,11 @@ def ingest_document(
 
     if ext in {".csv", ".xlsx", ".xlsm", ".xls"}:
 
-        print(
-            f"[Ingest] Total spreadsheet/CSV chunks ready "
-            f"to embed and save: {len(chunks_to_add)}"
-        )
+        logger.debug("Spreadsheet chunks ready=%s", len(chunks_to_add))
 
         if not chunks_to_add:
 
-            print(
-                f"[Ingest] Error: no chunks generated "
-                f"for {filename}"
-            )
+            logger.warning("Spreadsheet ingestion generated no chunks")
 
             return 0
 
@@ -816,10 +931,7 @@ def ingest_document(
         db.add_all(db_chunks)
         db.commit()
 
-        print(
-            f"[Ingest] Successfully committed "
-            f"{len(db_chunks)} chunks for {filename}"
-        )
+        logger.info("Spreadsheet ingestion committed chunks=%s", len(db_chunks))
 
         return len(db_chunks)
 
@@ -885,10 +997,7 @@ def ingest_document(
     db.add_all(db_chunks)
     db.commit()
 
-    print(
-        f"[Ingest] Successfully committed "
-        f"{len(db_chunks)} text chunks for {filename}"
-    )
+    logger.info("Text ingestion committed chunks=%s", len(db_chunks))
 
     return len(db_chunks)
 
@@ -902,11 +1011,12 @@ def retrieve_chunks(
     offset: int = 0,
     document_ids: List[int] | None = None,
     use_hyde: bool = True,
+    reserve_llm_call: Callable[[], bool] | None = None,
 ) -> dict:
     embedder = get_embedder()
 
     if use_hyde:
-        query_vector = build_hyde_vector(query, embedder)
+        query_vector = build_hyde_vector(query, embedder, reserve_llm_call)
     else:
         query_vector = embedder.encode([query], normalize_embeddings=True).tolist()[0]
 

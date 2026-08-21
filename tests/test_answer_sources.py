@@ -230,7 +230,16 @@ def test_ask_returns_and_caches_authoritative_per_answer_sources(
     ]
     cached = {}
 
-    monkeypatch.setattr(main_app, "get_user_org_ids", lambda *_args: [3])
+    monkeypatch.setattr(
+        main_app,
+        "require_business_access",
+        lambda *_args, **_kwargs: business,
+    )
+    monkeypatch.setattr(
+        main_app,
+        "get_billing_owner",
+        lambda *_args, **_kwargs: user,
+    )
     monkeypatch.setattr(
         main_app,
         "get_business_doc_state",
@@ -238,11 +247,11 @@ def test_ask_returns_and_caches_authoritative_per_answer_sources(
     )
     monkeypatch.setattr(
         main_app,
-        "check_search_limit",
-        lambda *_args: (True, 0, 50),
+        "reserve_search",
+        lambda *_args: (True, 1, 50),
     )
+    monkeypatch.setattr(main_app, "limit_search", lambda *_args: None)
     monkeypatch.setattr(main_app, "get_active_query", lambda *_args: None)
-    monkeypatch.setattr(main_app, "increment_search_count", lambda *_args: 1)
     monkeypatch.setattr(
         main_app,
         "retrieve_chunks_multi",
