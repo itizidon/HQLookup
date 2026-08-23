@@ -213,14 +213,20 @@ class Settings:
         redis_query = parse_qs(redis.query)
         redis_cert_reqs = redis_query.get("ssl_cert_reqs", ["required"])
         redis_hostname_check = redis_query.get("ssl_check_hostname", ["true"])
-        if (
-            redis.scheme != "rediss"
-            or _is_local_hostname(redis.hostname)
-            or len(redis_cert_reqs) != 1
-            or redis_cert_reqs[0].lower() != "required"
-            or len(redis_hostname_check) != 1
-            or redis_hostname_check[0].lower() not in {"1", "true", "yes", "on"}
-        ):
+        is_railway_private_redis = (
+            redis.scheme == "redis"
+            and redis.hostname is not None
+            and redis.hostname.lower().endswith(".railway.internal")
+        )
+        is_tls_redis = (
+            redis.scheme == "rediss"
+            and not _is_local_hostname(redis.hostname)
+            and len(redis_cert_reqs) == 1
+            and redis_cert_reqs[0].lower() == "required"
+            and len(redis_hostname_check) == 1
+            and redis_hostname_check[0].lower() in {"1", "true", "yes", "on"}
+        )
+        if not (is_railway_private_redis or is_tls_redis):
             invalid.append("REDIS_URL")
 
         llm = urlparse(self.llm_base_url)
