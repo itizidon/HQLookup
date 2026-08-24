@@ -17,7 +17,7 @@ export function proxy(request: NextRequest) {
     "font-src 'self' data:",
     "form-action 'self'",
     "frame-ancestors 'none'",
-    "frame-src 'none'",
+    "frame-src https://challenges.cloudflare.com",
     "img-src 'self' blob: data:",
     "manifest-src 'self'",
     "media-src 'self'",

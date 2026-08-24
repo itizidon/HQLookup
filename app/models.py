@@ -100,6 +100,13 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     role            = Column(String, default="user")   # global role: superadmin / user
     created_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    email_verified_at = Column(DateTime(timezone=True), nullable=True)
+    email_verification_token_hash = Column(String(64), nullable=True, unique=True, index=True)
+    email_verification_expires_at = Column(DateTime(timezone=True), nullable=True)
+    mfa_secret_encrypted = Column(Text, nullable=True)
+    mfa_recovery_code_hashes = Column(Text, nullable=True)
+    mfa_enabled_at = Column(DateTime(timezone=True), nullable=True)
+    mfa_last_counter = Column(Integer, nullable=True)
 
     # Subscription properties shifted to the User level
     plan                    = Column(String, nullable=False, default="free")  # free/starter/pro/business
@@ -112,6 +119,50 @@ class User(Base):
     owned_orgs      = relationship("Organization", foreign_keys="Organization.owner_id", back_populates="owner")
     org_memberships = relationship("OrgMember", foreign_keys="OrgMember.user_id", back_populates="user")
     businesses      = relationship("Business", secondary=user_business, back_populates="users")
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+
+    jti        = Column(String(32), primary_key=True)
+    user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PasswordReset(Base):
+    __tablename__ = "password_resets"
+
+    id         = Column(Integer, primary_key=True)
+    user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class MfaLoginChallenge(Base):
+    __tablename__ = "mfa_login_challenges"
+
+    jti        = Column(String(32), primary_key=True)
+    user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class EmailOutbox(Base):
+    __tablename__ = "email_outbox"
+
+    id             = Column(Integer, primary_key=True)
+    recipient      = Column(String, nullable=False)
+    subject        = Column(String, nullable=False)
+    encrypted_html = Column(Text, nullable=False)
+    kind           = Column(String, nullable=False, index=True)
+    attempts       = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    expires_at     = Column(DateTime(timezone=True), nullable=False, index=True)
+    sent_at        = Column(DateTime(timezone=True), nullable=True, index=True)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class Business(Base):

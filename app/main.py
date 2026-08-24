@@ -33,7 +33,7 @@ from app.rag import (
 )
 from app.llm import generate_answer
 from pydantic import BaseModel, Field, EmailStr, field_validator
-from app.auth import get_current_user, hash_password, validate_password, verify_password
+from app.auth import MIN_PASSWORD_LENGTH, get_current_user, hash_password, validate_password, verify_password
 from app.access import (
     get_accessible_businesses,
     get_billing_owner,
@@ -55,9 +55,7 @@ from app.uploads import UnsafeUpload, count_spreadsheet_rows, store_upload
 from datetime import datetime, timedelta, timezone
 from app.routes.billing import router as billing_router
 
-import resend
-
-resend.api_key = settings.resend_api_key
+from app.email_outbox import enqueue_email
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -114,7 +112,7 @@ class WorkspaceQueryRequest(BaseModel):
 
 class AcceptInviteRequest(BaseModel):
     token:    str = Field(..., min_length=32, max_length=512)
-    password: str = Field(..., min_length=8, max_length=72)
+    password: str = Field(..., min_length=MIN_PASSWORD_LENGTH, max_length=256)
     name:     str = Field(default="User", min_length=1, max_length=200)
 
     @field_validator("password")
@@ -440,12 +438,16 @@ def accept_workspace_invitation(body: AcceptInviteRequest, db: Session = Depends
                     status_code=401,
                     detail="Invalid invitation credentials.",
                 )
+            target_user.email_verified_at = datetime.now(timezone.utc)
+            target_user.email_verification_token_hash = None
+            target_user.email_verification_expires_at = None
         else:
             target_user = User(
                 email=email,
                 name=body.name,
                 hashed_password=hash_password(body.password),
                 plan="free",
+                email_verified_at=datetime.now(timezone.utc),
             )
             db.add(target_user)
             db.flush()
@@ -888,7 +890,6 @@ def invite_user_to_workspace(
         ).with_for_update().all()
         for invitation in old_pending:
             invitation.status = "revoked"
-
         for business_id in business_ids:
             invitation = Invitation(
                 org_id=org_id,
@@ -911,11 +912,13 @@ def invite_user_to_workspace(
         safe_org_name = html.escape(org.name)
         safe_invite_link = html.escape(invite_link, quote=True)
         subject_org_name = str(org.name).replace("\r", " ").replace("\n", " ")[:200]
-        resend.Emails.send({
-            "from": settings.resend_from_email,
-            "to": [normalized_email],
-            "subject": f"You've been invited to join {subject_org_name}",
-            "html": f"""
+        enqueue_email(
+            db,
+            recipient=normalized_email,
+            subject=f"You've been invited to join {subject_org_name}",
+            kind="workspace_invitation",
+            expires_at=expires_at,
+            html=f"""
                 <div style="font-family:sans-serif;padding:20px;color:#333">
                     <h2>You're invited!</h2>
                     <p><strong>{safe_admin_email}</strong> invited you to join their workspace: <strong>{safe_org_name}</strong>.</p>
@@ -927,7 +930,7 @@ def invite_user_to_workspace(
                     <p style="font-size:12px;color:#666">Or copy: {safe_invite_link}</p>
                 </div>
             """,
-        })
+        )
         db.commit()
     except Exception as exc:
         db.rollback()

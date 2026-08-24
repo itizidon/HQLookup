@@ -202,12 +202,16 @@ export default function AcceptInviteForm() {
                   id="invite-password"
                   type="password"
                   autoComplete={verification.invitation.userExists ? 'current-password' : 'new-password'}
-                  minLength={8}
+                  minLength={15}
+                  maxLength={256}
                   required
                   value={password}
                   onChange={(event) => setPassword(event.target.value)}
                   className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
                 />
+                {!verification.invitation.userExists && (
+                  <p className="mt-1 text-xs text-zinc-500">Use at least 15 characters and avoid common passwords.</p>
+                )}
               </div>
 
               {submitError && (

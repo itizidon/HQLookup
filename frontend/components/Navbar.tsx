@@ -47,6 +47,7 @@ export default function Navbar({ avatarInitials = 'D' }) {
       
       <div className="nav-right" style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
         <Link href="/billing" className="nav-link">Billing</Link>
+        <Link href="/security" className="nav-link">Security</Link>
         
         {/* Avatar with Dropdown Container */}
         <div style={{ position: 'relative' }} ref={dropdownRef}>

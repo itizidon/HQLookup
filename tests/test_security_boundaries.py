@@ -31,6 +31,7 @@ from app.models import (
     Organization,
     OrgMember,
     User,
+    UserSession,
     user_business,
 )
 from app.settings import settings
@@ -46,17 +47,16 @@ def test_bcrypt_5_hashes_and_verifies_existing_hashes() -> None:
     assert not verify_password(password, "not-a-bcrypt-hash")
 
 
-def test_passwords_over_bcrypt_byte_limit_are_rejected_not_truncated() -> None:
-    with pytest.raises(ValueError, match="72 UTF-8 bytes"):
-        validate_password("a" * 73)
-    with pytest.raises(ValueError, match="72 UTF-8 bytes"):
-        validate_password("💥" * 19)
-    assert not verify_password("a" * 73, hash_password("a" * 72))
+def test_argon_passwords_support_long_unicode_and_enforce_bounded_length() -> None:
+    password = "💥αβγ-safe-password-" * 8
+    assert verify_password(password, hash_password(password))
+    with pytest.raises(ValueError, match="256 characters"):
+        validate_password("a" * 257)
 
 
 def test_session_tokens_require_expected_registered_claims() -> None:
-    token = create_token(42, business_id=7)
-    assert decode_access_token(token) == (42, 7)
+    token, jti, _expires_at = create_token(42, business_id=7)
+    assert decode_access_token(token) == (42, 7, jti)
 
     now = datetime.now(timezone.utc)
     wrong_audience_token = jwt.encode(
@@ -79,8 +79,11 @@ def test_session_tokens_require_expected_registered_claims() -> None:
 
 
 def test_session_cookie_is_http_only_and_uses_configured_name() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine, tables=[User.__table__, UserSession.__table__])
+    db = sessionmaker(bind=engine)()
     response = Response()
-    set_jwt_cookie(response, 1)
+    set_jwt_cookie(response, db, 1)
     cookie = response.headers["set-cookie"]
 
     assert cookie.startswith(f"{settings.jwt_cookie_name}=")
@@ -88,6 +91,8 @@ def test_session_cookie_is_http_only_and_uses_configured_name() -> None:
     assert "Path=/" in cookie
     assert "SameSite=lax" in cookie
     assert response.headers["cache-control"] == "no-store"
+    db.close()
+    engine.dispose()
 
 
 def test_validation_responses_do_not_echo_password_inputs() -> None:
@@ -206,7 +211,7 @@ def test_invitation_token_is_database_backed_and_single_use(invitation_session) 
     owner = User(
         email="owner@example.com",
         name="Owner",
-        hashed_password=hash_password("owner-password"),
+        hashed_password=hash_password("owner-password-long"),
     )
     db.add(owner)
     db.flush()
@@ -234,7 +239,7 @@ def test_invitation_token_is_database_backed_and_single_use(invitation_session) 
     main_app.accept_workspace_invitation(
         main_app.AcceptInviteRequest(
             token=raw_token,
-            password="member-password",
+            password="member-password-long",
             name="New Member",
         ),
         db=db,
@@ -249,7 +254,7 @@ def test_invitation_token_is_database_backed_and_single_use(invitation_session) 
         main_app.accept_workspace_invitation(
             main_app.AcceptInviteRequest(
                 token=raw_token,
-                password="member-password",
+                password="member-password-long",
                 name="New Member",
             ),
             db=db,
@@ -262,12 +267,12 @@ def test_existing_user_must_confirm_password_to_accept_invite(invitation_session
     owner = User(
         email="owner-2@example.com",
         name="Owner",
-        hashed_password=hash_password("owner-password"),
+        hashed_password=hash_password("owner-password-long"),
     )
     invited_user = User(
         email="member@example.com",
         name="Member",
-        hashed_password=hash_password("correct-password"),
+        hashed_password=hash_password("correct-password-long"),
     )
     db.add_all([owner, invited_user])
     db.flush()
@@ -295,7 +300,7 @@ def test_existing_user_must_confirm_password_to_accept_invite(invitation_session
         main_app.accept_workspace_invitation(
             main_app.AcceptInviteRequest(
                 token=raw_token,
-                password="wrong-password",
+                password="wrong-password-long",
                 name="Member",
             ),
             db=db,

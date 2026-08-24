@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request
 import redis
 
 from app.settings import settings
+from app.security_events import record_auth_event
 
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,11 @@ def enforce_identifier_rate_limit(
 
     if int(current) > limit:
         retry_after = max(int(ttl), 1)
+        record_auth_event(
+            "rate_limit",
+            outcome=f"blocked:{bucket}",
+            identifier=identifier,
+        )
         raise HTTPException(
             status_code=429,
             detail="Too many requests. Try again later.",
@@ -103,6 +109,31 @@ def limit_login_account(email: str) -> None:
 
 def limit_signup(request: Request) -> None:
     enforce_rate_limit(request, bucket="signup", limit=5, window_seconds=3600)
+
+
+def limit_verification_email(user_id: int) -> None:
+    enforce_identifier_rate_limit(
+        str(user_id),
+        bucket="verification-email",
+        limit=3,
+        window_seconds=3600,
+    )
+
+
+def limit_email_verify(request: Request) -> None:
+    enforce_rate_limit(request, bucket="email-verify", limit=10, window_seconds=3600)
+
+
+def limit_password_reset(request: Request) -> None:
+    enforce_rate_limit(request, bucket="password-reset", limit=5, window_seconds=3600)
+
+
+def limit_password_reset_account(email: str) -> None:
+    enforce_identifier_rate_limit(email, bucket="password-reset-account", limit=3, window_seconds=3600)
+
+
+def limit_mfa_attempt(user_id: int) -> None:
+    enforce_identifier_rate_limit(str(user_id), bucket="mfa", limit=10, window_seconds=600)
 
 
 def limit_invite_verify(request: Request) -> None:

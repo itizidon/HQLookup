@@ -21,7 +21,9 @@ to `http://127.0.0.1:8000`. For builds and production, set the server-only
 `BACKEND_URL` variable to the absolute backend origin:
 
 ```bash
-BACKEND_URL=https://api.example.com npm run build
+BACKEND_URL=https://api.example.com \
+NEXT_PUBLIC_TURNSTILE_SITE_KEY=your-public-sitekey \
+npm run build
 ```
 
 `BACKEND_URL` is intentionally not a `NEXT_PUBLIC_` variable. It must be

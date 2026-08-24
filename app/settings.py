@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from email.utils import parseaddr
+import base64
 import ipaddress
 import os
 from urllib.parse import parse_qs, urlparse
@@ -20,6 +21,14 @@ load_dotenv()
 
 class SettingsError(RuntimeError):
     """Raised when deployment configuration is unsafe or incomplete."""
+
+
+_TURNSTILE_TEST_SECRETS = {
+    "1x0000000000000000000000000000000AA",
+    "2x0000000000000000000000000000000AA",
+    "3x0000000000000000000000000000000AA",
+}
+_DEVELOPMENT_DATA_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 
 def _read_bool(name: str, default: bool) -> bool:
@@ -148,6 +157,11 @@ class Settings:
     max_ingested_chunk_chars: int
     embedding_model_path: str
     public_signup_enabled: bool
+    turnstile_secret_key: str | None
+    email_verification_hours: int
+    password_reset_hours: int
+    data_encryption_key: str
+    mfa_issuer: str
 
     stripe_secret_key: str | None
     stripe_webhook_secret: str | None
@@ -320,8 +334,33 @@ class Settings:
         ):
             invalid.append("RESEND_FROM_EMAIL")
 
-        if self.public_signup_enabled:
-            invalid.append("PUBLIC_SIGNUP_ENABLED")
+        if (
+            not self.turnstile_secret_key
+            or _looks_like_placeholder(self.turnstile_secret_key)
+            or len(self.turnstile_secret_key) < 20
+            or self.turnstile_secret_key in _TURNSTILE_TEST_SECRETS
+        ):
+            invalid.append("TURNSTILE_SECRET_KEY")
+
+        try:
+            decoded_data_key = base64.urlsafe_b64decode(
+                self.data_encryption_key.encode("ascii")
+            )
+        except (ValueError, UnicodeError):
+            decoded_data_key = b""
+        if (
+            len(decoded_data_key) != 32
+            or self.data_encryption_key == _DEVELOPMENT_DATA_KEY
+            or _looks_like_placeholder(self.data_encryption_key)
+        ):
+            invalid.append("DATA_ENCRYPTION_KEY")
+        if (
+            not self.mfa_issuer
+            or len(self.mfa_issuer) > 100
+            or any(character in self.mfa_issuer for character in "\r\n:")
+        ):
+            invalid.append("MFA_ISSUER")
+
         if not os.path.isabs(self.embedding_model_path):
             invalid.append("EMBEDDING_MODEL_PATH")
 
@@ -407,6 +446,17 @@ def _load_settings() -> Settings:
         public_signup_enabled=_read_bool(
             "PUBLIC_SIGNUP_ENABLED", not is_production
         ),
+        turnstile_secret_key=os.getenv("TURNSTILE_SECRET_KEY"),
+        email_verification_hours=_read_bounded_int(
+            "EMAIL_VERIFICATION_HOURS", 24, maximum=72
+        ),
+        password_reset_hours=_read_bounded_int(
+            "PASSWORD_RESET_HOURS", 1, maximum=24
+        ),
+        data_encryption_key=os.getenv(
+            "DATA_ENCRYPTION_KEY", _DEVELOPMENT_DATA_KEY
+        ).strip(),
+        mfa_issuer=os.getenv("MFA_ISSUER", "HQLookup").strip(),
         stripe_secret_key=os.getenv("STRIPE_SECRET_KEY"),
         stripe_webhook_secret=os.getenv("STRIPE_WEBHOOK_SECRET"),
         stripe_price_starter=os.getenv("STRIPE_PRICE_STARTER"),

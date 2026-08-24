@@ -8,61 +8,93 @@ authorization from the database on every request.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import re
+import unicodedata
 import uuid
 
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 import bcrypt
 from fastapi import Depends, HTTPException, Request, Response, status
 import jwt
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import User
+from app.models import User, UserSession
 from app.settings import settings
 
 
 ALGORITHM = "HS256"
-MIN_PASSWORD_LENGTH = 8
-MAX_PASSWORD_BYTES = 72
+MIN_PASSWORD_LENGTH = 15
+MAX_PASSWORD_LENGTH = 256
 _POSITIVE_INTEGER = re.compile(r"^[1-9][0-9]*$")
+_ARGON2 = PasswordHasher(time_cost=2, memory_cost=19_456, parallelism=1, hash_len=32)
+_PASSWORD_BLOCKLIST = frozenset(
+    line.strip().casefold()
+    for line in (Path(__file__).parent / "data" / "common_passwords.txt").read_text().splitlines()
+    if line.strip() and not line.startswith("#")
+)
+_DUMMY_HASH = _ARGON2.hash("dummy-password-that-is-never-valid")
 
 
 def validate_password(password: str) -> str:
     """Validate a password before bcrypt sees it."""
 
-    if len(password) < MIN_PASSWORD_LENGTH:
+    normalized = unicodedata.normalize("NFC", password)
+    if len(normalized) < MIN_PASSWORD_LENGTH:
         raise ValueError(
             f"Password must be at least {MIN_PASSWORD_LENGTH} characters long."
         )
-    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+    if len(normalized) > MAX_PASSWORD_LENGTH:
         raise ValueError(
-            f"Password must be at most {MAX_PASSWORD_BYTES} UTF-8 bytes."
+            f"Password must be at most {MAX_PASSWORD_LENGTH} characters long."
         )
-    return password
+    folded = normalized.casefold()
+    if (
+        folded in _PASSWORD_BLOCKLIST
+        or "hqlookup" in folded
+        or len(set(folded)) == 1
+    ):
+        raise ValueError("Choose a password that is not common or easily guessed.")
+    return normalized
 
 
 def hash_password(password: str) -> str:
     validated = validate_password(password)
-    return bcrypt.hashpw(validated.encode("utf-8"), bcrypt.gensalt()).decode("ascii")
+    return _ARGON2.hash(validated)
 
 
 def verify_password(plain: str, hashed: str) -> bool:
     """Verify existing ``$2a$``/``$2b$`` bcrypt hashes without Passlib."""
 
     try:
-        if len(plain.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        normalized = unicodedata.normalize("NFC", plain)
+        if hashed.startswith("$argon2"):
+            return _ARGON2.verify(hashed, normalized)
+        if len(normalized.encode("utf-8")) > 72:
             return False
-        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("ascii"))
-    except (TypeError, ValueError, UnicodeError):
+        return bcrypt.checkpw(normalized.encode("utf-8"), hashed.encode("ascii"))
+    except (InvalidHashError, VerificationError, VerifyMismatchError, TypeError, ValueError, UnicodeError):
         # Treat malformed stored hashes and invalid inputs like bad credentials.
         return False
+
+
+def perform_dummy_password_check(password: str) -> None:
+    """Equalize unknown-account login work without exposing a valid hash."""
+
+    verify_password(password, _DUMMY_HASH)
+
+
+def password_hash_needs_upgrade(hashed: str) -> bool:
+    return not hashed.startswith("$argon2") or _ARGON2.check_needs_rehash(hashed)
 
 
 def create_token(
     user_id: int,
     business_id: int | None = None,
     expire_hours: int | None = None,
-) -> str:
+) -> tuple[str, str, datetime]:
     if user_id <= 0 or (business_id is not None and business_id <= 0):
         raise ValueError("Token identifiers must be positive integers.")
     now = datetime.now(timezone.utc)
@@ -81,15 +113,22 @@ def create_token(
     }
     if business_id is not None:
         payload["business_id"] = str(business_id)
-    return jwt.encode(payload, settings.jwt_secret_key, algorithm=ALGORITHM)
+    return (
+        jwt.encode(payload, settings.jwt_secret_key, algorithm=ALGORITHM),
+        str(payload["jti"]),
+        payload["exp"],
+    )
 
 
 def set_jwt_cookie(
     response: Response,
+    db: Session,
     user_id: int,
     business_id: int | None = None,
 ) -> None:
-    token = create_token(user_id, business_id)
+    token, jti, expires_at = create_token(user_id, business_id)
+    db.add(UserSession(jti=jti, user_id=user_id, expires_at=expires_at))
+    db.flush()
     response.set_cookie(
         key=settings.jwt_cookie_name,
         value=token,
@@ -113,7 +152,7 @@ def remove_jwt_cookie(response: Response) -> None:
     response.headers["Cache-Control"] = "no-store"
 
 
-def decode_access_token(token: str) -> tuple[int, int | None]:
+def decode_access_token(token: str) -> tuple[int, int | None, str]:
     """Validate a session token and return its typed identifiers."""
 
     try:
@@ -151,7 +190,10 @@ def decode_access_token(token: str) -> tuple[int, int | None]:
     else:
         raise HTTPException(status_code=401, detail="Invalid session")
 
-    return int(subject), business_id
+    jti = payload.get("jti")
+    if not isinstance(jti, str) or not re.fullmatch(r"[0-9a-f]{32}", jti):
+        raise HTTPException(status_code=401, detail="Invalid session")
+    return int(subject), business_id, jti
 
 
 def get_current_user(
@@ -162,7 +204,16 @@ def get_current_user(
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    user_id, business_id = decode_access_token(token)
+    user_id, business_id, jti = decode_access_token(token)
+    now = datetime.now(timezone.utc)
+    session = db.query(UserSession).filter(
+        UserSession.jti == jti,
+        UserSession.user_id == user_id,
+        UserSession.revoked_at.is_(None),
+        UserSession.expires_at > now,
+    ).first()
+    if session is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")

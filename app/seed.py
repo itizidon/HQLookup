@@ -7,6 +7,7 @@ import os
 from sqlalchemy import text
 
 from app.auth import hash_password
+from datetime import datetime, timezone
 from app.database import Base, SessionLocal, engine
 from app.models import Business, Organization, OrgMember, User
 from app.settings import settings
@@ -14,8 +15,8 @@ from app.settings import settings
 
 def _required_seed_password(name: str) -> str:
     value = os.getenv(name, "")
-    if len(value) < 12:
-        raise RuntimeError(f"{name} must contain at least 12 characters")
+    if len(value) < 15:
+        raise RuntimeError(f"{name} must contain at least 15 characters")
     return value
 
 
@@ -55,6 +56,7 @@ def seed() -> None:
                 name=name,
                 role=role,
                 hashed_password=hash_password(_required_seed_password(password_name)),
+                email_verified_at=datetime.now(timezone.utc),
             )
             db.add(user)
             users.append(user)

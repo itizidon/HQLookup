@@ -69,6 +69,7 @@ jobs:
     env:
       # Build-time rewrite target only; no backend request is made during build.
       BACKEND_URL: http://api.internal:8000
+      NEXT_PUBLIC_TURNSTILE_SITE_KEY: 1x00000000000000000000AA
     defaults:
       run:
         working-directory: frontend

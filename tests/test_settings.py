@@ -30,6 +30,11 @@ def _valid_production_settings():
         resend_from_email="HQLookup <team@hqlookup.test>",
         embedding_model_path="/opt/models/all-MiniLM-L6-v2",
         public_signup_enabled=False,
+        turnstile_secret_key="0x4AAAAAAAreal-looking-production-secret",
+        email_verification_hours=24,
+        password_reset_hours=1,
+        data_encryption_key="P8DOzKW4P0pDL8G5mGk8jVvDsdRBwJceRIN7BuGbOvQ=",
+        mfa_issuer="HQLookup",
     )
 
 
@@ -54,11 +59,33 @@ def test_production_settings_report_names_without_secret_values():
     assert unsafe_value not in message
 
 
-def test_production_rejects_public_signup_and_weak_provider_credentials():
-    unsafe = replace(
+def test_production_allows_explicit_public_signup():
+    public_signup = replace(
         _valid_production_settings(),
         public_signup_enabled=True,
+    )
+
+    public_signup.validate()
+
+
+def test_production_rejects_turnstile_test_secret():
+    test_key = replace(
+        _valid_production_settings(),
+        turnstile_secret_key="1x0000000000000000000000000000000AA",
+    )
+
+    with pytest.raises(SettingsError) as exc_info:
+        test_key.validate()
+
+    assert "TURNSTILE_SECRET_KEY" in str(exc_info.value)
+
+
+def test_production_rejects_weak_provider_credentials():
+    unsafe = replace(
+        _valid_production_settings(),
         stripe_webhook_secret="whsec_x",
+        turnstile_secret_key=None,
+        data_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         forwarded_allow_ips=("0.0.0.0/0",),
     )
 
@@ -66,6 +93,16 @@ def test_production_rejects_public_signup_and_weak_provider_credentials():
         unsafe.validate()
 
     message = str(exc_info.value)
-    assert "PUBLIC_SIGNUP_ENABLED" in message
     assert "STRIPE_WEBHOOK_SECRET" in message
+    assert "TURNSTILE_SECRET_KEY" in message
+    assert "DATA_ENCRYPTION_KEY" in message
     assert "FORWARDED_ALLOW_IPS" in message
+
+
+def test_production_rejects_unsafe_mfa_issuer():
+    invalid = replace(_valid_production_settings(), mfa_issuer="Bad:Issuer")
+
+    with pytest.raises(SettingsError) as exc_info:
+        invalid.validate()
+
+    assert "MFA_ISSUER" in str(exc_info.value)

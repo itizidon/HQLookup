@@ -2,6 +2,10 @@ import type { NextConfig } from "next";
 
 const isDevelopment = process.env.NODE_ENV === "development";
 
+if (!isDevelopment && !process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY) {
+  throw new Error("NEXT_PUBLIC_TURNSTILE_SITE_KEY is required outside development.");
+}
+
 function resolveBackendUrl(): string {
   const configuredUrl = process.env.BACKEND_URL;
 
