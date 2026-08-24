@@ -6,11 +6,14 @@ import os
 
 from sqlalchemy import text
 
+from app.settings import settings
+
+settings.validate_database()
+
 from app.auth import hash_password
 from datetime import datetime, timezone
 from app.database import Base, SessionLocal, engine
 from app.models import Business, Organization, OrgMember, User
-from app.settings import settings
 
 
 def _required_seed_password(name: str) -> str:

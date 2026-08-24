@@ -13,6 +13,10 @@ from typing import List, Literal, Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pathlib import Path
+from app.settings import settings
+
+settings.validate()
+
 from app.database import get_db
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -42,7 +46,6 @@ from app.access import (
     require_businesses_access,
     require_organization_access,
 )
-from app.settings import settings
 from app.security import CookieOriginMiddleware, UploadBodyLimitMiddleware
 from app.rate_limit import (
     limit_document_upload,

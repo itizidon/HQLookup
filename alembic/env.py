@@ -12,8 +12,11 @@ from alembic import context
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # ── 2. IMPORT YOUR TARGET METADATA AND EXPLICIT MODELS ──
-from app.database import Base  # Adjust import path if your file structure differs
 from app.settings import settings
+
+settings.validate_database()
+
+from app.database import Base  # Adjust import path if your file structure differs
 from app.models import User, Organization, Business, OrgMember, Invitation  # Ensures all tables are registered
 
 # This is the Alembic Config object, which provides

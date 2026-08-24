@@ -5,6 +5,10 @@ from __future__ import annotations
 import logging
 import time
 
+from app.settings import settings
+
+settings.validate_email_worker()
+
 from app.database import SessionLocal
 from app.auth_maintenance import cleanup_expired_auth_records
 from app.email_outbox import deliver_pending_email

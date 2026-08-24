@@ -122,6 +122,54 @@ def _is_safe_forwarded_network(value: str) -> bool:
     return network.prefixlen > 0 and not network.is_unspecified
 
 
+def _is_safe_production_database_url(value: str) -> bool:
+    database = urlparse(value)
+    sslmodes = parse_qs(database.query).get("sslmode", [])
+    sslmode = sslmodes[0].lower() if len(sslmodes) == 1 else ""
+    is_railway_private_database = (
+        database.scheme in {"postgresql", "postgresql+psycopg2"}
+        and database.hostname is not None
+        and database.hostname.lower().endswith(".railway.internal")
+        and sslmode in {"", "disable", "prefer"}
+    )
+    is_tls_database = (
+        database.scheme in {"postgresql", "postgresql+psycopg2"}
+        and not _is_local_hostname(database.hostname)
+        and sslmode in {"require", "verify-ca", "verify-full"}
+    )
+    return is_railway_private_database or is_tls_database
+
+
+def _is_safe_production_data_key(value: str) -> bool:
+    try:
+        decoded_data_key = base64.urlsafe_b64decode(value.encode("ascii"))
+    except (ValueError, UnicodeError):
+        return False
+    return (
+        len(decoded_data_key) == 32
+        and value != _DEVELOPMENT_DATA_KEY
+        and not _looks_like_placeholder(value)
+    )
+
+
+def _is_safe_production_resend_key(value: str | None) -> bool:
+    return bool(
+        value
+        and not _looks_like_placeholder(value)
+        and len(value) >= 12
+    )
+
+
+def _is_safe_production_resend_sender(value: str) -> bool:
+    _, resend_address = parseaddr(value)
+    return bool(
+        resend_address
+        and not resend_address.lower().endswith("@resend.dev")
+        and resend_address.count("@") == 1
+        and not any(character.isspace() for character in resend_address)
+    )
+
+
 @dataclass(frozen=True)
 class Settings:
     app_env: str
@@ -180,12 +228,50 @@ class Settings:
     def is_production(self) -> bool:
         return self.app_env == "production"
 
-    def validate(self) -> None:
+    def _validate_runtime_basics(self) -> None:
         if self.app_env not in {"development", "test", "production"}:
             raise SettingsError("APP_ENV must be development, test, or production")
 
         if not self.database_url:
             raise SettingsError("DATABASE_URL is required")
+
+    def validate_database(self) -> None:
+        """Validate settings needed by database-only processes such as Alembic."""
+
+        self._validate_runtime_basics()
+        if (
+            self.is_production
+            and not _is_safe_production_database_url(self.database_url or "")
+        ):
+            raise SettingsError(
+                "Unsafe or missing production settings: DATABASE_URL"
+            )
+
+    def validate_email_worker(self) -> None:
+        """Validate only the settings required to deliver queued email."""
+
+        self._validate_runtime_basics()
+        if not self.is_production:
+            return
+
+        invalid: list[str] = []
+        if not _is_safe_production_database_url(self.database_url or ""):
+            invalid.append("DATABASE_URL")
+        if not _is_safe_production_data_key(self.data_encryption_key):
+            invalid.append("DATA_ENCRYPTION_KEY")
+        if not _is_safe_production_resend_key(self.resend_api_key):
+            invalid.append("RESEND_API_KEY")
+        if not _is_safe_production_resend_sender(self.resend_from_email):
+            invalid.append("RESEND_FROM_EMAIL")
+
+        if invalid:
+            names = ", ".join(sorted(set(invalid)))
+            raise SettingsError(f"Unsafe or missing production settings: {names}")
+
+    def validate(self) -> None:
+        """Validate the complete API configuration."""
+
+        self._validate_runtime_basics()
 
         if not self.is_production:
             return
@@ -213,21 +299,7 @@ class Settings:
         ):
             invalid.append("FRONTEND_URL")
 
-        database = urlparse(self.database_url)
-        sslmodes = parse_qs(database.query).get("sslmode", [])
-        sslmode = sslmodes[0].lower() if len(sslmodes) == 1 else ""
-        is_railway_private_database = (
-            database.scheme in {"postgresql", "postgresql+psycopg2"}
-            and database.hostname is not None
-            and database.hostname.lower().endswith(".railway.internal")
-            and sslmode in {"", "disable", "prefer"}
-        )
-        is_tls_database = (
-            database.scheme in {"postgresql", "postgresql+psycopg2"}
-            and not _is_local_hostname(database.hostname)
-            and sslmode in {"require", "verify-ca", "verify-full"}
-        )
-        if not (is_railway_private_database or is_tls_database):
+        if not _is_safe_production_database_url(self.database_url or ""):
             invalid.append("DATABASE_URL")
 
         redis = urlparse(self.redis_url)
@@ -326,19 +398,9 @@ class Settings:
             or len(self.stripe_price_starter or "") < 12
         ):
             invalid.append("STRIPE_PRICE_STARTER")
-        if (
-            not self.resend_api_key
-            or _looks_like_placeholder(self.resend_api_key)
-            or len(self.resend_api_key) < 12
-        ):
+        if not _is_safe_production_resend_key(self.resend_api_key):
             invalid.append("RESEND_API_KEY")
-        _, resend_address = parseaddr(self.resend_from_email)
-        if (
-            not resend_address
-            or resend_address.lower().endswith("@resend.dev")
-            or resend_address.count("@") != 1
-            or any(character.isspace() for character in resend_address)
-        ):
+        if not _is_safe_production_resend_sender(self.resend_from_email):
             invalid.append("RESEND_FROM_EMAIL")
 
         if (
@@ -349,17 +411,7 @@ class Settings:
         ):
             invalid.append("TURNSTILE_SECRET_KEY")
 
-        try:
-            decoded_data_key = base64.urlsafe_b64decode(
-                self.data_encryption_key.encode("ascii")
-            )
-        except (ValueError, UnicodeError):
-            decoded_data_key = b""
-        if (
-            len(decoded_data_key) != 32
-            or self.data_encryption_key == _DEVELOPMENT_DATA_KEY
-            or _looks_like_placeholder(self.data_encryption_key)
-        ):
+        if not _is_safe_production_data_key(self.data_encryption_key):
             invalid.append("DATA_ENCRYPTION_KEY")
         if (
             not self.mfa_issuer
@@ -487,4 +539,3 @@ def _load_settings() -> Settings:
 
 
 settings = _load_settings()
-settings.validate()

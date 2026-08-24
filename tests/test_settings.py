@@ -129,3 +129,46 @@ def test_production_rejects_unsafe_mfa_issuer():
         invalid.validate()
 
     assert "MFA_ISSUER" in str(exc_info.value)
+
+
+def test_email_worker_does_not_require_api_only_settings():
+    worker = replace(
+        _valid_production_settings(),
+        openai_api_key="ollama",
+        llm_base_url="http://localhost:11434/v1",
+        embedding_model_path="all-MiniLM-L6-v2",
+        stripe_secret_key=None,
+        stripe_webhook_secret=None,
+        stripe_price_starter=None,
+        trusted_hosts=(),
+    )
+
+    worker.validate_email_worker()
+
+
+def test_email_worker_requires_its_production_credentials():
+    worker = replace(
+        _valid_production_settings(),
+        data_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        resend_api_key=None,
+        resend_from_email="Team <onboarding@resend.dev>",
+    )
+
+    with pytest.raises(SettingsError) as exc_info:
+        worker.validate_email_worker()
+
+    message = str(exc_info.value)
+    assert "DATA_ENCRYPTION_KEY" in message
+    assert "RESEND_API_KEY" in message
+    assert "RESEND_FROM_EMAIL" in message
+
+
+def test_database_process_does_not_require_api_only_settings():
+    database_process = replace(
+        _valid_production_settings(),
+        openai_api_key="ollama",
+        stripe_secret_key=None,
+        trusted_hosts=(),
+    )
+
+    database_process.validate_database()
