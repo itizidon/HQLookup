@@ -216,11 +216,18 @@ class Settings:
         database = urlparse(self.database_url)
         sslmodes = parse_qs(database.query).get("sslmode", [])
         sslmode = sslmodes[0].lower() if len(sslmodes) == 1 else ""
-        if (
-            database.scheme not in {"postgresql", "postgresql+psycopg2"}
-            or _is_local_hostname(database.hostname)
-            or sslmode not in {"require", "verify-ca", "verify-full"}
-        ):
+        is_railway_private_database = (
+            database.scheme in {"postgresql", "postgresql+psycopg2"}
+            and database.hostname is not None
+            and database.hostname.lower().endswith(".railway.internal")
+            and sslmode in {"", "disable", "prefer"}
+        )
+        is_tls_database = (
+            database.scheme in {"postgresql", "postgresql+psycopg2"}
+            and not _is_local_hostname(database.hostname)
+            and sslmode in {"require", "verify-ca", "verify-full"}
+        )
+        if not (is_railway_private_database or is_tls_database):
             invalid.append("DATABASE_URL")
 
         redis = urlparse(self.redis_url)

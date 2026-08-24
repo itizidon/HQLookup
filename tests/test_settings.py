@@ -42,6 +42,29 @@ def test_valid_production_settings_pass_validation():
     _valid_production_settings().validate()
 
 
+def test_production_allows_encrypted_railway_private_database_network():
+    private_database = replace(
+        _valid_production_settings(),
+        database_url=(
+            "postgresql+psycopg2://app:password@pgvector.railway.internal:5432/app"
+        ),
+    )
+
+    private_database.validate()
+
+
+def test_production_rejects_external_database_without_tls():
+    insecure_database = replace(
+        _valid_production_settings(),
+        database_url="postgresql+psycopg2://app:password@db.example.net:5432/app",
+    )
+
+    with pytest.raises(SettingsError) as exc_info:
+        insecure_database.validate()
+
+    assert "DATABASE_URL" in str(exc_info.value)
+
+
 def test_production_settings_report_names_without_secret_values():
     unsafe_value = "placeholder-secret-that-must-never-be-logged"
     invalid = replace(
