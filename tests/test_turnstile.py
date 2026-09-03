@@ -63,7 +63,7 @@ def test_turnstile_fails_closed_when_provider_is_unavailable(monkeypatch) -> Non
     assert exc_info.value.status_code == 503
 
 
-def test_turnstile_allows_synthetic_hostname_only_for_local_test_secret(monkeypatch) -> None:
+def test_turnstile_allows_omitted_metadata_for_local_test_secret(monkeypatch) -> None:
     monkeypatch.setattr(
         turnstile,
         "settings",
@@ -78,9 +78,34 @@ def test_turnstile_allows_synthetic_hostname_only_for_local_test_secret(monkeypa
         "urlopen",
         lambda *_args, **_kwargs: _SiteverifyResponse({
             "success": True,
-            "action": "login",
-            "hostname": "dummy-key-pass",
+            "hostname": "example.com",
+            "metadata": {"result_with_testing_key": True},
         }),
     )
 
     turnstile.verify_turnstile("test-token", action="login", remote_ip=None)
+
+
+def test_turnstile_test_secret_still_requires_success(monkeypatch) -> None:
+    monkeypatch.setattr(
+        turnstile,
+        "settings",
+        SimpleNamespace(
+            turnstile_secret_key="1x0000000000000000000000000000000AA",
+            is_production=False,
+            frontend_url="http://localhost:3000",
+        ),
+    )
+    monkeypatch.setattr(
+        turnstile,
+        "urlopen",
+        lambda *_args, **_kwargs: _SiteverifyResponse({
+            "success": False,
+            "error-codes": ["invalid-input-response"],
+        }),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        turnstile.verify_turnstile("invalid-token", action="login", remote_ip=None)
+
+    assert exc_info.value.status_code == 400

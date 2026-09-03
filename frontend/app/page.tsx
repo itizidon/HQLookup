@@ -14,29 +14,54 @@ export default async function Home() {
 
   return (
     <div className="screen" style={{ position: 'relative', overflowX: 'hidden', minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-      {/* Responsive media query to stack cards on mobile screens only */}
+      {/* Responsive media query to stack cards and handle mobile navigation */}
       <style>{`
         @media (max-width: 768px) {
           .feature-grid {
             grid-template-columns: 1fr !important;
+          }
+          .nav-links {
+            display: none !important;
           }
         }
       `}</style>
 
       {/* Top Header matching dashboard style */}
       <header style={{ borderBottom: '1px solid var(--color-border-tertiary, #e4e4e7)', background: 'var(--color-background-primary, #ffffff)', padding: '16px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <div style={{ padding: '6px', borderRadius: '6px', background: 'var(--color-background-secondary, #f4f4f5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <Building2 size={18} />
-          </div>
-          <span style={{ fontSize: '16px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)' }}>HQLookup</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+          <Link href="/" style={{ display: 'flex', alignItems: 'center', gap: '8px', textDecoration: 'none' }}>
+            <div style={{ padding: '6px', borderRadius: '6px', background: 'var(--color-background-secondary, #f4f4f5)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-text-primary, #18181b)' }}>
+              <Building2 size={18} />
+            </div>
+            <span style={{ fontSize: '16px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)' }}>HQLookup</span>
+          </Link>
+
+          {/* Main Navigation Tabs */}
+          <nav className="nav-links" style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
+            <Link href="/features" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
+              Features
+            </Link>
+            <Link href="/pricing" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
+              Pricing
+            </Link>
+            <Link href="/demo" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
+              Demo
+            </Link>
+            <Link href="/about" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
+              About
+            </Link>
+            <Link href="/contact" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
+              Contact
+            </Link>
+          </nav>
         </div>
+
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           <Link href="/auth" className="btn btn-secondary" style={{ fontSize: '13px', textDecoration: 'none' }}>
             Sign in
           </Link>
-          <Link href="/auth?mode=signup" className="btn btn-primary" style={{ fontSize: '13px', textDecoration: 'none' }}>
-            Get Started <ArrowRight size={14} style={{ marginLeft: '4px' }} />
+          <Link href="/demo" className="btn btn-primary" style={{ fontSize: '13px', textDecoration: 'none' }}>
+            Get a Demo <ArrowRight size={14} style={{ marginLeft: '4px' }} />
           </Link>
         </div>
       </header>
@@ -56,11 +81,11 @@ export default async function Home() {
             Upload documents per location, manage multi-tenant organization workspaces, and query your enterprise knowledge base with precise RAG intelligence.
           </p>
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-            <Link href="/auth?mode=signup" className="btn btn-primary" style={{ fontSize: '13px', textDecoration: 'none', padding: '8px 16px' }}>
-              Get Started Free <ArrowRight size={14} style={{ marginLeft: '6px' }} />
+            <Link href="/demo" className="btn btn-primary" style={{ fontSize: '13px', textDecoration: 'none', padding: '8px 16px' }}>
+              Book a Demo <ArrowRight size={14} style={{ marginLeft: '6px' }} />
             </Link>
-            <Link href="/auth" className="btn btn-secondary" style={{ fontSize: '13px', textDecoration: 'none', padding: '8px 16px' }}>
-              Sign in to Workspace
+            <Link href="/auth?mode=signup" className="btn btn-secondary" style={{ fontSize: '13px', textDecoration: 'none', padding: '8px 16px' }}>
+              Get Started Free
             </Link>
           </div>
         </div>
@@ -99,9 +124,18 @@ export default async function Home() {
         </div>
       </main>
 
-      {/* Footer */}
-      <footer style={{ borderTop: '1px solid var(--color-border-tertiary, #e4e4e7)', padding: '16px 24px', textAlign: 'center', fontSize: '12px', color: 'var(--color-text-secondary, #71717a)' }}>
-        © {new Date().getFullYear()} HQLookup. All rights reserved.
+      {/* Footer with SEO Navigation Links */}
+      <footer style={{ borderTop: '1px solid var(--color-border-tertiary, #e4e4e7)', padding: '24px', display: 'flex', flexDirection: 'column', gap: '12px', alignItems: 'center', fontSize: '12px', color: 'var(--color-text-secondary, #71717a)', background: 'var(--color-background-primary, #ffffff)' }}>
+        <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', justifyContent: 'center' }}>
+          <Link href="/features" style={{ color: 'inherit', textDecoration: 'none' }}>Features</Link>
+          <Link href="/pricing" style={{ color: 'inherit', textDecoration: 'none' }}>Pricing</Link>
+          <Link href="/demo" style={{ color: 'inherit', textDecoration: 'none' }}>Demo</Link>
+          <Link href="/about" style={{ color: 'inherit', textDecoration: 'none' }}>About</Link>
+          <Link href="/contact" style={{ color: 'inherit', textDecoration: 'none' }}>Contact</Link>
+        </div>
+        <div>
+          © {new Date().getFullYear()} HQLookup. All rights reserved.
+        </div>
       </footer>
     </div>
   );
