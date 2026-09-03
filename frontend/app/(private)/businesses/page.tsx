@@ -42,11 +42,13 @@ interface PendingInvitation {
 }
 
 interface UploadedDocument {
-  document_id: string | number;
+  document_id?: string | number;
   filename: string;
+  error?: string;
 }
 
 type ActiveTab = 'files' | 'settings' | 'team';
+const MAX_INGESTION_NOTES_LENGTH = 4000;
 
 const tabs: Array<{ id: ActiveTab; label: string; icon: React.ReactNode }> = [
   { id: 'files', label: 'Knowledge Base', icon: <FileText size={14} /> },
@@ -91,6 +93,7 @@ export default function EnterpriseBusinessDetail() {
   const [documents, setDocuments] = useState<ServerDocument[]>([]);
   const [docsLoading, setDocsLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   
   // Pending File Staging State for XLSX Context Injection
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
@@ -240,6 +243,7 @@ export default function EnterpriseBusinessDetail() {
   // Stage files into pending list when picked from disk
   const handleFileSelection = (e: ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files || e.target.files.length === 0) return;
+    setUploadError(null);
 
     const newFiles: PendingFile[] = Array.from(e.target.files).map((f) => {
       const lowerName = f.name.toLowerCase();
@@ -269,7 +273,11 @@ export default function EnterpriseBusinessDetail() {
 
   const updatePendingFileContext = (id: string, text: string) => {
     setPendingFiles((prev) =>
-      prev.map((f) => (f.id === id ? { ...f, context: text } : f))
+      prev.map((f) => (
+        f.id === id
+          ? { ...f, context: text.slice(0, MAX_INGESTION_NOTES_LENGTH) }
+          : f
+      ))
     );
   };
 
@@ -279,7 +287,10 @@ export default function EnterpriseBusinessDetail() {
         if (f.id !== id) return f;
         const current = f.context.trim();
         const updated = current ? `${current}; ${presetText}` : presetText;
-        return { ...f, context: updated };
+        return {
+          ...f,
+          context: updated.slice(0, MAX_INGESTION_NOTES_LENGTH),
+        };
       })
     );
   };
@@ -291,18 +302,17 @@ export default function EnterpriseBusinessDetail() {
     const businessId = businessDetails.id;
 
     setUploading(true);
+    setUploadError(null);
     const formData = new FormData();
     formData.append("business_id", businessId.toString());
 
-    // Map file metadata contexts as a JSON string array to pass alongside FormData
-    const contextsPayload: Record<string, string> = {};
-
+    // Keep notes aligned with the repeated file fields, including duplicate names.
     pendingFiles.forEach((p) => {
       formData.append("files", p.file);
-      if (p.isExcel && p.context.trim()) {
-        contextsPayload[p.file.name] = p.context.trim();
-      }
     });
+    const contextsPayload = pendingFiles.map((p) => (
+      p.isExcel ? p.context.trim() : ''
+    ));
 
     formData.append("file_contexts", JSON.stringify(contextsPayload));
 
@@ -311,19 +321,48 @@ export default function EnterpriseBusinessDetail() {
         method: "POST",
         body: formData,
       });
+      if (!res.ok) {
+        throw new Error(await responseErrorMessage(res, "Could not upload documents."));
+      }
       const data = await res.json() as { uploaded?: UploadedDocument[] };
-      if (data.uploaded) {
-        const newDocs: ServerDocument[] = data.uploaded.map((uploaded) => ({
+      if (!data.uploaded) {
+        throw new Error("The upload service returned an invalid response.");
+      }
+
+      const successfulUploads = data.uploaded.filter(
+        (uploaded): uploaded is UploadedDocument & { document_id: string | number } => (
+          uploaded.document_id !== undefined && !uploaded.error
+        ),
+      );
+      const failedUploads = data.uploaded.filter((uploaded) => uploaded.error);
+      const completedFileIds = new Set(
+        data.uploaded.flatMap((uploaded, index) => (
+          uploaded.document_id !== undefined && !uploaded.error && pendingFiles[index]
+            ? [pendingFiles[index].id]
+            : []
+        )),
+      );
+
+      if (successfulUploads.length > 0) {
+        const newDocs: ServerDocument[] = successfulUploads.map((uploaded) => ({
           id: uploaded.document_id.toString(),
           name: uploaded.filename,
           type: uploaded.filename.split('.').pop()?.toUpperCase() || 'UNKNOWN',
           business_id: businessId
         }));
         setDocuments((prev) => [...newDocs, ...prev]);
-        setPendingFiles([]); // Clear staging queue
       }
+      if (failedUploads.length > 0) {
+        setUploadError(
+          failedUploads
+            .map((uploaded) => `${uploaded.filename}: ${uploaded.error}`)
+            .join(' '),
+        );
+      }
+      setPendingFiles((prev) => prev.filter((file) => !completedFileIds.has(file.id)));
     } catch (err) {
       console.error("Upload failure:", err);
+      setUploadError(errorMessage(err, "An unhandled upload error occurred."));
     } finally {
       setUploading(false);
     }
@@ -549,6 +588,13 @@ export default function EnterpriseBusinessDetail() {
                     </label>
                   </div>
 
+                  {uploadError && (
+                    <div style={{ ...s.errorBox, marginBottom: '16px' }}>
+                      <ShieldAlert size={14} style={{ flexShrink: 0 }} />
+                      <span style={{ fontSize: '12px' }}>{uploadError}</span>
+                    </div>
+                  )}
+
                   {/* STAGING QUEUE (PENDING FILES BEFORE INGESTION) */}
                   {pendingFiles.length > 0 && (
                     <div style={{ marginBottom: '24px', padding: '16px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '8px' }}>
@@ -629,12 +675,13 @@ export default function EnterpriseBusinessDetail() {
                             {p.isExcel && p.isExpanded && (
                               <div style={{ padding: '12px', background: '#f8fafc', borderTop: '1px solid #e2e8f0' }}>
                                 <label style={{ display: 'block', fontSize: '11px', fontWeight: 600, color: '#475569', marginBottom: '4px' }}>
-                                  Spreadsheet Processing Context (Optional)
+                                  Spreadsheet Ingestion Notes (Optional)
                                 </label>
                                 <textarea
                                   value={p.context}
                                   onChange={(e) => updatePendingFileContext(p.id, e.target.value)}
                                   placeholder="e.g. Yellow highlighted cells mean pending approval; Columns A-D are Q1 data."
+                                  maxLength={MAX_INGESTION_NOTES_LENGTH}
                                   rows={2}
                                   style={{
                                     width: '100%',
@@ -647,6 +694,9 @@ export default function EnterpriseBusinessDetail() {
                                     fontFamily: 'inherit'
                                   }}
                                 />
+                                <div style={{ marginTop: '3px', textAlign: 'right', fontSize: '10px', color: '#94a3b8' }}>
+                                  {p.context.length} / {MAX_INGESTION_NOTES_LENGTH}
+                                </div>
 
                                 {/* Quick Preset Chips */}
                                 <div style={{ display: 'flex', gap: '6px', marginTop: '8px', flexWrap: 'wrap', alignItems: 'center' }}>

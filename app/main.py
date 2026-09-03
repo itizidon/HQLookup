@@ -592,8 +592,9 @@ def upload_documents(
     max_rows  = config["max_rows"]
     max_mb    = config["max_file_mb"]
 
-    # Parse optional JSON map: {"filename.xlsx": "context note"}
+    # Parse either the current index-aligned notes array or the legacy filename map.
     contexts_map: dict[str, str] = {}
+    contexts_by_index: list[str] | None = None
     if file_contexts:
         if len(file_contexts) > 100_000:
             raise HTTPException(status_code=400, detail="file_contexts is too large.")
@@ -602,29 +603,52 @@ def upload_documents(
         except (TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=400,
-                detail="file_contexts must be a valid JSON object.",
+                detail="file_contexts must be valid JSON.",
             ) from exc
-        if not isinstance(raw_contexts, dict) or any(
+        if isinstance(raw_contexts, list):
+            if len(raw_contexts) != len(files) or any(
+                not isinstance(value, str) for value in raw_contexts
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "file_contexts must contain one text value per uploaded file."
+                    ),
+                )
+            if any(len(value) > 4000 for value in raw_contexts):
+                raise HTTPException(
+                    status_code=400,
+                    detail="A file context is too long.",
+                )
+            contexts_by_index = [value.strip() for value in raw_contexts]
+        elif not isinstance(raw_contexts, dict) or any(
             not isinstance(key, str) or not isinstance(value, str)
             for key, value in raw_contexts.items()
         ):
             raise HTTPException(
                 status_code=400,
-                detail="file_contexts must map filenames to text.",
+                detail=(
+                    "file_contexts must be an array aligned with files or map "
+                    "filenames to text."
+                ),
             )
-        if any(len(value) > 4000 for value in raw_contexts.values()):
-            raise HTTPException(status_code=400, detail="A file context is too long.")
-        contexts_map = {
-            Path(key).name: value.strip()
-            for key, value in raw_contexts.items()
-        }
+        else:
+            if any(len(value) > 4000 for value in raw_contexts.values()):
+                raise HTTPException(
+                    status_code=400,
+                    detail="A file context is too long.",
+                )
+            contexts_map = {
+                Path(key).name: value.strip()
+                for key, value in raw_contexts.items()
+            }
 
     uploaded = []
     total_bytes = 0
     max_file_bytes = int(max_mb * 1024 * 1024)
     max_total_bytes = settings.max_upload_total_mb * 1024 * 1024
 
-    for file in files:
+    for file_index, file in enumerate(files):
         stored = None
         display_filename = Path(file.filename or "upload").name[:255] or "upload"
 
@@ -635,7 +659,11 @@ def upload_documents(
                 max_remaining_bytes=max_total_bytes - total_bytes,
             )
             total_bytes += stored.size_bytes
-            specific_context = contexts_map.get(stored.filename) or None
+            specific_context = (
+                contexts_by_index[file_index]
+                if contexts_by_index is not None
+                else contexts_map.get(stored.filename, "")
+            ) or None
 
             # ── Row count check (spreadsheets only) ───────────────────────────
             if stored.extension in {".csv", ".xlsx", ".xlsm", ".xls"}:
@@ -667,6 +695,7 @@ def upload_documents(
                 document_id=doc.id,
                 file_path=stored.path,
                 filename=stored.filename,
+                ingestion_notes=specific_context,
             )
             if chunks_count <= 0:
                 raise UnsafeUpload("Document did not contain searchable content")

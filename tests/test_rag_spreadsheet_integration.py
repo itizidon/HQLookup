@@ -156,3 +156,49 @@ def test_ingest_document_persists_normalized_spreadsheet_chunks(
     assert "X Axis: Month" in march.parent_text
     assert "Y Axis: Revenue" in march.parent_text
     assert "Unit: USD" in march.parent_text
+
+
+def test_ingest_document_forwards_notes_to_spreadsheet_builder(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = _workbook_with_line_chart(tmp_path / "noted-revenue.xlsx")
+    captured: dict[str, object] = {}
+
+    def record_build(file_path: str, filename: str, **kwargs):
+        captured.update(
+            {
+                "file_path": file_path,
+                "filename": filename,
+                **kwargs,
+            }
+        )
+        return [
+            {
+                "text": "Sheet: Data\nMonth: Jan | Revenue: 100",
+                "parent": "Sheet: Data\nMonth: Jan | Revenue: 100",
+                "chunk_type": "tabular_record",
+                "content_type": "tabular",
+            }
+        ]
+
+    session = RecordingSession()
+    monkeypatch.setattr(rag, "get_embedder", lambda: FakeEmbedder())
+    monkeypatch.setattr(rag, "build_spreadsheet_chunk_specs", record_build)
+
+    count = rag.ingest_document(
+        session,
+        business_id=7,
+        document_id=11,
+        file_path=str(path),
+        filename=path.name,
+        ingestion_notes="The first three rows are KPI summary cards.",
+    )
+
+    assert count == 1
+    assert captured == {
+        "file_path": str(path),
+        "filename": path.name,
+        "client": rag.client,
+        "ingestion_notes": "The first three rows are KPI summary cards.",
+    }

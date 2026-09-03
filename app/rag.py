@@ -821,6 +821,8 @@ def ingest_document(
     document_id: int,
     file_path: str,
     filename: str,
+    *,
+    ingestion_notes: str | None = None,
 ) -> int:
 
     from app.models import Chunk
@@ -839,6 +841,7 @@ def ingest_document(
             file_path,
             filename,
             client=client,
+            ingestion_notes=ingestion_notes,
         )
 
     # ==================================================================

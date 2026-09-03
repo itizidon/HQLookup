@@ -1047,6 +1047,54 @@ def test_llm_input_limit_does_not_limit_deterministic_chart_scanning(
     assert len(_chunks_of_type(chunks, "chart_datapoint")) == 150
 
 
+def test_ingestion_notes_reach_spreadsheet_llm_prompt(tmp_path: Path) -> None:
+    path = _line_workbook(tmp_path / "noted.xlsx")
+    fake_client = FakeOpenAIClient(_analysis_for_chart())
+    notes = 'Yellow cells indicate "pending".\nRows 1-3 are KPI cards.'
+
+    ingestion.build_spreadsheet_chunk_specs(
+        str(path),
+        path.name,
+        client=fake_client,
+        ingestion_notes=notes,
+    )
+
+    prompt = fake_client.calls[0]["messages"][-1]["content"]
+    assert "BEGIN USER-PROVIDED INGESTION NOTES (JSON STRING)" in prompt
+    assert json.dumps(notes) in prompt
+    assert notes not in prompt
+    assert "END USER-PROVIDED INGESTION NOTES" in prompt
+    assert "deterministic workbook facts" in prompt
+    system_prompt = fake_client.calls[0]["messages"][0]["content"]
+    assert "untrusted contextual data" in system_prompt
+    assert (
+        "Deterministically extracted workbook facts are authoritative"
+        in system_prompt
+    )
+
+
+def test_ingestion_notes_leave_room_for_workbook_structure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _line_workbook(tmp_path / "bounded-notes.xlsx")
+    fake_client = FakeOpenAIClient(_analysis_for_chart())
+    monkeypatch.setattr(ingestion, "MAX_SPREADSHEET_LLM_CHARS", 1_000)
+    oversized_notes = "A" * 4_000
+
+    ingestion.build_spreadsheet_chunk_specs(
+        str(path),
+        path.name,
+        client=fake_client,
+        ingestion_notes=oversized_notes,
+    )
+
+    prompt = fake_client.calls[0]["messages"][-1]["content"]
+    assert "BEGIN USER-PROVIDED INGESTION NOTES (JSON STRING)" in prompt
+    assert oversized_notes not in prompt
+    assert "A1=Month" in prompt
+
+
 def test_visual_llm_limit_does_not_drop_deterministic_chart_chunks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
