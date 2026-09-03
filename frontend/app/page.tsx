@@ -41,6 +41,9 @@ export default async function Home() {
             <Link href="/features" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
               Features
             </Link>
+            <Link href="/solutions" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
+              Solutions
+            </Link>
             <Link href="/pricing" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
               Pricing
             </Link>
