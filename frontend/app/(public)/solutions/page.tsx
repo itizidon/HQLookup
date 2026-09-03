@@ -1,14 +1,12 @@
 import Link from "next/link";
-import { Building2, ArrowRight, Home, Calculator, Shield, Building, Briefcase, FileText, Database, Layers, CheckCircle2, Search } from "lucide-react";
+import { ArrowRight, Home, Calculator, Shield, Building, Briefcase, BookOpen, CheckCircle2, Scale } from "lucide-react";
+import { MarketingFooter, MarketingHeader } from "@/components/MarketingNavigation";
 
 export default function SolutionsPage() {
   return (
     <div className="screen" style={{ position: 'relative', overflowX: 'hidden', minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
       <style>{`
         @media (max-width: 768px) {
-          .nav-links {
-            display: none !important;
-          }
           .solutions-grid {
             grid-template-columns: 1fr !important;
           }
@@ -18,47 +16,7 @@ export default function SolutionsPage() {
         }
       `}</style>
 
-      {/* Top Header */}
-      <header style={{ borderBottom: '1px solid var(--color-border-tertiary, #e4e4e7)', background: 'var(--color-background-primary, #ffffff)', padding: '16px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
-          <Link href="/" style={{ display: 'flex', alignItems: 'center', gap: '8px', textDecoration: 'none' }}>
-            <div style={{ padding: '6px', borderRadius: '6px', background: 'var(--color-background-secondary, #f4f4f5)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-text-primary, #18181b)' }}>
-              <Building2 size={18} />
-            </div>
-            <span style={{ fontSize: '16px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)' }}>HQLookup</span>
-          </Link>
-
-          <nav className="nav-links" style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
-            <Link href="/features" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
-              Features
-            </Link>
-            <Link href="/pricing" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
-              Pricing
-            </Link>
-            <Link href="/solutions" style={{ fontSize: '13px', color: 'var(--color-text-primary, #18181b)', textDecoration: 'none', fontWeight: 600 }}>
-              Solutions
-            </Link>
-            <Link href="/demo" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
-              Demo
-            </Link>
-            <Link href="/about" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
-              About
-            </Link>
-            <Link href="/contact" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
-              Contact
-            </Link>
-          </nav>
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <Link href="/auth" className="btn btn-secondary" style={{ fontSize: '13px', textDecoration: 'none' }}>
-            Sign in
-          </Link>
-          <Link href="/demo" className="btn btn-primary" style={{ fontSize: '13px', textDecoration: 'none' }}>
-            Get a Demo <ArrowRight size={14} style={{ marginLeft: '4px' }} />
-          </Link>
-        </div>
-      </header>
+      <MarketingHeader activePage="solutions" />
 
       {/* Main Content Area */}
       <main style={{ padding: '48px 24px', maxWidth: '840px', margin: '0 auto', width: '100%', flex: 1, display: 'flex', flexDirection: 'column', gap: '48px' }}>
@@ -72,10 +30,10 @@ export default function SolutionsPage() {
             AI document search built for real business workflows
           </h1>
           <p style={{ fontSize: '15px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.6' }}>
-            HQLookup helps businesses search across PDFs, Excel spreadsheets, reports, policies, contracts, tables, charts, and other internal documents using natural language.
+            HQLookup helps businesses search across PDFs, Excel spreadsheets, reports, policies, contracts, tables, charts, and internal knowledge using natural language.
           </p>
           <p style={{ fontSize: '14px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.6' }}>
-            Instead of manually digging through files, teams can upload their business documents, ask questions, and get answers grounded in the information they already have. Whether you manage properties, financial records, insurance policies, operational documents, or information across multiple locations, HQLookup helps turn scattered files into searchable business knowledge.
+            Instead of manually digging through files, teams can upload their business documents, ask questions, and get answers grounded in the information they already have. Give your team one place to ask how your business works.
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '8px' }}>
             <Link href="/auth?mode=signup" className="btn btn-primary" style={{ fontSize: '13px', textDecoration: 'none', padding: '10px 20px', width: 'fit-content', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
@@ -127,7 +85,7 @@ export default function SolutionsPage() {
               </p>
               <div style={{ fontSize: '12px', color: 'var(--color-text-secondary, #71717a)', background: 'var(--color-background-secondary, #f4f4f5)', padding: '12px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
                 <strong style={{ color: 'var(--color-text-primary, #18181b)', marginBottom: '2px', display: 'block' }}>Example questions:</strong>
-                <span>• What were this client's largest expenses?</span>
+                <span>• What were this client&apos;s largest expenses?</span>
                 <span>• Which invoices are still outstanding?</span>
                 <span>• How did expenses change month over month?</span>
                 <span>• What does this spreadsheet chart show?</span>
@@ -170,26 +128,61 @@ export default function SolutionsPage() {
               </div>
             </div>
 
-          </div>
-
-          {/* Business Operations (Full width card) */}
-          <div className="card" style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '16px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)' }}>
-              <Briefcase size={18} style={{ color: 'var(--color-text-secondary)' }} />
-              Business Operations & Multi-Branch Enterprises
+            {/* Business Operations */}
+            <div className="card" style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '16px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)' }}>
+                <Briefcase size={18} style={{ color: 'var(--color-text-secondary)' }} />
+                Business Operations
+              </div>
+              <p style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.5', margin: 0 }}>
+                Turn internal documents into a searchable knowledge base for day-to-day operations. Search SOPs, policies, reports, spreadsheets, and vendor agreements.
+              </p>
+              <div style={{ fontSize: '12px', color: 'var(--color-text-secondary, #71717a)', background: 'var(--color-background-secondary, #f4f4f5)', padding: '12px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <strong style={{ color: 'var(--color-text-primary, #18181b)', marginBottom: '2px', display: 'block' }}>Example questions:</strong>
+                <span>• What is our policy for this situation?</span>
+                <span>• Which vendor agreement contains this requirement?</span>
+                <span>• What were the key findings in this report?</span>
+                <span>• Where is this process documented?</span>
+              </div>
             </div>
-            <p style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.5', margin: 0 }}>
-              Turn internal documents into a searchable knowledge base for day-to-day operations. Search SOPs, policies, reports, spreadsheets, internal documentation, vendor agreements, and operational records.
-            </p>
-            <div style={{ fontSize: '12px', color: 'var(--color-text-secondary, #71717a)', background: 'var(--color-background-secondary, #f4f4f5)', padding: '12px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-              <strong style={{ color: 'var(--color-text-primary, #18181b)', marginBottom: '2px', display: 'block' }}>Example questions:</strong>
-              <span>• What is our policy for this situation?</span>
-              <span>• Which vendor agreement contains this requirement?</span>
-              <span>• What were the key findings in this report?</span>
-              <span>• Where is this process documented?</span>
-            </div>
-          </div>
 
+            {/* Internal Knowledge Base */}
+            <div className="card" style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '16px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)' }}>
+                <BookOpen size={18} style={{ color: 'var(--color-text-secondary)' }} />
+                Internal Knowledge Base
+              </div>
+              <p style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.5', margin: 0 }}>
+                Turn company terminology, procedures, SOPs, policies, and reference documents into a searchable internal knowledge base.
+              </p>
+              <div style={{ fontSize: '12px', color: 'var(--color-text-secondary, #71717a)', background: 'var(--color-background-secondary, #f4f4f5)', padding: '12px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <strong style={{ color: 'var(--color-text-primary, #18181b)', marginBottom: '2px', display: 'block' }}>Example questions:</strong>
+                <span>• What does this internal term mean?</span>
+                <span>• What is the procedure for handling this request?</span>
+                <span>• What steps should I follow for onboarding?</span>
+                <span>• Which document defines this acronym?</span>
+              </div>
+            </div>
+
+            {/* Legal */}
+            <div className="card" style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '16px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)' }}>
+                <Scale size={18} style={{ color: 'var(--color-text-secondary)' }} />
+                Legal
+              </div>
+              <p style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.5', margin: 0 }}>
+                Search across contracts, legal briefs, compliance documents, agreements, and regulatory guidelines with precision.
+              </p>
+              <div style={{ fontSize: '12px', color: 'var(--color-text-secondary, #71717a)', background: 'var(--color-background-secondary, #f4f4f5)', padding: '12px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <strong style={{ color: 'var(--color-text-primary, #18181b)', marginBottom: '2px', display: 'block' }}>Example questions:</strong>
+                <span>• What are the termination clauses in this agreement?</span>
+                <span>• What are our primary obligations under this contract?</span>
+                <span>• What compliance requirements apply here?</span>
+                <span>• Which documents mention this specific indemnification term?</span>
+              </div>
+            </div>
+
+          </div>
         </div>
 
         {/* Feature Capabilities Breakdown */}
@@ -213,7 +206,7 @@ export default function SolutionsPage() {
               "CSV files",
               "Reports and policies",
               "Contracts and invoices",
-              "Operational records"
+              "Internal terminology & SOPs"
             ].map((format, idx) => (
               <div key={idx} style={{ padding: '12px 16px', borderRadius: '8px', background: 'var(--color-background-secondary, #f4f4f5)', fontSize: '13px', color: 'var(--color-text-primary, #18181b)', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <CheckCircle2 size={14} style={{ color: '#10b981', flexShrink: 0 }} />
@@ -247,7 +240,7 @@ export default function SolutionsPage() {
               Search across multiple documents
             </h4>
             <p style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.5', margin: 0 }}>
-              Business questions often require information spread across multiple files. Instead of wondering <em style={{ color: 'var(--color-text-primary)' }}>"Which file was that information in?"</em> you can start directly with <em style={{ color: 'var(--color-text-primary)' }}>"What do our documents say about this?"</em>
+              Business questions often require information spread across multiple files. Instead of wondering <em style={{ color: 'var(--color-text-primary)' }}>“Which file was that information in?”</em> you can start directly with <em style={{ color: 'var(--color-text-primary)' }}>“What do our documents say about this?”</em>
             </p>
           </div>
 
@@ -290,7 +283,7 @@ export default function SolutionsPage() {
             Find the information your business already has
           </h3>
           <p style={{ fontSize: '14px', color: 'var(--color-text-secondary, #71717a)', maxWidth: '480px', margin: 0 }}>
-            Your team shouldn't have to remember which folder or spreadsheet contains the answer. Turn existing documents into searchable business knowledge.
+            Your team shouldn&apos;t have to remember which folder or spreadsheet contains the answer. Turn existing documents into searchable business knowledge.
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'center', marginTop: '8px' }}>
             <Link href="/auth?mode=signup" className="btn btn-primary" style={{ fontSize: '13px', textDecoration: 'none', padding: '10px 20px', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
@@ -302,20 +295,7 @@ export default function SolutionsPage() {
 
       </main>
 
-      {/* Footer */}
-      <footer style={{ borderTop: '1px solid var(--color-border-tertiary, #e4e4e7)', padding: '24px', display: 'flex', flexDirection: 'column', gap: '12px', alignItems: 'center', fontSize: '12px', color: 'var(--color-text-secondary, #71717a)', background: 'var(--color-background-primary, #ffffff)' }}>
-        <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', justifyContent: 'center' }}>
-          <Link href="/features" style={{ color: 'inherit', textDecoration: 'none' }}>Features</Link>
-          <Link href="/pricing" style={{ color: 'inherit', textDecoration: 'none' }}>Pricing</Link>
-          <Link href="/solutions" style={{ color: 'inherit', textDecoration: 'none', fontWeight: 500 }}>Solutions</Link>
-          <Link href="/demo" style={{ color: 'inherit', textDecoration: 'none' }}>Demo</Link>
-          <Link href="/about" style={{ color: 'inherit', textDecoration: 'none' }}>About</Link>
-          <Link href="/contact" style={{ color: 'inherit', textDecoration: 'none' }}>Contact</Link>
-        </div>
-        <div>
-          © {new Date().getFullYear()} HQLookup. All rights reserved.
-        </div>
-      </footer>
+      <MarketingFooter activePage="solutions" />
     </div>
   );
 }

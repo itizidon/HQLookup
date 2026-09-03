@@ -1,7 +1,8 @@
 import Link from "next/link";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { Building2, ArrowRight, ShieldCheck, Database, Layers } from "lucide-react";
+import { ArrowRight, ShieldCheck, Database, Layers } from "lucide-react";
+import { MarketingFooter, MarketingHeader } from "@/components/MarketingNavigation";
 
 export default async function Home() {
   const cookieStore = await cookies();
@@ -20,54 +21,10 @@ export default async function Home() {
           .feature-grid {
             grid-template-columns: 1fr !important;
           }
-          .nav-links {
-            display: none !important;
-          }
         }
       `}</style>
 
-      {/* Top Header matching dashboard style */}
-      <header style={{ borderBottom: '1px solid var(--color-border-tertiary, #e4e4e7)', background: 'var(--color-background-primary, #ffffff)', padding: '16px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
-          <Link href="/" style={{ display: 'flex', alignItems: 'center', gap: '8px', textDecoration: 'none' }}>
-            <div style={{ padding: '6px', borderRadius: '6px', background: 'var(--color-background-secondary, #f4f4f5)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-text-primary, #18181b)' }}>
-              <Building2 size={18} />
-            </div>
-            <span style={{ fontSize: '16px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)' }}>HQLookup</span>
-          </Link>
-
-          {/* Main Navigation Tabs */}
-          <nav className="nav-links" style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
-            <Link href="/features" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
-              Features
-            </Link>
-            <Link href="/solutions" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
-              Solutions
-            </Link>
-            <Link href="/pricing" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
-              Pricing
-            </Link>
-            <Link href="/demo" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
-              Demo
-            </Link>
-            <Link href="/about" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
-              About
-            </Link>
-            <Link href="/contact" style={{ fontSize: '13px', color: 'var(--color-text-secondary, #71717a)', textDecoration: 'none', fontWeight: 500 }}>
-              Contact
-            </Link>
-          </nav>
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <Link href="/auth" className="btn btn-secondary" style={{ fontSize: '13px', textDecoration: 'none' }}>
-            Sign in
-          </Link>
-          <Link href="/demo" className="btn btn-primary" style={{ fontSize: '13px', textDecoration: 'none' }}>
-            Get a Demo <ArrowRight size={14} style={{ marginLeft: '4px' }} />
-          </Link>
-        </div>
-      </header>
+      <MarketingHeader />
 
       {/* Main Content Area */}
       <main style={{ padding: '40px 24px', maxWidth: '1000px', margin: '0 auto', width: '100%', flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
@@ -127,19 +84,7 @@ export default async function Home() {
         </div>
       </main>
 
-      {/* Footer with SEO Navigation Links */}
-      <footer style={{ borderTop: '1px solid var(--color-border-tertiary, #e4e4e7)', padding: '24px', display: 'flex', flexDirection: 'column', gap: '12px', alignItems: 'center', fontSize: '12px', color: 'var(--color-text-secondary, #71717a)', background: 'var(--color-background-primary, #ffffff)' }}>
-        <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', justifyContent: 'center' }}>
-          <Link href="/features" style={{ color: 'inherit', textDecoration: 'none' }}>Features</Link>
-          <Link href="/pricing" style={{ color: 'inherit', textDecoration: 'none' }}>Pricing</Link>
-          <Link href="/demo" style={{ color: 'inherit', textDecoration: 'none' }}>Demo</Link>
-          <Link href="/about" style={{ color: 'inherit', textDecoration: 'none' }}>About</Link>
-          <Link href="/contact" style={{ color: 'inherit', textDecoration: 'none' }}>Contact</Link>
-        </div>
-        <div>
-          © {new Date().getFullYear()} HQLookup. All rights reserved.
-        </div>
-      </footer>
+      <MarketingFooter />
     </div>
   );
 }
