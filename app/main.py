@@ -789,9 +789,18 @@ def get_my_businesses(
 
     combined = []
     for org_id in dict.fromkeys(requested_org_ids):
-        combined.extend(get_accessible_businesses(db, user, org_id))
+        access = require_organization_access(db, user, org_id)
+        for business in get_accessible_businesses(db, user, org_id):
+            combined.append({
+                "id": business.id,
+                "name": business.name,
+                "org_id": business.org_id,
+                "query_allocation": business.query_allocation,
+                "can_edit_usage_limits": access.is_owner,
+                "can_invite_members": access.is_admin,
+            })
 
-    return {"businesses": [{"id": b.id, "name": b.name, "org_id": b.org_id} for b in combined]}
+    return {"businesses": combined}
 
 
 # ── Organizations: create ──────────────────────────────────────────────────────

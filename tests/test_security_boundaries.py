@@ -186,6 +186,88 @@ def test_owner_and_admin_can_access_every_org_business() -> None:
     assert require_business_access(admin_session, admin, business.id) is business
 
 
+def test_business_directory_exposes_role_specific_capabilities_and_allocation() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            User.__table__,
+            Organization.__table__,
+            OrgMember.__table__,
+            Business.__table__,
+            user_business,
+        ],
+    )
+    db = sessionmaker(bind=engine)()
+
+    try:
+        owner = User(
+            email="directory-owner@example.com",
+            name="Directory Owner",
+            hashed_password="unused-test-hash",
+        )
+        admin = User(
+            email="directory-admin@example.com",
+            name="Directory Admin",
+            hashed_password="unused-test-hash",
+        )
+        member = User(
+            email="directory-member@example.com",
+            name="Directory Member",
+            hashed_password="unused-test-hash",
+        )
+        db.add_all([owner, admin, member])
+        db.flush()
+
+        organization = Organization(name="Directory Workspace", owner_id=owner.id)
+        db.add(organization)
+        db.flush()
+
+        business = Business(
+            name="Directory Location",
+            org_id=organization.id,
+            query_allocation=137,
+        )
+        db.add(business)
+        db.flush()
+
+        db.add_all([
+            OrgMember(org_id=organization.id, user_id=owner.id, role="admin"),
+            OrgMember(org_id=organization.id, user_id=admin.id, role="admin"),
+            OrgMember(org_id=organization.id, user_id=member.id, role="member"),
+        ])
+        member.businesses.append(business)
+        db.commit()
+
+        expected_capabilities = [
+            (owner, True, True),
+            (admin, False, True),
+            (member, False, False),
+        ]
+        for user, can_edit_usage_limits, can_invite_members in expected_capabilities:
+            result = main_app.get_my_businesses(
+                main_app.MultiOrgBusinessesRequest(org_ids=[organization.id]),
+                db=db,
+                current_user=(user, None),
+            )
+
+            assert result == {
+                "businesses": [
+                    {
+                        "id": business.id,
+                        "name": business.name,
+                        "org_id": organization.id,
+                        "query_allocation": 137,
+                        "can_edit_usage_limits": can_edit_usage_limits,
+                        "can_invite_members": can_invite_members,
+                    }
+                ]
+            }
+    finally:
+        db.close()
+        engine.dispose()
+
+
 @pytest.fixture
 def invitation_session():
     engine = create_engine("sqlite+pysqlite:///:memory:")
