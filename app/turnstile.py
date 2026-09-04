@@ -65,15 +65,20 @@ def verify_turnstile(token: str, *, action: str, remote_ip: str | None) -> None:
         and str(result.get("hostname", "")).rstrip(".").lower()
         == expected_hostname.rstrip(".").lower()
     )
-    # Cloudflare's documented test credentials return a synthetic hostname.
-    # They are useful locally, while Settings rejects every test secret in
-    # production so this exception cannot weaken a deployed hostname check.
+    # Cloudflare's documented test credentials return placeholder metadata and
+    # can omit ``action`` entirely. They are useful locally, while Settings
+    # rejects every test secret in production so this exception cannot weaken
+    # deployed action or hostname checks.
     test_credential = not settings.is_production and secret in _TEST_SECRETS
+    metadata_matches = test_credential or (
+        isinstance(result, dict)
+        and result.get("action") == action
+        and hostname_matches
+    )
     if (
         not isinstance(result, dict)
         or result.get("success") is not True
-        or result.get("action") != action
-        or not (hostname_matches or test_credential)
+        or not metadata_matches
     ):
         raise HTTPException(
             status_code=400,

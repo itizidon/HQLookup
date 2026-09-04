@@ -1,7 +1,8 @@
 import Link from "next/link";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { Building2, ArrowRight, ShieldCheck, Database, Layers } from "lucide-react";
+import { ArrowRight, ShieldCheck, Database, Layers } from "lucide-react";
+import { MarketingFooter, MarketingHeader } from "@/components/MarketingNavigation";
 
 export default async function Home() {
   const cookieStore = await cookies();
@@ -14,7 +15,7 @@ export default async function Home() {
 
   return (
     <div className="screen" style={{ position: 'relative', overflowX: 'hidden', minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-      {/* Responsive media query to stack cards on mobile screens only */}
+      {/* Responsive media query to stack cards and handle mobile navigation */}
       <style>{`
         @media (max-width: 768px) {
           .feature-grid {
@@ -23,23 +24,7 @@ export default async function Home() {
         }
       `}</style>
 
-      {/* Top Header matching dashboard style */}
-      <header style={{ borderBottom: '1px solid var(--color-border-tertiary, #e4e4e7)', background: 'var(--color-background-primary, #ffffff)', padding: '16px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <div style={{ padding: '6px', borderRadius: '6px', background: 'var(--color-background-secondary, #f4f4f5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <Building2 size={18} />
-          </div>
-          <span style={{ fontSize: '16px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)' }}>HQLookup</span>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <Link href="/auth" className="btn btn-secondary" style={{ fontSize: '13px', textDecoration: 'none' }}>
-            Sign in
-          </Link>
-          <Link href="/auth?mode=signup" className="btn btn-primary" style={{ fontSize: '13px', textDecoration: 'none' }}>
-            Get Started <ArrowRight size={14} style={{ marginLeft: '4px' }} />
-          </Link>
-        </div>
-      </header>
+      <MarketingHeader />
 
       {/* Main Content Area */}
       <main style={{ padding: '40px 24px', maxWidth: '1000px', margin: '0 auto', width: '100%', flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
@@ -56,11 +41,11 @@ export default async function Home() {
             Upload documents per location, manage multi-tenant organization workspaces, and query your enterprise knowledge base with precise RAG intelligence.
           </p>
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-            <Link href="/auth?mode=signup" className="btn btn-primary" style={{ fontSize: '13px', textDecoration: 'none', padding: '8px 16px' }}>
-              Get Started Free <ArrowRight size={14} style={{ marginLeft: '6px' }} />
+            <Link href="/demo" className="btn btn-primary" style={{ fontSize: '13px', textDecoration: 'none', padding: '8px 16px' }}>
+              Book a Demo <ArrowRight size={14} style={{ marginLeft: '6px' }} />
             </Link>
-            <Link href="/auth" className="btn btn-secondary" style={{ fontSize: '13px', textDecoration: 'none', padding: '8px 16px' }}>
-              Sign in to Workspace
+            <Link href="/auth?mode=signup" className="btn btn-secondary" style={{ fontSize: '13px', textDecoration: 'none', padding: '8px 16px' }}>
+              Get Started Free
             </Link>
           </div>
         </div>
@@ -99,10 +84,7 @@ export default async function Home() {
         </div>
       </main>
 
-      {/* Footer */}
-      <footer style={{ borderTop: '1px solid var(--color-border-tertiary, #e4e4e7)', padding: '16px 24px', textAlign: 'center', fontSize: '12px', color: 'var(--color-text-secondary, #71717a)' }}>
-        © {new Date().getFullYear()} HQLookup. All rights reserved.
-      </footer>
+      <MarketingFooter />
     </div>
   );
 }
