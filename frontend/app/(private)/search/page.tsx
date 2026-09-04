@@ -6,6 +6,7 @@ import { FileText } from 'lucide-react';
 import { Search, ChevronDown, Clock, Loader2, Building2, MessageSquare, ArrowRight, Plus } from 'lucide-react';
 import { useBusiness } from '@/app/context/BusinessContext';
 import { DebounceContainer } from '@/components/Debounce';
+import { BrandIcon } from '@/components/BrandIcon';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { apiFetch } from '@/app/lib/api';
 
@@ -188,7 +189,7 @@ export default function SearchHome() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', position: 'relative' }}>
           {/* Logo / Brand Name linking back to Dashboard */}
           <Link href="/dashboard" className="nav-logo" style={{ textDecoration: 'none' }}>
-            <FileText size={18} style={{ color: 'var(--color-text-info)' }} /> HQLookup
+            <BrandIcon /> HQLookup
           </Link>
 
           <div style={{ width: '1px', height: '14px', background: 'var(--color-border-secondary)' }} />

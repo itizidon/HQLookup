@@ -2,8 +2,9 @@
 
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
-import { CheckCircle2, FileText, Loader2 } from 'lucide-react';
+import { CheckCircle2, Loader2 } from 'lucide-react';
 import { apiFetch, errorMessage, responseErrorMessage } from '@/app/lib/api';
+import { BrandIcon } from '@/components/BrandIcon';
 
 interface InvitationDetails {
   email: string;
@@ -135,7 +136,7 @@ export default function AcceptInviteForm() {
     <div className="flex min-h-full flex-1 items-center justify-center bg-zinc-50 p-8 dark:bg-black">
       <main className="w-full max-w-md rounded-xl border border-zinc-200 bg-white p-8 shadow-sm dark:border-zinc-800 dark:bg-zinc-950">
         <div className="flex items-center gap-2 text-zinc-900 dark:text-zinc-100">
-          <FileText size={20} aria-hidden="true" />
+          <BrandIcon size={20} />
           <span className="text-sm font-semibold">HQLookup</span>
         </div>
 

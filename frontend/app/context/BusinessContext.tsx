@@ -14,7 +14,9 @@ export type Business = {
   id: number;
   name: string;
   org_id: number;
-  query_allocation?: number;
+  query_allocation: number;
+  can_edit_usage_limits: boolean;
+  can_invite_members: boolean;
 };
 
 type State = {

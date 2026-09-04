@@ -61,6 +61,8 @@ interface BusinessDetails {
   name: string;
   org_id: number;
   query_allocation: number;
+  can_edit_usage_limits: boolean;
+  can_invite_members: boolean;
 }
 
 interface PendingFile {
@@ -125,6 +127,8 @@ export default function EnterpriseBusinessDetail() {
       name: matched.name,
       org_id: matched.org_id,
       query_allocation: matched.query_allocation ?? 25,
+      can_edit_usage_limits: matched.can_edit_usage_limits === true,
+      can_invite_members: matched.can_invite_members === true,
     };
   }, [activeBizId, activeOrgId, businesses]);
 
@@ -202,8 +206,13 @@ export default function EnterpriseBusinessDetail() {
     };
 
     const fetchTeamAndInvites = async () => {
-      setTeamLoading(true);
       setAllMembers([]);
+      if (!businessDetails.can_invite_members) {
+        setTeamLoading(false);
+        return;
+      }
+
+      setTeamLoading(true);
       try {
         const res = await apiFetch(
           `/organizations/${organizationId}/businesses/${businessId}/members`,
@@ -384,6 +393,10 @@ export default function EnterpriseBusinessDetail() {
 
   const handleSaveSettings = async () => {
     if (!businessDetails) return;
+    if (!businessDetails.can_edit_usage_limits) {
+      setSettingsError("Only the organization owner can update usage limits.");
+      return;
+    }
     setIsSavingSettings(true);
     setSettingsError(null);
     try {
@@ -407,7 +420,12 @@ export default function EnterpriseBusinessDetail() {
 
   const handleInlineInvite = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inviteEmail.trim() || !businessDetails) return;
+    if (!businessDetails) return;
+    if (!businessDetails.can_invite_members) {
+      setInviteStatus({ type: 'error', message: 'Only organization owners and admins can invite members.' });
+      return;
+    }
+    if (!inviteEmail.trim()) return;
 
     setIsSendingInvite(true);
     setInviteStatus(null);
@@ -440,6 +458,10 @@ export default function EnterpriseBusinessDetail() {
 
   const handleRevokeInvite = async (inviteId: string | number) => {
     if (!businessDetails) return;
+    if (!businessDetails.can_invite_members) {
+      setInviteStatus({ type: 'error', message: 'Only organization owners and admins can revoke invitations.' });
+      return;
+    }
     try {
       const parsedId = String(inviteId).replace('pending_', '');
       const res = await apiFetch(`/organizations/${businessDetails.org_id}/invitations/${encodeURIComponent(parsedId)}`, {
@@ -578,7 +600,11 @@ export default function EnterpriseBusinessDetail() {
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
                     <div>
                       <h3 style={{ fontSize: '14px', fontWeight: 500, margin: 0 }}>Document Library</h3>
-                      <p style={{ fontSize: '12px', color: 'var(--color-text-secondary)', margin: '2px 0 0 0' }}>Files ingested into the AI search index for this location.</p>
+                      <p style={{ fontSize: '12px', color: 'var(--color-text-secondary, #71717a)', margin: '2px 0 0 0' }}>Files ingested into the AI search index for this location.</p>
+                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: '6px', marginTop: '6px', padding: '6px 10px', borderRadius: '6px', background: 'var(--color-background-secondary, #f4f4f5)', border: '1px solid var(--color-border-tertiary, #e4e4e7)', fontSize: '11px', color: 'var(--color-text-secondary, #71717a)' }}>
+                        <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#f59e0b', display: 'inline-block', flexShrink: 0, marginTop: '4px' }}></span>
+                        <span>Standalone images (PNG, JPG) and <strong>image-only PDFs</strong> (scanned documents without a text layer) cannot be ingested because no content can be detected.</span>
+                      </div>
                     </div>
                     
                     <label className="btn btn-primary" style={{ fontSize: '12px', padding: '6px 12px', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
@@ -765,6 +791,13 @@ export default function EnterpriseBusinessDetail() {
                   <h3 style={{ fontSize: '14px', fontWeight: 500, margin: '0 0 4px 0' }}>Quota Threshold Controls</h3>
                   <p style={{ fontSize: '12px', color: 'var(--color-text-secondary)', margin: '0 0 16px 0' }}>Configure maximum execution query guardrails assigned to this single branch entity.</p>
 
+                  {!businessDetails.can_edit_usage_limits && (
+                    <div id="usage-limit-permission-note" style={{ ...s.permissionNotice, marginBottom: '16px' }}>
+                      <ShieldAlert size={14} style={{ flexShrink: 0 }} />
+                      <span>Only the organization owner can update usage limits. You can still view the current allocation.</span>
+                    </div>
+                  )}
+
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '20px' }}>
                     <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>MAX ALLOCATED QUERIES / MONTH</label>
                     <input
@@ -774,8 +807,14 @@ export default function EnterpriseBusinessDetail() {
                         businessId: businessDetails.id,
                         value: Number(e.target.value),
                       })}
-                      style={s.formInput}
+                      style={{
+                        ...s.formInput,
+                        cursor: businessDetails.can_edit_usage_limits ? 'text' : 'not-allowed',
+                        opacity: businessDetails.can_edit_usage_limits ? 1 : 0.65,
+                      }}
                       min={0}
+                      disabled={!businessDetails.can_edit_usage_limits}
+                      aria-describedby={!businessDetails.can_edit_usage_limits ? 'usage-limit-permission-note' : undefined}
                     />
                   </div>
 
@@ -789,7 +828,7 @@ export default function EnterpriseBusinessDetail() {
                   <button
                     className="btn btn-primary"
                     onClick={handleSaveSettings}
-                    disabled={isSavingSettings}
+                    disabled={isSavingSettings || !businessDetails.can_edit_usage_limits}
                     style={{ fontSize: '13px', padding: '6px 14px' }}
                   >
                     {isSavingSettings ? <Loader2 className="animate-spin" size={13} /> : "Update Limits"}
@@ -807,6 +846,13 @@ export default function EnterpriseBusinessDetail() {
                     </div>
                   </div>
 
+                  {!businessDetails.can_invite_members && (
+                    <div id="invite-permission-note" style={{ ...s.permissionNotice, marginBottom: '16px' }}>
+                      <ShieldAlert size={14} style={{ flexShrink: 0 }} />
+                      <span>Only organization owners and admins can invite members or manage pending invitations.</span>
+                    </div>
+                  )}
+
                   {/* Inline Invite Form */}
                   <form onSubmit={handleInlineInvite} style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
                     <input 
@@ -816,8 +862,10 @@ export default function EnterpriseBusinessDetail() {
                       onChange={(e) => setInviteEmail(e.target.value)}
                       style={{ ...s.formInput, flex: 1, marginTop: 0 }}
                       required
+                      disabled={!businessDetails.can_invite_members}
+                      aria-describedby={!businessDetails.can_invite_members ? 'invite-permission-note' : undefined}
                     />
-                    <button type="submit" className="btn btn-primary" disabled={isSendingInvite || !inviteEmail.trim()} style={{ fontSize: '13px', whiteSpace: 'nowrap' }}>
+                    <button type="submit" className="btn btn-primary" disabled={isSendingInvite || !inviteEmail.trim() || !businessDetails.can_invite_members} style={{ fontSize: '13px', whiteSpace: 'nowrap' }}>
                       {isSendingInvite ? <Loader2 className="animate-spin" size={13} /> : <UserPlus size={13} />}
                       Send Invite
                     </button>
@@ -830,7 +878,8 @@ export default function EnterpriseBusinessDetail() {
                   )}
 
                   {/* Team Members List */}
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  {businessDetails.can_invite_members && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                     {teamLoading ? (
                       <div style={{ padding: '30px', display: 'flex', justifyContent: 'center' }}><Loader2 className="animate-spin" size={18} /></div>
                     ) : teamMembers.length === 0 && pendingInvites.length === 0 ? (
@@ -861,7 +910,8 @@ export default function EnterpriseBusinessDetail() {
                         ))}
                       </>
                     )}
-                  </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -881,5 +931,6 @@ const s: Record<string, React.CSSProperties> = {
   docItemRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--color-background-secondary, #fafafa)', border: '1px solid var(--color-border-tertiary, #e4e4e7)', borderRadius: '6px' },
   formInput: { width: '100%', padding: '8px 12px', fontSize: '13px', borderRadius: '6px', border: '1px solid var(--color-border-tertiary, #e4e4e7)', background: 'transparent', outline: 'none', marginTop: '4px' },
   errorBox: { display: 'flex', gap: '8px', alignItems: 'center', padding: '10px 12px', borderRadius: '6px', backgroundColor: '#fef2f2', border: '1px solid #fee2e2', color: '#ef4444' },
+  permissionNotice: { display: 'flex', gap: '8px', alignItems: 'center', padding: '10px 12px', borderRadius: '6px', backgroundColor: '#f8fafc', border: '1px solid #e2e8f0', color: '#475569', fontSize: '12px', lineHeight: 1.5 },
   presetChip: { background: '#f1f5f9', border: '1px solid #cbd5e1', borderRadius: '4px', padding: '2px 6px', fontSize: '10px', color: '#334155', cursor: 'pointer', fontWeight: 500 }
 };
