@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useState, useEffect } from "react";
 import { apiFetch, responseErrorMessage } from "@/app/lib/api";
 import { Turnstile } from "@/components/Turnstile";
-import { Building2 } from "lucide-react";
+import { BrandIcon } from "@/components/BrandIcon";
 
 const turnstileSiteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY ?? "";
 
@@ -153,7 +153,7 @@ export default function SignInPage() {
         <main className="card" style={{ maxWidth: '400px', width: '100%', padding: '32px', textAlign: 'center' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', marginBottom: '24px' }}>
             <div style={{ padding: '8px', borderRadius: '8px', background: 'var(--color-background-secondary, #f4f4f5)' }}>
-              <Building2 size={20} />
+              <BrandIcon size={20} />
             </div>
           </div>
           <h1 style={{ fontSize: '20px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)', marginBottom: '12px' }}>Check your email</h1>
@@ -182,7 +182,7 @@ export default function SignInPage() {
         <main className="card" style={{ maxWidth: '400px', width: '100%', padding: '32px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '20px' }}>
             <div style={{ padding: '6px', borderRadius: '6px', background: 'var(--color-background-secondary, #f4f4f5)' }}>
-              <Building2 size={18} />
+              <BrandIcon />
             </div>
             <span style={{ fontSize: '12px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--color-text-secondary)' }}>
               HQLookup
@@ -215,7 +215,7 @@ export default function SignInPage() {
       <main className="card" style={{ maxWidth: '400px', width: '100%', padding: '32px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '20px' }}>
           <div style={{ padding: '6px', borderRadius: '6px', background: 'var(--color-background-secondary, #f4f4f5)' }}>
-            <Building2 size={18} />
+            <BrandIcon />
           </div>
           <span style={{ fontSize: '12px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--color-text-secondary)' }}>
             HQLookup Workspace

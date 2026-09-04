@@ -2,9 +2,10 @@
 
 import { useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
-import { FileText, LogOut } from 'lucide-react';
+import { LogOut } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { apiFetch, errorMessage } from '@/app/lib/api';
+import { BrandIcon } from '@/components/BrandIcon';
 
 export default function Navbar({ avatarInitials = 'D' }) {
   const [isOpen, setIsOpen] = useState(false);
@@ -42,7 +43,7 @@ export default function Navbar({ avatarInitials = 'D' }) {
   return (
     <div className="nav" style={{ position: 'relative' }}>
       <Link href="/dashboard" className="nav-logo" style={{ textDecoration: 'none' }}>
-        <FileText size={18} style={{ color: 'var(--color-text-info)' }} /> HQLookup
+        <BrandIcon /> HQLookup
       </Link>
       
       <div className="nav-right" style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>

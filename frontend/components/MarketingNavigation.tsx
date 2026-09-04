@@ -1,5 +1,6 @@
 import Link from "next/link";
-import { ArrowRight, Building2 } from "lucide-react";
+import { ArrowRight } from "lucide-react";
+import { BrandIcon } from "@/components/BrandIcon";
 
 export type MarketingPage = "about" | "contact" | "features" | "pricing" | "roadmap" | "solutions" | "demo";
 
@@ -56,7 +57,7 @@ export function MarketingHeader({ activePage }: MarketingNavigationProps) {
         <div style={{ display: "flex", alignItems: "center", gap: "24px" }}>
           <Link href="/" style={{ display: "flex", alignItems: "center", gap: "8px", textDecoration: "none" }}>
             <div style={{ padding: "6px", borderRadius: "6px", background: "var(--color-background-secondary, #f4f4f5)", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--color-text-primary, #18181b)" }}>
-              <Building2 size={18} />
+              <BrandIcon />
             </div>
             <span style={{ fontSize: "16px", fontWeight: 600, color: "var(--color-text-primary, #18181b)" }}>HQLookup</span>
           </Link>

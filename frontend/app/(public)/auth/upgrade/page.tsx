@@ -1,11 +1,12 @@
 import Link from 'next/link';
-import { X, FileText } from 'lucide-react';
+import { X } from 'lucide-react';
+import { BrandIcon } from '@/components/BrandIcon';
 
 export default function UpgradeGate() {
   return (
     <div className="screen">
       <div className="nav">
-        <div className="nav-logo"><FileText size={18} style={{ color: 'var(--color-text-info)' }} /> HQLookup</div>
+        <div className="nav-logo"><BrandIcon /> HQLookup</div>
         <div className="nav-right"><div className="avatar">JD</div></div>
       </div>
       <div className="modal-overlay">

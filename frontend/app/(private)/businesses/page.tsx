@@ -578,7 +578,11 @@ export default function EnterpriseBusinessDetail() {
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
                     <div>
                       <h3 style={{ fontSize: '14px', fontWeight: 500, margin: 0 }}>Document Library</h3>
-                      <p style={{ fontSize: '12px', color: 'var(--color-text-secondary)', margin: '2px 0 0 0' }}>Files ingested into the AI search index for this location.</p>
+                      <p style={{ fontSize: '12px', color: 'var(--color-text-secondary, #71717a)', margin: '2px 0 0 0' }}>Files ingested into the AI search index for this location.</p>
+                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: '6px', marginTop: '6px', padding: '6px 10px', borderRadius: '6px', background: 'var(--color-background-secondary, #f4f4f5)', border: '1px solid var(--color-border-tertiary, #e4e4e7)', fontSize: '11px', color: 'var(--color-text-secondary, #71717a)' }}>
+                        <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#f59e0b', display: 'inline-block', flexShrink: 0, marginTop: '4px' }}></span>
+                        <span>Standalone images (PNG, JPG) and <strong>image-only PDFs</strong> (scanned documents without a text layer) cannot be ingested because no content can be detected.</span>
+                      </div>
                     </div>
                     
                     <label className="btn btn-primary" style={{ fontSize: '12px', padding: '6px 12px', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
