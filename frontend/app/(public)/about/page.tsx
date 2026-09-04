@@ -1,6 +1,8 @@
 import Link from "next/link";
+import Image from "next/image";
 import { ArrowRight } from "lucide-react";
-import { MarketingFooter, MarketingHeader } from "@/components/MarketingNavigation";
+import { MarketingHeader } from "@/components/MarketingNavigation";
+import donImage from "@/assets/Don-Ng.jpg";
 
 export default function AboutPage() {
   return (
@@ -9,7 +11,7 @@ export default function AboutPage() {
 
       {/* Main Content Area */}
       <main style={{ padding: '48px 24px', maxWidth: '760px', margin: '0 auto', width: '100%', flex: 1, display: 'flex', flexDirection: 'column', gap: '32px' }}>
-        
+
         {/* Header Section */}
         <div>
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '4px 10px', borderRadius: '20px', background: 'var(--color-background-secondary, #f4f4f5)', fontSize: '11px', fontWeight: 500, color: 'var(--color-text-secondary, #71717a)', marginBottom: '16px' }}>
@@ -98,21 +100,29 @@ export default function AboutPage() {
         </section>
 
         {/* Meet the founder */}
+        {/* Meet the founder */}
         <section style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
           <h2 style={{ fontSize: '20px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)' }}>Meet the founder</h2>
-          <div className="card" style={{ padding: '24px' }}>
-            <h3 style={{ fontSize: '16px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)', marginBottom: '8px' }}>
-              Don Ng — Founder & Software Engineer
-            </h3>
-            <p style={{ fontSize: '14px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.6', marginBottom: '16px' }}>
-              HQLookup was founded and built by Don Ng, a software engineer with experience building web applications across frontend and backend systems.
-            </p>
-            <p style={{ fontSize: '14px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.6', marginBottom: '16px' }}>
-              HQLookup began with a simple idea: businesses already possess valuable knowledge, but accessing that knowledge is unnecessarily difficult when it is spread across dozens or hundreds of documents.
-            </p>
-            <p style={{ fontSize: '14px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.6', margin: 0 }}>
-              The product is being built to make that information easier to search, understand, and use.
-            </p>
+          <div className="card" style={{ padding: '24px', display: 'flex', gap: '20px', alignItems: 'flex-start', flexWrap: 'wrap' }}>
+            <div style={{ width: '80px', height: '80px', borderRadius: '50%', overflow: 'hidden', flexShrink: 0, position: 'relative', border: '1px solid var(--color-border-tertiary, #e4e4e7)' }}>
+              <Image src={donImage} alt="Don Ng" fill style={{ objectFit: 'cover' }} />
+            </div>
+            <div style={{ flex: 1, minWidth: '240px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              <div>
+                <h3 style={{ fontSize: '16px', fontWeight: 600, color: 'var(--color-text-primary, #18181b)', marginBottom: '4px' }}>
+                  Don Ng — Founder & Software Engineer
+                </h3>
+                <p style={{ fontSize: '14px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.6', margin: 0 }}>
+                  HQLookup was founded and built by Don Ng, a software engineer with experience building web applications across frontend and backend systems.
+                </p>
+              </div>
+              <p style={{ fontSize: '14px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.6', margin: 0 }}>
+                HQLookup began with a simple idea: businesses already possess valuable knowledge, but accessing that knowledge is unnecessarily difficult when it is spread across dozens or hundreds of documents.
+              </p>
+              <p style={{ fontSize: '14px', color: 'var(--color-text-secondary, #71717a)', lineHeight: '1.6', margin: 0 }}>
+                The product is being built to make that information easier to search, understand, and use.
+              </p>
+            </div>
           </div>
         </section>
 
@@ -145,7 +155,6 @@ export default function AboutPage() {
 
       </main>
 
-      <MarketingFooter activePage="about" />
     </div>
   );
 }
