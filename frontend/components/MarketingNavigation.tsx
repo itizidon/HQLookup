@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { ArrowRight, Building2 } from "lucide-react";
 
-export type MarketingPage = "about" | "contact" | "features" | "pricing" | "roadmap" | "solutions";
+export type MarketingPage = "about" | "contact" | "features" | "pricing" | "roadmap" | "solutions" | "demo";
 
 type MarketingNavigationProps = {
   activePage?: MarketingPage;
