@@ -183,7 +183,30 @@ def signup(
     existing_user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
     if existing_user:
         # Registration responses do not disclose whether an identity exists.
-        perform_dummy_password_check(body.password)
+        password_matches = verify_password(body.password, existing_user.hashed_password)
+        if existing_user.email_verified_at is None and password_matches:
+            limit_verification_email(existing_user.id)
+            try:
+                send_email_verification(existing_user, db)
+                db.commit()
+            except Exception:
+                db.rollback()
+                record_auth_event(
+                    "signup",
+                    outcome="verification_queue_failure",
+                    user_id=existing_user.id,
+                    client_ip=request.client.host if request.client else None,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="We could not queue the verification email. Try again later.",
+                ) from None
+            record_auth_event(
+                "signup",
+                outcome="verification_requeued",
+                user_id=existing_user.id,
+                client_ip=request.client.host if request.client else None,
+            )
         return SignupResponse(
             message="If this address can be registered, check your email for the next step.",
             email=normalized_email,
